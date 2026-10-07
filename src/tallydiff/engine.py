@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from decimal import Decimal
 
+from tallydiff._decimal import sum_decimals
 from tallydiff.models import (
     CompositeKey,
     FindingCategory,
@@ -21,16 +22,20 @@ class ReconciliationIntegrityError(RuntimeError):
 
 
 def reconcile(
-    records_a: Sequence[SourceRecord],
-    records_b: Sequence[SourceRecord],
+    records_a: Iterable[SourceRecord],
+    records_b: Iterable[SourceRecord],
 ) -> ReconciliationResult:
-    """Reconcile two sets of validated records by their normalized exact keys.
+    """Reconcile validated records by exact keys, ordered by key and source row.
+
+    Inputs are snapshotted once so validation cannot consume one-pass iterables.
 
     Duplicate keys are never paired heuristically. If either side contains more
     than one row for a key, every row for that key is retained in a single
     ``DUPLICATE_AMBIGUOUS`` finding.
     """
 
+    records_a = tuple(records_a)
+    records_b = tuple(records_b)
     _validate_source_records(records_a, Source.A)
     _validate_source_records(records_b, Source.B)
 
@@ -75,8 +80,7 @@ def _validate_source_records(records: Sequence[SourceRecord], expected_source: S
             )
         if record.source_row in seen_rows:
             raise ValueError(
-                f"File {expected_source.value} contains duplicate source row "
-                f"{record.source_row}"
+                f"File {expected_source.value} contains duplicate source row {record.source_row}"
             )
         seen_rows.add(record.source_row)
 
@@ -87,11 +91,13 @@ def _group_by_key(
     grouped: dict[CompositeKey, list[SourceRecord]] = defaultdict(list)
     for record in records:
         grouped[record.key].append(record)
+    for rows in grouped.values():
+        rows.sort(key=lambda record: record.source_row)
     return dict(grouped)
 
 
 def _sum_amounts(records: Iterable[SourceRecord]) -> Decimal:
-    return sum((record.amount for record in records), Decimal("0"))
+    return sum_decimals(record.amount for record in records)
 
 
 def _classify(
@@ -121,13 +127,13 @@ def _assert_integrity(
             "finding deltas do not explain the control-total difference"
         )
 
-    expected_rows = {
+    expected_rows = Counter(
         (record.source, record.source_row) for record in (*records_a, *records_b)
-    }
-    accounted_rows = {
+    )
+    accounted_rows = Counter(
         (record.source, record.source_row)
         for finding in result.findings
         for record in (*finding.rows_a, *finding.rows_b)
-    }
+    )
     if expected_rows != accounted_rows:
         raise ReconciliationIntegrityError("not every source row was accounted for exactly once")
