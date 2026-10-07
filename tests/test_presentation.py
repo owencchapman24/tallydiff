@@ -174,3 +174,19 @@ def test_finding_table_distinguishes_missing_records_from_present_zero_amounts(
         assert finding.amount_a == Decimal("0")
     if not amounts_b:
         assert finding.amount_b == Decimal("0")
+
+
+def test_configuration_identity_includes_exact_decimal_tolerance() -> None:
+    mapping = ColumnMapping((("id", "ref"),), "amount", "gross")
+
+    def identity(tolerance: Decimal) -> str:
+        return configuration_id(
+            b"a", b"b", mapping, name_a="a.csv", name_b="b.csv", amount_tolerance=tolerance
+        )
+
+    assert identity(Decimal("0")) == configuration_id(
+        b"a", b"b", mapping, name_a="a.csv", name_b="b.csv"
+    )
+    assert (
+        len({identity(Decimal(value)) for value in ("0", "0.01", "0.010000000000000000001")}) == 3
+    )

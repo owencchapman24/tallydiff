@@ -11,6 +11,7 @@ from tallydiff.models import FindingCategory, ReconciliationFinding, Source, Sou
 
 CATEGORY_LABELS = {
     FindingCategory.EXACT_MATCH: "Exact match",
+    FindingCategory.WITHIN_TOLERANCE: "Within tolerance",
     FindingCategory.AMOUNT_MISMATCH: "Amount mismatch",
     FindingCategory.A_ONLY: "File A only",
     FindingCategory.B_ONLY: "File B only",
@@ -68,8 +69,9 @@ def configuration_id(
     *,
     name_a: str,
     name_b: str,
+    amount_tolerance: Decimal = Decimal("0"),
 ) -> str:
-    """Identify the exact files and ordered selections behind a displayed result."""
+    """Identify the files, ordered selections, and tolerance behind a displayed result."""
 
     identity = [
         [name_a, hashlib.sha256(data_a).hexdigest()],
@@ -77,6 +79,7 @@ def configuration_id(
         mapping.key_pairs,
         mapping.amount_a,
         mapping.amount_b,
+        str(amount_tolerance),
     ]
     return hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
 

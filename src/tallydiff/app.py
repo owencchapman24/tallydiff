@@ -5,8 +5,10 @@ from collections import Counter
 import streamlit as st
 
 from tallydiff import (
+    AmountParseError,
     FindingCategory,
     IngestionError,
+    ReconciliationFinding,
     ReconciliationIntegrityError,
     ReconciliationResult,
     Source,
@@ -14,6 +16,7 @@ from tallydiff import (
     export_exceptions_csv,
     ingest_csv,
     inspect_csv_columns,
+    parse_amount,
     reconcile,
 )
 from tallydiff.presentation import (
@@ -133,62 +136,20 @@ def _show_evidence(rows: tuple[SourceRecord, ...], source: Source) -> None:
             st.dataframe(evidence_rows(row), hide_index=True, width="stretch")
 
 
-def _show_results(
-    result: ReconciliationResult, mapping: ColumnMapping, identity: str, name_a: str, name_b: str
-) -> None:
-    st.header("4. Review results")
-    st.caption("Configuration used for this reconciliation")
-    st.text(f"File A: {name_a}\nFile B: {name_b}")
-    for index, (left, right) in enumerate(mapping.key_pairs, start=1):
-        st.text(f"Key {index}: {left}  \u2194  {right}")
-    st.text(f"Amount: {mapping.amount_a}  \u2194  {mapping.amount_b}")
-
-    a, b, difference = st.columns(3)
-    a.metric("File A control total", display_amount(result.total_a))
-    b.metric("File B control total", display_amount(result.total_b))
-    difference.metric(
-        "Net difference (A - B)", display_amount(result.control_difference, signed=True)
-    )
-    counts = Counter(finding.category for finding in result.findings)
-    for column, category in zip(st.columns(5), FindingCategory, strict=True):
-        column.metric(CATEGORY_LABELS[category], str(counts[category]))
-    st.caption(
-        "Counts are key groups. A duplicate / ambiguous group can contain multiple source rows."
-    )
-
-    exceptions = result.exceptions
-    if not result.findings:
-        st.info("Both files contain headers only; there are no data records to reconcile.")
-        return
-    if not exceptions:
-        st.success("All key groups match exactly. No exceptions to review.")
-        return
-    if result.control_difference == 0:
-        st.warning(f"Control totals agree, but {len(exceptions)} key groups still require review.")
-    else:
-        st.warning(f"{len(exceptions)} key groups require review.")
-    st.subheader("Exceptions")
-    st.download_button(
-        "Download exception report",
-        data=export_exceptions_csv(result),
-        file_name="tallydiff_exceptions.csv",
-        mime="text/csv; charset=utf-8",
-        key=f"download_{identity}",
-        on_click="ignore",
-    )
+def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_key: str) -> None:
     st.caption("Select a row to inspect its original source records below.")
     event = st.dataframe(
-        finding_rows(exceptions),
+        finding_rows(findings),
         hide_index=True,
         width="stretch",
-        key=f"exceptions_{identity}",
+        key=table_key,
         on_select="rerun",
         selection_mode="single-row",
         lazy=False,
-        height=min(440, 35 * (len(exceptions) + 1) + 3),
+        height=min(440, 35 * (len(findings) + 1) + 3),
     )
     if event.selection.rows:
-        finding = exceptions[event.selection.rows[0]]
+        finding = findings[event.selection.rows[0]]
         st.text(f"Selected key: {' / '.join(finding.key)}")
         st.caption(
             "Original values as parsed from CSV. Source numbers count records, not physical lines."
@@ -198,6 +159,72 @@ def _show_results(
             _show_evidence(finding.rows_a, Source.A)
         with right:
             _show_evidence(finding.rows_b, Source.B)
+
+
+def _show_results(
+    result: ReconciliationResult, mapping: ColumnMapping, identity: str, name_a: str, name_b: str
+) -> None:
+    st.header("4. Review results")
+    st.caption("Configuration used for this reconciliation")
+    st.text(f"File A: {name_a}\nFile B: {name_b}")
+    for index, (left, right) in enumerate(mapping.key_pairs, start=1):
+        st.text(f"Key {index}: {left}  \u2194  {right}")
+    st.text(f"Amount: {mapping.amount_a}  \u2194  {mapping.amount_b}")
+    st.text(f"Amount tolerance: {display_amount(result.amount_tolerance)} (absolute difference)")
+
+    a, b, difference = st.columns(3)
+    a.metric("File A control total", display_amount(result.total_a))
+    b.metric("File B control total", display_amount(result.total_b))
+    difference.metric(
+        "Net difference (A - B)", display_amount(result.control_difference, signed=True)
+    )
+    counts = Counter(finding.category for finding in result.findings)
+    for column, category in zip(st.columns(len(FindingCategory)), FindingCategory, strict=True):
+        column.metric(CATEGORY_LABELS[category], str(counts[category]))
+    st.caption(
+        "Counts are key groups. A duplicate / ambiguous group can contain multiple source rows."
+    )
+
+    exceptions = result.exceptions
+    tolerated = result.tolerated_findings
+    if not result.findings:
+        st.info("Both files contain headers only; there are no data records to reconcile.")
+        return
+    if not exceptions:
+        if tolerated:
+            st.success("Reconciled within configured tolerance. No exceptions to review.")
+        else:
+            st.success("All key groups match exactly. No exceptions to review.")
+    elif result.control_difference == 0:
+        st.warning(f"Control totals agree, but {len(exceptions)} key groups still require review.")
+    else:
+        st.warning(f"{len(exceptions)} key groups require review.")
+    if exceptions:
+        st.subheader("Exceptions")
+        st.download_button(
+            "Download exception report",
+            data=export_exceptions_csv(result),
+            file_name="tallydiff_exceptions.csv",
+            mime="text/csv; charset=utf-8",
+            key=f"download_{identity}",
+            on_click="ignore",
+        )
+        _show_finding_table(exceptions, table_key=f"exceptions_{identity}")
+    if tolerated:
+        st.subheader("Within tolerance")
+        st.metric(
+            "Net accepted variance (A - B)",
+            display_amount(result.tolerated_delta_total, signed=True),
+        )
+        st.caption(
+            "Accepted nonzero differences are included in control totals and excluded from the "
+            "exception report. Opposing accepted deltas can cancel in this net amount."
+        )
+        _show_finding_table(tolerated, table_key=f"tolerated_{identity}")
+
+
+def _clear_result() -> None:
+    st.session_state.pop("completed", None)
 
 
 def main() -> None:
@@ -221,15 +248,46 @@ def main() -> None:
     name_a, data_a, text_a, columns_a = file_a
     name_b, data_b, text_b, columns_b = file_b
     mapping = _map_columns(columns_a, columns_b)
-    identity = configuration_id(data_a, data_b, mapping, name_a=name_a, name_b=name_b)
+    st.header("3. Run reconciliation")
+    tolerance_text = st.text_input(
+        "Amount tolerance",
+        value="0",
+        key="amount_tolerance",
+        help="Maximum absolute difference for a unique pair, in your amount units. "
+        "The boundary is inclusive; 0 requires exact equality. Actual deltas stay visible.",
+        on_change=_clear_result,
+    )
+    try:
+        amount_tolerance = parse_amount(tolerance_text)
+        if amount_tolerance < 0:
+            raise AmountParseError("must be zero or greater")
+    except AmountParseError as exc:
+        st.error(f"Amount tolerance: {exc}.")
+        amount_tolerance = None
+    identity = (
+        configuration_id(
+            data_a,
+            data_b,
+            mapping,
+            name_a=name_a,
+            name_b=name_b,
+            amount_tolerance=amount_tolerance,
+        )
+        if amount_tolerance is not None
+        else None
+    )
     completed = st.session_state.get("completed")
     if completed is not None and completed[0] != identity:
         st.session_state.pop("completed")
     problem = mapping.problem(columns_a, columns_b)
-    st.header("3. Run reconciliation")
     if problem:
         st.info(problem)
-    if st.button("Run reconciliation", type="primary", key="run", disabled=problem is not None):
+    if st.button(
+        "Run reconciliation",
+        type="primary",
+        key="run",
+        disabled=problem is not None or amount_tolerance is None,
+    ):
         st.session_state.pop("completed", None)
         records = []
         for source, text, keys, amount in (
@@ -244,7 +302,7 @@ def main() -> None:
                 st.error(str(exc))
         if len(records) == 2:
             try:
-                result = reconcile(records[0], records[1])
+                result = reconcile(records[0], records[1], amount_tolerance=amount_tolerance)
             except ReconciliationIntegrityError as exc:
                 st.error(f"Reconciliation integrity check failed: {exc}")
             else:

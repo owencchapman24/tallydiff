@@ -24,6 +24,7 @@ class FindingCategory(StrEnum):
     """Mutually exclusive outcome for one exact reconciliation key."""
 
     EXACT_MATCH = "exact_match"
+    WITHIN_TOLERANCE = "within_tolerance"
     AMOUNT_MISMATCH = "amount_mismatch"
     A_ONLY = "a_only"
     B_ONLY = "b_only"
@@ -90,7 +91,12 @@ class ReconciliationFinding:
 
     @property
     def is_exception(self) -> bool:
-        return self.category is not FindingCategory.EXACT_MATCH
+        """Whether this group requires review rather than representing accepted variance."""
+
+        return self.category not in (
+            FindingCategory.EXACT_MATCH,
+            FindingCategory.WITHIN_TOLERANCE,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +106,7 @@ class ReconciliationResult:
     total_a: Decimal
     total_b: Decimal
     findings: tuple[ReconciliationFinding, ...]
+    amount_tolerance: Decimal = Decimal("0")
 
     @property
     def control_difference(self) -> Decimal:
@@ -112,3 +119,19 @@ class ReconciliationResult:
     @property
     def exceptions(self) -> tuple[ReconciliationFinding, ...]:
         return tuple(finding for finding in self.findings if finding.is_exception)
+
+    @property
+    def tolerated_findings(self) -> tuple[ReconciliationFinding, ...]:
+        """Accepted nonzero differences, retained separately from review exceptions."""
+
+        return tuple(
+            finding
+            for finding in self.findings
+            if finding.category is FindingCategory.WITHIN_TOLERANCE
+        )
+
+    @property
+    def tolerated_delta_total(self) -> Decimal:
+        """Signed net accepted variance; opposing tolerated deltas can cancel."""
+
+        return sum_decimals(finding.delta for finding in self.tolerated_findings)

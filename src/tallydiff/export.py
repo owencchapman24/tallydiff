@@ -24,7 +24,8 @@ def export_exceptions_csv(result: ReconciliationResult) -> bytes:
     amounts; present zero amounts retain their exact Decimal representation.
     All source record ordinals are retained, separated by ``; ``. CSV quoting
     preserves commas, quotes, and embedded newlines. An empty exception set
-    produces a header-only CSV. Record terminators are CRLF.
+    produces a header-only CSV. Exact matches and accepted within-tolerance
+    findings are excluded. Record terminators are CRLF.
 
     Matching keys are not rewritten or spreadsheet-escaped. CSV quoting does
     not prevent spreadsheet formula evaluation; consumers must import untrusted

@@ -7,10 +7,12 @@ source evidence.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
-**v0.1.0** is a local Streamlit application: upload two files, map their columns,
-reconcile, inspect exceptions, and download a CSV report. Every source record is
-accounted for, ambiguous duplicates stay visible, and exception deltas explain
-the control-total difference. Equal totals alone never imply a reconciliation.
+**v0.1.0** is the stable compatibility baseline. The **v0.2 development branch**
+adds an optional global absolute amount tolerance to the local Streamlit app:
+upload two files, map their columns, reconcile, inspect findings, and download
+a CSV exception report. Every source record is accounted for, ambiguous
+duplicates stay visible, and all finding deltas explain the control-total
+difference. Equal totals alone never imply a reconciliation.
 TallyDiff reports differences; it does not decide which source is authoritative.
 
 ## Quick start
@@ -44,8 +46,8 @@ The files in `sample_data/` contain only synthetic records.
    | Key field 2 | Invoice Number | Invoice Ref |
    | Amount | Invoice Amount | Gross Amount |
 
-3. Click **Run reconciliation**. Expect File A total **2550**, File B total
-   **2305**, and net difference **+245**. The four key groups are:
+3. Leave **Amount tolerance** at its default `0`, then click **Run reconciliation**.
+   Expect File A total **2550**, File B total **2305**, and net difference **+245**. The four key groups are:
 
    | Matching key | Category | Delta (A - B) |
    | --- | --- | --- |
@@ -61,8 +63,34 @@ The files in `sample_data/` contain only synthetic records.
 
 The pair order defines the composite key. Incomplete mappings or repeated key
 column selections disable reconciliation. A changed file resets mappings; any
-file or mapping change clears the result and download until you run again.
-Selecting an exception preserves the current result.
+file, mapping, or tolerance change clears the result and download until you run
+again. Selecting an exception or accepted variance preserves the current result.
+
+## Absolute amount tolerance
+
+**Amount tolerance** accepts ordinary monetary text in the same units as the
+selected amount columns. It defaults to `0`, preserving v0.1 exact-match behavior.
+Negative, blank, malformed, and non-finite values block reconciliation. The
+existing monetary grammar is used directly to construct a Decimal; no float
+conversion or rounding occurs, and more than two decimal places are supported.
+
+Tolerance applies only to a key with exactly one record on each side. Exact
+equality remains **Exact match**. A nonzero difference is **Within tolerance**
+when `abs(A - B) <= tolerance` (inclusive); larger differences are **Amount
+mismatch**. At tolerance `0.01`, `100.00` versus `100.01` is within tolerance with
+a true delta of `-0.01`; `100.00` versus `100.02` remains an amount mismatch.
+One-sided records and duplicate / ambiguous groups always require review.
+
+Within-tolerance findings are accepted variances, excluded from ordinary
+exceptions and their CSV report. The summary shows the tolerance used and the
+Within tolerance group count. A separate **Within tolerance** table retains both
+amounts, the actual delta, and selectable original source evidence. Its **Net
+accepted variance (A - B)** is a signed sum: opposing deltas can cancel, while
+the count and individual rows still expose every accepted difference.
+
+With only exact matches and accepted differences, the app says **Reconciled
+within configured tolerance**. The control totals and net difference always
+include all true deltas; tolerance never zeroes, rounds, or hides arithmetic.
 
 ## Supported inputs
 
@@ -84,7 +112,8 @@ See the [monetary grammar](#monetary-text-grammar) for the full accepted syntax.
 | Category | Meaning |
 | --- | --- |
 | Exact match | One record on each side with equal amounts. |
-| Amount mismatch | One record on each side with unequal amounts. |
+| Within tolerance | One record on each side with a nonzero absolute delta at or below tolerance. |
+| Amount mismatch | One record on each side with an absolute delta above tolerance. |
 | File A only | One File A record and no File B record. |
 | File B only | One File B record and no File A record. |
 | Duplicate / ambiguous | More than one record on either side; all records need review. |
@@ -102,8 +131,8 @@ File A control total - File B control total = sum of all finding deltas
 ```
 
 Amounts are parsed and calculated using `Decimal`, without floats, rounding,
-quantization, or tolerances. Findings are sorted by key, and evidence by source
-record number. Raw field values are preserved in immutable snapshots. The CSV
+or quantization. Tolerance changes classification only. Findings are sorted by
+key, and evidence by source record number. Raw field values are preserved in immutable snapshots. The CSV
 header is record **1**, and the first data record is **2**; a quoted multiline
 field is still part of one record, so these are not necessarily physical line numbers.
 
@@ -111,8 +140,10 @@ field is still part of one record, so these are not necessarily physical line nu
 
 **Download exception report** saves `tallydiff_exceptions.csv` for the currently
 displayed reconciliation. There is one row per exception key group, including
-zero-delta ambiguous groups. Exact matches are excluded; the UI offers no
-exception download when there are no exceptions.
+zero-delta ambiguous groups. Exact matches and accepted within-tolerance findings
+are excluded; the UI offers no exception download when there are no exceptions.
+When accepted variance exists, exception-report deltas alone need not equal the
+control difference: add the net accepted variance shown in the UI.
 
 Columns, in order: `Category`, `Matching key`, `File A amount`, `File B amount`,
 `Delta (A - B)`, `File A records`, `File B records`. Matching key components use
@@ -159,8 +190,8 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 Public Python APIs are exposed through `tallydiff`. The engine and export layer
 have no Streamlit dependency. The UI performs no financial calculations.
 Results carry a SHA-256 identity covering file contents, filenames, ordered key
-pairs, and amount selections; each rerun checks it before showing results or a
-download. Expected validation failures are shown explicitly; unexpected errors
+pairs, amount selections, and the exact Decimal tolerance; each rerun checks it
+before showing results or a download. Expected validation failures are shown explicitly; unexpected errors
 are not broadly swallowed.
 
 ## Development and verification
@@ -190,11 +221,25 @@ Decimal precision and context isolation, invalid monetary text, CSV validation,
 encoding, mappings, missing versus zero amounts, evidence and export read-back.
 Streamlit [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest)
 exercises uploads, mappings, the sample workflow, source evidence, error states,
-download visibility, and stale-result invalidation.
+download visibility, and stale-result invalidation. Tolerance tests cover inclusive
+boundaries, high precision, invalid types and values, duplicate and one-sided
+precedence, accepted variance totals, separate review, and export exclusion.
 
 ## Python API contracts
 
 ### Reconciliation kernel
+
+`reconcile(records_a, records_b, *, amount_tolerance=Decimal("0"))` preserves the
+v0.1 classifications when tolerance is omitted or zero. Tolerance must be a
+finite, nonnegative `Decimal`; other types raise `TypeError`, and non-finite or
+negative Decimals raise `ValueError`. No numeric coercion is performed.
+
+`ReconciliationResult.amount_tolerance` records the configured value.
+`result.tolerated_findings` contains accepted nonzero differences, and
+`result.tolerated_delta_total` is their exact signed net delta.
+`finding.is_exception` and `result.exceptions` exclude exact and within-tolerance
+groups. `result.findings`, control totals, and the integrity invariant include
+every group, including accepted variances.
 
 - Inputs are already-parsed `SourceRecord` objects. Amounts must be finite `Decimal`
   values; floats, other numeric types, NaN, and infinity are rejected.
@@ -208,7 +253,7 @@ download visibility, and stale-result invalidation.
 - Findings are sorted by key, and rows within each finding by source row number.
   Inputs are snapshotted once, including one-pass iterables.
 - Totals and deltas use exact Decimal arithmetic isolated from the caller's Decimal
-  context. No rounding, quantization, or tolerance is applied.
+  context. No rounding or quantization is applied; tolerance affects classification only.
 
 ### CSV ingestion
 
@@ -294,8 +339,9 @@ when ingesting CSV). No malformed amount is converted to zero.
 - CSV only, UTF-8 input, two files at a time, one amount field per file, and
   U.S.-style monetary syntax. No Excel ingestion or export, locale inference,
   currency conversion, or automatic sign correction.
-- Exact keys after surrounding-whitespace trimming. No fuzzy matching,
-  tolerances, automatic mappings, or decisions about the authoritative source.
+- Exact keys after surrounding-whitespace trimming and one global absolute amount
+  tolerance. No percentage or per-row tolerance, fuzzy matching, automatic
+  mappings, or decisions about the authoritative source.
 - No saved configurations, database, reconciliation history, accounting-system
   integrations, authentication, or cloud service. The app is intended to run
   locally from the repository root, not as a shared hosted service.
