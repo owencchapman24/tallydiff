@@ -8,9 +8,9 @@ source evidence.
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
 **v0.1.0** is the stable compatibility baseline. The **v0.2 development branch**
-adds an optional global absolute amount tolerance to the local Streamlit app:
-upload two files, map their columns, reconcile, inspect findings, and download
-a CSV exception report. Every source record is accounted for, ambiguous
+adds an optional global absolute amount tolerance and portable mapping profiles
+to the local Streamlit app: upload two files, configure their columns, reconcile,
+inspect findings, and download a CSV exception report. Every source record is accounted for, ambiguous
 duplicates stay visible, and all finding deltas explain the control-total
 difference. Equal totals alone never imply a reconciliation.
 TallyDiff reports differences; it does not decide which source is authoritative.
@@ -91,6 +91,66 @@ the count and individual rows still expose every accepted difference.
 With only exact matches and accepted differences, the app says **Reconciled
 within configured tolerance**. The control totals and net difference always
 include all true deltas; tolerance never zeroes, rounds, or hides arithmetic.
+
+## Portable mapping profiles
+
+For recurring exports with the same logical columns, save the current valid
+configuration with **Download mapping profile**. The app offers this download
+once the ordered key pairs, both amount columns, and tolerance are valid; you do
+not need to run reconciliation first. The default filename is
+`tallydiff_profile.json`, and you may rename it outside TallyDiff.
+
+A profile remembers ordered File A ↔ File B key pairs, both amount columns,
+and the exact Decimal tolerance, including fractional trailing zeroes such as
+`0.0100`. It contains column names and configuration only: no uploaded source
+records, source filenames or hashes, financial amounts, totals, findings, or
+timestamps. Profiles stay local; TallyDiff uses no external service, profile
+directory, database, account, browser storage, or automatic filesystem writes.
+Saving is an explicit download to a location you choose.
+
+To reuse a profile:
+
+1. Upload the new File A and File B CSV exports.
+2. Under **Mapping profile**, upload the saved JSON file. Selecting a file does
+   not change the current configuration.
+3. Click **Apply profile**. TallyDiff validates the entire profile and every
+   required column on its configured side before changing any setting.
+4. Check the populated key pairs, amount columns, and tolerance, then click
+   **Run reconciliation**. Applying a valid profile clears any prior result and
+   exception download, even if its configuration is identical.
+5. Edit any populated control normally if needed, and download a new profile
+   when the new configuration is valid. Profiles never lock the controls.
+
+Column names must match exactly on the correct side, including case and
+whitespace. Extra columns and changed CSV filenames or header order are allowed.
+Missing or renamed required columns produce an error naming the unavailable
+columns; nothing is partially applied or guessed. A rejected profile leaves the
+current configuration and any result for it intact. Update mappings manually
+when schemas change, then save a new profile.
+
+Profiles use UTF-8 JSON with a stable format identifier and schema version:
+
+```json
+{
+  "format": "tallydiff-mapping-profile",
+  "version": 1,
+  "key_pairs": [
+    {"file_a": "Vendor ID", "file_b": "Supplier"},
+    {"file_a": "Invoice Number", "file_b": "Invoice Ref"}
+  ],
+  "amount_columns": {
+    "file_a": "Invoice Amount",
+    "file_b": "Gross Amount"
+  },
+  "amount_tolerance": "0.0100"
+}
+```
+
+Tolerance is a JSON string parsed directly with the monetary grammar; JSON
+numeric tolerances are rejected. Version 1 requires exactly the documented
+fields and structures. Invalid JSON, duplicate object fields, unsupported
+formats or versions, blank or repeated key selections, invalid amount names,
+and invalid or negative tolerance are rejected with a concise message.
 
 ## Supported inputs
 
@@ -183,15 +243,19 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `models.py` | Validated source records, immutable evidence, findings and totals. |
 | `engine.py` | Exact grouping, classification, deterministic ordering and integrity checks. |
 | `ingest.py` | Header discovery and atomic CSV validation with explicit mappings. |
-| `presentation.py` | UTF-8 decoding, mapping validation, configuration identity and display strings. |
+| `configuration.py` | Shared ordered column mappings and manual mapping validation. |
+| `profiles.py` | Validated JSON profile import/export and directional column compatibility. |
+| `presentation.py` | UTF-8 decoding, configuration identity and display strings. |
 | `export.py` | Ordinary CSV bytes, reusing UI-independent labels and Decimal formatting. |
 | `app.py` | Streamlit controls, error messages, results, download and source evidence. |
 
 Public Python APIs are exposed through `tallydiff`. The engine and export layer
 have no Streamlit dependency. The UI performs no financial calculations.
 Results carry a SHA-256 identity covering file contents, filenames, ordered key
-pairs, amount selections, and the exact Decimal tolerance; each rerun checks it
-before showing results or a download. Expected validation failures are shown explicitly; unexpected errors
+pairs, amount selections, and the effective Decimal tolerance; each rerun checks
+it before showing results or a download. Profile filenames and JSON formatting
+do not enter this identity; equivalent tolerance values share an identity while
+profile serialization preserves their fractional trailing zeroes. Expected validation failures are shown explicitly; unexpected errors
 are not broadly swallowed.
 
 ## Development and verification
@@ -224,6 +288,9 @@ exercises uploads, mappings, the sample workflow, source evidence, error states,
 download visibility, and stale-result invalidation. Tolerance tests cover inclusive
 boundaries, high precision, invalid types and values, duplicate and one-sided
 precedence, accepted variance totals, separate review, and export exclusion.
+Profile tests cover strict schema validation, exact Decimal round trips, key order,
+directional compatibility, atomic application, editable controls, download
+validity, configuration privacy, and stale-result clearing.
 
 ## Python API contracts
 
@@ -254,6 +321,24 @@ every group, including accepted variances.
   Inputs are snapshotted once, including one-pass iterables.
 - Totals and deltas use exact Decimal arithmetic isolated from the caller's Decimal
   context. No rounding or quantization is applied; tolerance affects classification only.
+
+### Mapping profiles
+
+`ColumnMapping` now lives in `tallydiff.configuration` because both profiles and
+the UI use it. The existing `tallydiff.presentation.ColumnMapping` import remains
+available for compatibility, and public profile APIs are exposed via `tallydiff`:
+
+- `export_mapping_profile(mapping, *, amount_tolerance=Decimal("0")) -> bytes`
+  validates a complete configuration and returns UTF-8 JSON without writing files.
+- `load_mapping_profile(data: bytes | str) -> MappingProfile` returns immutable,
+  validated `mapping` and `amount_tolerance` fields. It accepts a UTF-8 BOM on byte
+  input and raises `ProfileError` for invalid profile contents.
+- `profile.validate_columns(columns_a, columns_b)` raises `ProfileError` listing
+  missing directional columns; extra columns are allowed. Call it before applying
+  settings to currently uploaded files.
+
+These APIs do not ingest financial records, run reconciliation, or access the
+filesystem. Profiles configure the existing reconciliation path.
 
 ### CSV ingestion
 
@@ -342,7 +427,8 @@ when ingesting CSV). No malformed amount is converted to zero.
 - Exact keys after surrounding-whitespace trimming and one global absolute amount
   tolerance. No percentage or per-row tolerance, fuzzy matching, automatic
   mappings, or decisions about the authoritative source.
-- No saved configurations, database, reconciliation history, accounting-system
+- Configuration reuse is limited to explicit JSON profile downloads and uploads.
+  No managed profile library, database, reconciliation history, accounting-system
   integrations, authentication, or cloud service. The app is intended to run
   locally from the repository root, not as a shared hosted service.
 - Inputs, evidence, and report bytes are held in memory. There is no streaming

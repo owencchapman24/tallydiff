@@ -6,22 +6,25 @@ import streamlit as st
 
 from tallydiff import (
     AmountParseError,
+    ColumnMapping,
     FindingCategory,
     IngestionError,
+    ProfileError,
     ReconciliationFinding,
     ReconciliationIntegrityError,
     ReconciliationResult,
     Source,
     SourceRecord,
     export_exceptions_csv,
+    export_mapping_profile,
     ingest_csv,
     inspect_csv_columns,
+    load_mapping_profile,
     parse_amount,
     reconcile,
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
-    ColumnMapping,
     configuration_id,
     decode_upload,
     display_amount,
@@ -68,8 +71,37 @@ def _choose_file(source: Source) -> tuple[str, bytes, str, tuple[str, ...]] | No
     return upload.name, data, text, columns
 
 
+def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
+    st.subheader("Mapping profile")
+    st.caption(
+        "Reuse column mappings and amount tolerance with a local JSON profile. "
+        "Profiles contain no uploaded records or reconciliation results."
+    )
+    upload = st.file_uploader("Mapping profile JSON", type=["json"], key="profile_upload")
+    if st.button("Apply profile", key="apply_profile", disabled=upload is None):
+        try:
+            profile = load_mapping_profile(upload.getvalue())
+            profile.validate_columns(columns_a, columns_b)
+        except ProfileError as exc:
+            st.error(str(exc))
+        else:
+            # These widgets have not been instantiated on this run. Validate everything
+            # before replacing any state, so failed application cannot partially apply.
+            _reset_mapping()
+            st.session_state.key_count = len(profile.mapping.key_pairs)
+            for index, (a, b) in enumerate(profile.mapping.key_pairs):
+                st.session_state[f"map_key_a_{index}"] = a
+                st.session_state[f"map_key_b_{index}"] = b
+            st.session_state.map_amount_a = profile.mapping.amount_a
+            st.session_state.map_amount_b = profile.mapping.amount_b
+            st.session_state.amount_tolerance = format(profile.amount_tolerance, "f")
+            st.session_state.profile_notice = True
+            st.rerun()
+    if st.session_state.pop("profile_notice", False):
+        st.success("Mapping profile applied. You can still edit any configuration value.")
+
+
 def _map_columns(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> ColumnMapping:
-    st.header("2. Map columns")
     st.caption("Each numbered pair defines one matching key field, in this order.")
     pairs = []
     for index in range(st.session_state.key_count):
@@ -247,11 +279,14 @@ def main() -> None:
         return
     name_a, data_a, text_a, columns_a = file_a
     name_b, data_b, text_b, columns_b = file_b
+    st.header("2. Map columns")
+    _profile_controls(columns_a, columns_b)
     mapping = _map_columns(columns_a, columns_b)
     st.header("3. Run reconciliation")
+    st.session_state.setdefault("amount_tolerance", "0")
     tolerance_text = st.text_input(
         "Amount tolerance",
-        value="0",
+        value=None,
         key="amount_tolerance",
         help="Maximum absolute difference for a unique pair, in your amount units. "
         "The boundary is inclusive; 0 requires exact equality. Actual deltas stay visible.",
@@ -282,6 +317,15 @@ def main() -> None:
     problem = mapping.problem(columns_a, columns_b)
     if problem:
         st.info(problem)
+    elif amount_tolerance is not None:
+        st.download_button(
+            "Download mapping profile",
+            data=export_mapping_profile(mapping, amount_tolerance=amount_tolerance),
+            file_name="tallydiff_profile.json",
+            mime="application/json",
+            key="download_profile",
+            on_click="ignore",
+        )
     if st.button(
         "Run reconciliation",
         type="primary",
