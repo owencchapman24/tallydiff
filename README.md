@@ -4,7 +4,7 @@ TallyDiff compares two financial CSV exports and explains which records account
 for their difference. Use an ordered key, such as vendor plus invoice number, to
 review unequal amounts, missing records, and duplicate keys with their original
 source evidence.
-
+![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 **v0.1.0** is a local Streamlit application: upload two files, map their columns,
 reconcile, inspect exceptions, and download a CSV report. Every source record is
 accounted for, ambiguous duplicates stay visible, and exception deltas explain
