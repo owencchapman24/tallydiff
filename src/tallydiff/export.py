@@ -25,6 +25,10 @@ def export_exceptions_csv(result: ReconciliationResult) -> bytes:
     All source record ordinals are retained, separated by ``; ``. CSV quoting
     preserves commas, quotes, and embedded newlines. An empty exception set
     produces a header-only CSV. Record terminators are CRLF.
+
+    Matching keys are not rewritten or spreadsheet-escaped. CSV quoting does
+    not prevent spreadsheet formula evaluation; consumers must import untrusted
+    report cells as text. See the README's spreadsheet-safety limitation.
     """
 
     output = StringIO(newline="")

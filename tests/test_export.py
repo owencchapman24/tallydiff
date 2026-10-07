@@ -143,3 +143,26 @@ def test_no_exceptions_produce_a_header_only_report(has_records: bool) -> None:
 
     assert _read_report(data) == []
     assert data.decode("utf-8") == ",".join(COLUMNS) + "\r\n"
+
+
+def test_formula_like_keys_remain_verbatim_without_breaking_csv_columns() -> None:
+    # v0.1 deliberately preserves keys: CSV consumers must disable formula evaluation.
+    keys = ["=1+1", "+00123", "-00123", "@SUM(1,2)", '=1+2";,=3+4\nsecond line']
+    records = [
+        SourceRecord(Source.A, row, (key,), Decimal("-0.1200"), {"id": key})
+        for row, key in enumerate(keys, start=2)
+    ]
+    result = reconcile(records, [])
+
+    rows = _read_report(export_exceptions_csv(result))
+
+    assert len(rows) == len(keys)
+    assert {row["Matching key"] for row in rows} == set(keys)
+    for row in rows:
+        assert list(row) == COLUMNS
+        assert row["File A amount"] == "-0.1200"
+        assert row["File B amount"] == ""
+        assert row["Delta (A - B)"] == "-0.1200"
+        original = records[int(row["File A records"]) - 2]
+        assert original.key == (row["Matching key"],)
+        assert original.raw_fields["id"] == row["Matching key"]

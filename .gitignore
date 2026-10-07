@@ -8,3 +8,9 @@ build/
 *.egg-info/
 .DS_Store
 .env
+.env.*
+.streamlit/secrets.toml
+.uv-cache/
+.coverage
+.coverage.*
+htmlcov/

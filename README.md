@@ -1,31 +1,35 @@
 # TallyDiff
 
-TallyDiff is a local-first financial reconciliation tool for comparing structured exports and explaining, traceably, why they do not agree.
+TallyDiff compares two financial CSV exports and explains which records account
+for their difference. Use an ordered key, such as vendor plus invoice number, to
+review unequal amounts, missing records, and duplicate keys with their original
+source evidence.
 
-The project is intentionally narrow: correctness, row-level traceability, duplicate detection, and control-total integrity come before integrations or dashboard features.
+**v0.1.0** is a local Streamlit application: upload two files, map their columns,
+reconcile, inspect exceptions, and download a CSV report. Every source record is
+accounted for, ambiguous duplicates stay visible, and exception deltas explain
+the control-total difference. Equal totals alone never imply a reconciliation.
+TallyDiff reports differences; it does not decide which source is authoritative.
 
-## Current milestone
+## Quick start
 
-The repository contains a local Streamlit workflow for choosing two CSV files,
-mapping columns explicitly, reconciling, inspecting source evidence, and downloading
-CSV exception reports. It uses
-the existing deterministic kernel and strict CSV/monetary ingestion layer.
-
-## Run locally
-
-From the repository root:
+Requirements: Python **3.12+** and [uv](https://docs.astral.sh/uv/).
+Clone this repository, then run these commands from its root:
 
 ```bash
-uv sync
+uv sync --locked
 uv run streamlit run src/tallydiff/app.py
 ```
 
-Open <http://127.0.0.1:8501>. The checked-in Streamlit configuration binds the
-server to the local machine and disables usage telemetry. Uploaded files and
-results stay in the current local Streamlit session; the app adds no persistence
-or external integrations.
+Open <http://127.0.0.1:8501>. The tracked `.streamlit/config.toml` binds the server
+to the local machine and disables Streamlit usage telemetry. TallyDiff does not
+send uploaded data to external services, cache it globally, or save it to disk.
+Files and results are held in the local session; downloaded reports are saved
+where you choose. Installing dependencies requires network access initially.
 
-### Try the synthetic example
+## Sample workflow
+
+The files in `sample_data/` contain only synthetic records.
 
 1. Upload `sample_data/file_a.csv` as **File A** and `sample_data/file_b.csv` as
    **File B**. The app displays each filename and validated column names.
@@ -38,34 +42,79 @@ or external integrations.
    | Key field 2 | Invoice Number | Invoice Ref |
    | Amount | Invoice Amount | Gross Amount |
 
-3. Click **Run reconciliation**. Expect totals of **2550** and **2305**, a net
-   difference of **+245**, one exact match, one amount mismatch, one File A-only
-   group, one File B-only group, and no duplicate groups.
-4. Select **V001 / 1042** in the exception table. Both evidence panels show source
-   record **2**, including the original amounts **1250** and **1205**. The other
-   exceptions have deltas **+500** and **-300**.
+3. Click **Run reconciliation**. Expect File A total **2550**, File B total
+   **2305**, and net difference **+245**. The four key groups are:
 
-The pair order defines the composite key. Duplicate selections on either side
-and incomplete mappings disable the run action. A changed file resets mappings;
-any file or mapping change clears the previous result and requires a fresh run.
-Selecting exception rows preserves the current result.
+   | Matching key | Category | Delta (A - B) |
+   | --- | --- | --- |
+   | V001 / 1042 | Amount mismatch | +45 |
+   | V002 / 1043 | Exact match | 0 |
+   | V003 / 1044 | File A only | +500 |
+   | V004 / 1045 | File B only | -300 |
 
-Totals and table amounts are exact Decimal strings, including every fractional
-digit. Counts represent key groups. Equal control totals do not clear duplicate
-or other row-level exceptions. Every source row in an ambiguous group is shown
-in its evidence panel.
+4. Select **V001 / 1042** in the exception table. Both evidence panels show
+   source record **2**, including the original amounts **1250** and **1205**.
+5. Click **Download exception report**. The CSV contains exactly the three
+   exception groups above, with blank amounts for the missing sides.
 
-Uploads must be UTF-8, optionally with a BOM. Invalid encoding and ingestion
-errors block results with contextual diagnostics. Header discovery checks only
-the header; the run action validates every data record. Header-only files are
-valid, and two empty inputs are reported as having no data records.
+<!-- Insert a real screenshot of the synthetic +245 result here after capture.
+Show summary metrics, the three exceptions, and V001 / 1042 evidence if legible.
+Do not include real financial data, unrelated browser tabs, or local user paths. -->
 
-### Download an exception report
+The pair order defines the composite key. Incomplete mappings or repeated key
+column selections disable reconciliation. A changed file resets mappings; any
+file or mapping change clears the result and download until you run again.
+Selecting an exception preserves the current result.
 
-After a reconciliation with exceptions, click **Download exception report** to
-save `tallydiff_exceptions.csv`. The report contains one row per exception key
-group, including zero-delta ambiguous groups; exact matches are excluded. File or
-mapping changes remove the download until a fresh reconciliation completes.
+## Supported inputs
+
+- Two comma-delimited CSV files with headers, encoded as UTF-8 with an optional
+  BOM. Header names and selections are exact. Header-only files are valid.
+- One or more explicitly paired key columns in the same logical order, and one
+  amount column per file. Matching trims surrounding key whitespace only;
+  leading zeroes, case, punctuation, and internal whitespace remain significant.
+- U.S.-style amounts such as `1200.00`, `1,200.00`, `$1,200.00`, `-1200.00`, and
+  `(1,200.00)`. Quote CSV fields containing commas. All decimal places are retained.
+- Invalid encoding, malformed CSV, missing fields, blank keys, invalid headers,
+  or invalid amounts block the run with file/record/column context where available.
+  Header discovery checks only the header; reconciliation validates every record.
+
+See the [monetary grammar](#monetary-text-grammar) for the full accepted syntax.
+
+## Correctness and traceability
+
+| Category | Meaning |
+| --- | --- |
+| Exact match | One record on each side with equal amounts. |
+| Amount mismatch | One record on each side with unequal amounts. |
+| File A only | One File A record and no File B record. |
+| File B only | One File B record and no File A record. |
+| Duplicate / ambiguous | More than one record on either side; all records need review. |
+
+Duplicates take precedence over the other categories. They are never silently
+paired or discarded, even when their aggregate amounts agree or offset to zero.
+Counts represent key groups, while the evidence panels retain every source row.
+A missing side shows an em dash in the table and a blank amount in the export;
+a present zero-dollar record shows its actual Decimal amount, such as `0.00`.
+
+The engine checks both row accounting and this invariant on every run:
+
+```text
+File A control total - File B control total = sum of all finding deltas
+```
+
+Amounts are parsed and calculated using `Decimal`, without floats, rounding,
+quantization, or tolerances. Findings are sorted by key, and evidence by source
+record number. Raw field values are preserved in immutable snapshots. The CSV
+header is record **1**, and the first data record is **2**; a quoted multiline
+field is still part of one record, so these are not necessarily physical line numbers.
+
+## Exception report
+
+**Download exception report** saves `tallydiff_exceptions.csv` for the currently
+displayed reconciliation. There is one row per exception key group, including
+zero-delta ambiguous groups. Exact matches are excluded; the UI offers no
+exception download when there are no exceptions.
 
 Columns, in order: `Category`, `Matching key`, `File A amount`, `File B amount`,
 `Delta (A - B)`, `File A records`, `File B records`. Matching key components use
@@ -73,59 +122,81 @@ Columns, in order: `Category`, `Matching key`, `File A amount`, `File B amount`,
 Decimal text. Missing-side amounts are blank; a present `0.00` remains `0.00`.
 
 Each side lists **all** participating source record numbers, separated by `; `,
-including every duplicate. These refer back to the original CSV inputs: the
-header is record 1 and the first data record is 2, even with multiline fields.
-Keep the original files and the configuration shown in the UI for review.
+including every duplicate. Keep the original CSV files and the configuration
+shown in the UI: those references provide traceability without duplicating every
+raw field in the report. The joined key is a display label, not a serialization
+for reconstructing composite keys that themselves contain ` / `.
 
-Output is ordinary comma-delimited UTF-8 CSV without a BOM, with CRLF record
-endings and standard quoting for commas, quotes, and embedded newlines. The
-UI-independent `export_exceptions_csv(result)` API returns bytes; results with
-no exceptions produce a header-only CSV, while the UI offers no download.
+Output is comma-delimited UTF-8 CSV without a BOM, with CRLF record endings and
+standard quoting for commas, quotes, and embedded newlines. The UI-independent
+`export_exceptions_csv(result)` API returns bytes; a result with no exceptions
+produces a header-only CSV.
 
-### Application structure
+**Spreadsheet safety:** matching-key text is exported as displayed, without
+adding an apostrophe or tab prefix. Such prefixes would change identifiers for
+downstream CSV consumers. This preserves traceability but means the report is
+**not sanitized for spreadsheet formula execution**. Formula-like keys, including
+values starting with `=`, `+`, `-`, or `@`, can be interpreted as formulas by a
+spreadsheet; CSV quoting alone does not prevent this. Control characters and
+locale-specific variants can also matter. See [OWASP's CSV injection guidance](https://community.owasp.org/attacks/CSV_Injection).
 
-- `ingest.py`: shared header discovery through `inspect_csv_columns`, plus the
-  existing blocking CSV ingestion API.
-- `presentation.py`: UTF-8 decoding, ordered mapping state, configuration identity,
-  and exact string/table presentation. It contains no reconciliation rules.
-- `export.py`: deterministic exception CSV bytes using the standard `csv` module
-  and the shared category labels and exact Decimal formatter.
-- `app.py`: Streamlit controls, calls to `ingest_csv` and `reconcile`, expected
-  error messages, summary, and source-evidence rendering.
-- Results are associated with a SHA-256 identity covering both file contents,
-  filenames, ordered key pairs, and amount selections. Every rerun checks it
-  before displaying stored results. No global cache stores uploaded financial data.
+Do not open untrusted reports by double-clicking them in a spreadsheet. Use a CSV
+reader, or import every column as text with formula evaluation disabled. Text
+import also avoids losing leading zeroes or rounding long monetary values in the
+spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritten.
 
-Exception drill-down uses Streamlit's [single-row dataframe selection](https://docs.streamlit.io/develop/api-reference/data/st.dataframe).
-Automated [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest)
-smoke tests exercise actual upload widgets, mapping controls, results, evidence,
-and stale-result invalidation. New non-visual helpers also have focused tests.
+## Architecture
 
-## Development setup
+| Module | Responsibility |
+| --- | --- |
+| `_decimal.py` | Exact addition isolated from the caller's Decimal context. |
+| `amounts.py` | Strict monetary text parsing directly to Decimal. |
+| `models.py` | Validated source records, immutable evidence, findings and totals. |
+| `engine.py` | Exact grouping, classification, deterministic ordering and integrity checks. |
+| `ingest.py` | Header discovery and atomic CSV validation with explicit mappings. |
+| `presentation.py` | UTF-8 decoding, mapping validation, configuration identity and display strings. |
+| `export.py` | Ordinary CSV bytes, reusing UI-independent labels and Decimal formatting. |
+| `app.py` | Streamlit controls, error messages, results, download and source evidence. |
 
-Requirements:
+Public Python APIs are exposed through `tallydiff`. The engine and export layer
+have no Streamlit dependency. The UI performs no financial calculations.
+Results carry a SHA-256 identity covering file contents, filenames, ordered key
+pairs, and amount selections; each rerun checks it before showing results or a
+download. Expected validation failures are shown explicitly; unexpected errors
+are not broadly swallowed.
 
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
+## Development and verification
 
 ```bash
-uv sync
+uv sync --locked
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
+uv build
 ```
 
-## Core invariant
+`uv.lock` pins runtime and development dependencies; `--locked` rejects a stale
+lockfile. Streamlit is the runtime dependency; pytest and Ruff are development
+dependencies. `uv build` uses Hatchling to build a source distribution and wheel
+in the ignored `dist/` directory. The documented app workflow uses the repository
+checkout, which includes the local Streamlit configuration and synthetic samples.
 
-For every valid reconciliation:
+[CI](.github/workflows/ci.yml) runs these gates on every push and pull request
+using Python **3.12** (the minimum) and **3.14**. It starts from a clean checkout,
+installs locked dependencies without restoring an environment cache, and builds
+both package formats. Actions are pinned to commits; uv is pinned to **0.12.23**.
+There is no deployment or publishing step.
 
-```text
-File A control total - File B control total = sum of reconciliation finding deltas
-```
+Tests cover row accounting and control-total invariants, duplicate cardinalities,
+Decimal precision and context isolation, invalid monetary text, CSV validation,
+encoding, mappings, missing versus zero amounts, evidence and export read-back.
+Streamlit [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest)
+exercises uploads, mappings, the sample workflow, source evidence, error states,
+download visibility, and stale-result invalidation.
 
-Duplicate keys are never silently paired. They remain explicit ambiguous findings even when their group totals offset to zero.
+## Python API contracts
 
-## Kernel contract
+### Reconciliation kernel
 
 - Inputs are already-parsed `SourceRecord` objects. Amounts must be finite `Decimal`
   values; floats, other numeric types, NaN, and infinity are rejected.
@@ -141,7 +212,7 @@ Duplicate keys are never silently paired. They remain explicit ambiguous finding
 - Totals and deltas use exact Decimal arithmetic isolated from the caller's Decimal
   context. No rounding, quantization, or tolerance is applied.
 
-## CSV ingestion
+### CSV ingestion
 
 `inspect_csv_columns(data, source=...)` returns validated column names in their
 original order, without requiring mappings or validating data records. It shares
@@ -198,7 +269,7 @@ result = reconcile(records_a, records_b)  # control difference: Decimal("45.00")
 when applicable. Display `str(error)` for a concise diagnostic instead of a
 traceback. Ingestion stops at the first error; it does not return partial results.
 
-## Monetary text grammar
+### Monetary text grammar
 
 `parse_amount` constructs `Decimal` directly from validated source text. There is
 no float conversion, quantization, tolerance, currency conversion, or automatic
@@ -220,16 +291,20 @@ locales, trailing signs, underscores, and scientific notation are rejected with
 `AmountParseError` (wrapped in `IngestionError` with CSV record and column context
 when ingesting CSV). No malformed amount is converted to zero.
 
-## Scope
+## Known limitations
 
-Planned v0 scope:
-
-- two CSV files at a time;
-- user-defined exact matching key;
-- one amount column per file;
-- Decimal-based monetary comparison;
-- exact matches, amount mismatches, A-only, B-only, and duplicate/ambiguous groups;
-- traceable source rows;
-- exception export.
+- CSV only, UTF-8 input, two files at a time, one amount field per file, and
+  U.S.-style monetary syntax. No Excel ingestion or export, locale inference,
+  currency conversion, or automatic sign correction.
+- Exact keys after surrounding-whitespace trimming. No fuzzy matching,
+  tolerances, automatic mappings, or decisions about the authoritative source.
+- No saved configurations, database, reconciliation history, accounting-system
+  integrations, authentication, or cloud service. The app is intended to run
+  locally from the repository root, not as a shared hosted service.
+- Inputs, evidence, and report bytes are held in memory. There is no streaming
+  ingestion or large-file performance guarantee.
+- CSV does not carry spreadsheet cell types. Reports retain raw key text and
+  exact numeric strings; follow the spreadsheet-safety guidance above.
 
 No real or confidential financial data should be committed to this repository.
+No software license has been selected; a LICENSE decision remains with the owner.
