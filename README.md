@@ -6,8 +6,75 @@ The project is intentionally narrow: correctness, row-level traceability, duplic
 
 ## Current milestone
 
-The repository contains the deterministic reconciliation kernel, strict monetary parsing,
-and CSV ingestion. The user interface remains a later milestone.
+The repository contains a local Streamlit workflow for choosing two CSV files,
+mapping columns explicitly, reconciling, and inspecting source evidence. It uses
+the existing deterministic kernel and strict CSV/monetary ingestion layer.
+
+## Run locally
+
+From the repository root:
+
+```bash
+uv sync
+uv run streamlit run src/tallydiff/app.py
+```
+
+Open <http://127.0.0.1:8501>. The checked-in Streamlit configuration binds the
+server to the local machine and disables usage telemetry. Uploaded files and
+results stay in the current local Streamlit session; the app adds no persistence
+or external integrations.
+
+### Try the synthetic example
+
+1. Upload `sample_data/file_a.csv` as **File A** and `sample_data/file_b.csv` as
+   **File B**. The app displays each filename and validated column names.
+2. Choose the mappings below. Use **+ Add key field** for the second key pair.
+   Every selector starts empty; the app does not infer mappings.
+
+   | Selection | File A | File B |
+   | --- | --- | --- |
+   | Key field 1 | Vendor ID | Supplier |
+   | Key field 2 | Invoice Number | Invoice Ref |
+   | Amount | Invoice Amount | Gross Amount |
+
+3. Click **Run reconciliation**. Expect totals of **2550** and **2305**, a net
+   difference of **+245**, one exact match, one amount mismatch, one File A-only
+   group, one File B-only group, and no duplicate groups.
+4. Select **V001 / 1042** in the exception table. Both evidence panels show source
+   record **2**, including the original amounts **1250** and **1205**. The other
+   exceptions have deltas **+500** and **-300**.
+
+The pair order defines the composite key. Duplicate selections on either side
+and incomplete mappings disable the run action. A changed file resets mappings;
+any file or mapping change clears the previous result and requires a fresh run.
+Selecting exception rows preserves the current result.
+
+Totals and table amounts are exact Decimal strings, including every fractional
+digit. Counts represent key groups. Equal control totals do not clear duplicate
+or other row-level exceptions. Every source row in an ambiguous group is shown
+in its evidence panel.
+
+Uploads must be UTF-8, optionally with a BOM. Invalid encoding and ingestion
+errors block results with contextual diagnostics. Header discovery checks only
+the header; the run action validates every data record. Header-only files are
+valid, and two empty inputs are reported as having no data records.
+
+### Application structure
+
+- `ingest.py`: shared header discovery through `inspect_csv_columns`, plus the
+  existing blocking CSV ingestion API.
+- `presentation.py`: UTF-8 decoding, ordered mapping state, configuration identity,
+  and exact string/table presentation. It contains no reconciliation rules.
+- `app.py`: Streamlit controls, calls to `ingest_csv` and `reconcile`, expected
+  error messages, summary, and source-evidence rendering.
+- Results are associated with a SHA-256 identity covering both file contents,
+  filenames, ordered key pairs, and amount selections. Every rerun checks it
+  before displaying stored results. No global cache stores uploaded financial data.
+
+Exception drill-down uses Streamlit's [single-row dataframe selection](https://docs.streamlit.io/develop/api-reference/data/st.dataframe).
+Automated [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest)
+smoke tests exercise actual upload widgets, mapping controls, results, evidence,
+and stale-result invalidation. New non-visual helpers also have focused tests.
 
 ## Development setup
 
@@ -50,6 +117,11 @@ Duplicate keys are never silently paired. They remain explicit ambiguous finding
   context. No rounding, quantization, or tolerance is applied.
 
 ## CSV ingestion
+
+`inspect_csv_columns(data, source=...)` returns validated column names in their
+original order, without requiring mappings or validating data records. It shares
+header validation with `ingest_csv`. For text streams, inspection consumes the
+header; rewind the stream or provide the original text before ingestion.
 
 `ingest_csv` accepts decoded CSV text or an open text file-like object, plus an
 explicit `Source`, ordered key column names, and an amount column name. It returns

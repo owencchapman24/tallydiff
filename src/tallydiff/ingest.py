@@ -1,7 +1,7 @@
 """Atomic CSV ingestion with explicit mappings and preserved source evidence."""
 
 import csv
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from io import StringIO
 from typing import TextIO
 
@@ -33,6 +33,19 @@ class IngestionError(ValueError):
             location += f", column {column!r}"
         detail = f" (value {value!r})" if value is not None else ""
         super().__init__(f"{location}: {reason}{detail}")
+
+
+def inspect_csv_columns(data: str | TextIO, *, source: Source) -> tuple[str, ...]:
+    """Read and validate only the header, preserving column order and exact names.
+
+    This consumes the header from a caller-owned stream without closing it.
+    Data records are validated later by ``ingest_csv`` with explicit mappings.
+    """
+
+    if not isinstance(source, Source):
+        raise TypeError("source must be a Source enum member")
+    stream = StringIO(data, newline="") if isinstance(data, str) else data
+    return tuple(_read_header(csv.reader(stream, strict=True), source))
 
 
 def ingest_csv(
@@ -70,7 +83,16 @@ def ingest_csv(
     records: list[SourceRecord] = []
     source_row = 1
     try:
-        header = _validate_header(next(reader, None), source, keys, amount_column)
+        header = _read_header(reader, source)
+        for column in keys:
+            if column not in header:
+                raise IngestionError(
+                    source, "selected key column is missing", source_row=1, column=column
+                )
+        if amount_column not in header:
+            raise IngestionError(
+                source, "selected amount column is missing", source_row=1, column=amount_column
+            )
         source_row = 2
         for values in reader:
             if len(values) != len(header):
@@ -112,12 +134,13 @@ def ingest_csv(
     return tuple(records)
 
 
-def _validate_header(
-    header: list[str] | None,
-    source: Source,
-    keys: tuple[str, ...],
-    amount_column: str,
-) -> list[str]:
+def _read_header(reader: Iterator[list[str]], source: Source) -> list[str]:
+    try:
+        header = next(reader, None)
+    except csv.Error as exc:
+        raise IngestionError(source, f"invalid CSV: {exc}", source_row=1) from None
+    except (OSError, UnicodeError) as exc:
+        raise IngestionError(source, f"could not read CSV text: {exc}", source_row=1) from None
     if not header:
         raise IngestionError(source, "missing header", source_row=1)
     seen: set[str] = set()
@@ -131,13 +154,4 @@ def _validate_header(
                 source, "duplicate column name", source_row=1, column=column, value=column
             )
         seen.add(column)
-    for column in keys:
-        if column not in seen:
-            raise IngestionError(
-                source, "selected key column is missing", source_row=1, column=column
-            )
-    if amount_column not in seen:
-        raise IngestionError(
-            source, "selected amount column is missing", source_row=1, column=amount_column
-        )
     return header

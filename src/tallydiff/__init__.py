@@ -2,7 +2,7 @@
 
 from tallydiff.amounts import AmountParseError, parse_amount
 from tallydiff.engine import ReconciliationIntegrityError, reconcile
-from tallydiff.ingest import IngestionError, ingest_csv
+from tallydiff.ingest import IngestionError, ingest_csv, inspect_csv_columns
 from tallydiff.models import (
     FindingCategory,
     ReconciliationFinding,
@@ -21,6 +21,7 @@ __all__ = [
     "Source",
     "SourceRecord",
     "ingest_csv",
+    "inspect_csv_columns",
     "parse_amount",
     "reconcile",
 ]
