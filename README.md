@@ -59,10 +59,6 @@ The files in `sample_data/` contain only synthetic records.
 5. Click **Download exception report**. The CSV contains exactly the three
    exception groups above, with blank amounts for the missing sides.
 
-<!-- Insert a real screenshot of the synthetic +245 result here after capture.
-Show summary metrics, the three exceptions, and V001 / 1042 evidence if legible.
-Do not include real financial data, unrelated browser tabs, or local user paths. -->
-
 The pair order defines the composite key. Incomplete mappings or repeated key
 column selections disable reconciliation. A changed file resets mappings; any
 file or mapping change clears the result and download until you run again.
