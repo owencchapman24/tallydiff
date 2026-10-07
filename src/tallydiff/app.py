@@ -11,6 +11,7 @@ from tallydiff import (
     ReconciliationResult,
     Source,
     SourceRecord,
+    export_exceptions_csv,
     ingest_csv,
     inspect_csv_columns,
     reconcile,
@@ -167,6 +168,14 @@ def _show_results(
     else:
         st.warning(f"{len(exceptions)} key groups require review.")
     st.subheader("Exceptions")
+    st.download_button(
+        "Download exception report",
+        data=export_exceptions_csv(result),
+        file_name="tallydiff_exceptions.csv",
+        mime="text/csv; charset=utf-8",
+        key=f"download_{identity}",
+        on_click="ignore",
+    )
     st.caption("Select a row to inspect its original source records below.")
     event = st.dataframe(
         finding_rows(exceptions),

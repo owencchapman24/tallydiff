@@ -7,7 +7,8 @@ The project is intentionally narrow: correctness, row-level traceability, duplic
 ## Current milestone
 
 The repository contains a local Streamlit workflow for choosing two CSV files,
-mapping columns explicitly, reconciling, and inspecting source evidence. It uses
+mapping columns explicitly, reconciling, inspecting source evidence, and downloading
+CSV exception reports. It uses
 the existing deterministic kernel and strict CSV/monetary ingestion layer.
 
 ## Run locally
@@ -59,12 +60,36 @@ errors block results with contextual diagnostics. Header discovery checks only
 the header; the run action validates every data record. Header-only files are
 valid, and two empty inputs are reported as having no data records.
 
+### Download an exception report
+
+After a reconciliation with exceptions, click **Download exception report** to
+save `tallydiff_exceptions.csv`. The report contains one row per exception key
+group, including zero-delta ambiguous groups; exact matches are excluded. File or
+mapping changes remove the download until a fresh reconciliation completes.
+
+Columns, in order: `Category`, `Matching key`, `File A amount`, `File B amount`,
+`Delta (A - B)`, `File A records`, `File B records`. Matching key components use
+` / `, as in the table. Amounts and signed deltas retain the application's exact
+Decimal text. Missing-side amounts are blank; a present `0.00` remains `0.00`.
+
+Each side lists **all** participating source record numbers, separated by `; `,
+including every duplicate. These refer back to the original CSV inputs: the
+header is record 1 and the first data record is 2, even with multiline fields.
+Keep the original files and the configuration shown in the UI for review.
+
+Output is ordinary comma-delimited UTF-8 CSV without a BOM, with CRLF record
+endings and standard quoting for commas, quotes, and embedded newlines. The
+UI-independent `export_exceptions_csv(result)` API returns bytes; results with
+no exceptions produce a header-only CSV, while the UI offers no download.
+
 ### Application structure
 
 - `ingest.py`: shared header discovery through `inspect_csv_columns`, plus the
   existing blocking CSV ingestion API.
 - `presentation.py`: UTF-8 decoding, ordered mapping state, configuration identity,
   and exact string/table presentation. It contains no reconciliation rules.
+- `export.py`: deterministic exception CSV bytes using the standard `csv` module
+  and the shared category labels and exact Decimal formatter.
 - `app.py`: Streamlit controls, calls to `ingest_csv` and `reconcile`, expected
   error messages, summary, and source-evidence rendering.
 - Results are associated with a SHA-256 identity covering both file contents,
