@@ -292,6 +292,53 @@ Profile tests cover strict schema validation, exact Decimal round trips, key ord
 directional compatibility, atomic application, editable controls, download
 validity, configuration privacy, and stale-result clearing.
 
+## Realistic-data validation (developer tooling)
+
+The seeded generator in `scripts/synthetic_data.py` creates entirely synthetic,
+reproducible CSV pairs with different headers and a two-column key. Every 100 key
+groups include 70 equal pairs, 10 small variances, 8 larger variances, 4 A-only,
+4 B-only, and 4 ambiguous groups. Credits, zeros, sub-cent values, leading-zero
+identifiers, shuffled records, quoted commas/newlines, and Unicode are included.
+Expected counts and totals come from construction plans and integer
+ten-thousandths; the generator does not import TallyDiff.
+
+Run the normal CI-sized integration validation or the developer benchmark:
+
+```bash
+uv run pytest tests/test_realistic_data.py
+uv run python -m scripts.benchmark --memory
+uv run python -m scripts.benchmark --groups 50000 --tolerances 0.01 --profile
+```
+
+The benchmark defaults to 1,000, 10,000, and 50,000 **key groups** (about 980,
+9,800, and 49,000 records per file), in exact and `0.01` tolerance modes. It
+separately times CSV generation, header inspection/mapping/ingestion,
+reconciliation, exception serialization, and independent verification, plus
+total elapsed time. Verification checks categories, totals, row accounting, and
+exported exception keys against the generator's truth. No product behavior is
+changed by these scripts.
+
+`--memory` adds a separate, slower `tracemalloc` pass so instrumentation does
+not distort the reported timing pass. Its peak is an estimate of Python
+allocations across the fixture and pipeline, including expected results; it is
+not whole-process RSS or native Arrow/browser memory. `--profile` prints
+standard-library cProfile cumulative costs from another instrumented pass.
+
+For manual testing in Streamlit, explicitly write a larger pair:
+
+```bash
+uv run python -m scripts.synthetic_data --groups 10000 --seed 42 --write
+```
+
+This writes CSVs and an expected-results summary only under the ignored
+`benchmark_output/` directory. Map `Vendor ID` ↔ `Supplier` and
+`Invoice Number` ↔ `Invoice Ref`, with `Invoice Amount` ↔ `Gross Amount`.
+The summary defaults to tolerance `0.01`; use `--tolerance 0` for exact mode.
+Without `--write`, generation stays in memory. Do not commit generated files.
+
+Timings depend on hardware, Python version, and workload composition. They are
+developer observations, not CI performance thresholds or capacity guarantees.
+
 ## Python API contracts
 
 ### Reconciliation kernel
