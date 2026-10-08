@@ -397,14 +397,21 @@ uv run python -m scripts.benchmark --memory
 uv run python -m scripts.benchmark --groups 50000 --tolerances 0.01 --profile
 ```
 
-The benchmark defaults to 1,000, 10,000, and 50,000 **key groups** (about 980,
-9,800, and 49,000 records per file), in exact and `0.01` tolerance modes. It
-separately times CSV generation, header inspection/mapping/ingestion,
-reconciliation, exception serialization, and independent verification, plus
-total elapsed time. Verification checks categories, totals, row accounting, and
-exported exception keys against the generator's truth. This benchmark exercises
-CSV ingestion; its timings do not measure XLSX parsing. No product behavior is
-changed by these scripts.
+The benchmark defaults to the grouped-detail workload at 1,000, 10,000, and
+50,000 **key groups**, comparing both `unique` and `grouped_by_key` with exact
+and `0.01` tolerance on the same seeded exports. Every 100 groups include
+40 one-to-one exact, 10 small variances, 10 mismatches, 10 one-sided keys,
+and 30 multi-row keys: split totals, credits, zeros, offsets, large sub-cent
+amounts, and zero-net one-sided groups. Use `--workload legacy --modes unique`
+for the earlier workload, or `--groups 10000 50000 100000 --tolerances 0.01`
+for a larger comparison. It separately times CSV generation, header
+inspection/mapping/ingestion, reconciliation, exception serialization, and
+independent verification, plus
+total elapsed time. Verification checks every key/category, group amounts and
+signed deltas, counts, control and tolerated totals, exact source-row accounting,
+and exported exception keys against the independent integer construction plans.
+This benchmark exercises CSV ingestion; its timings do not measure XLSX parsing.
+No product behavior is changed by these scripts.
 
 `--memory` adds a separate, slower `tracemalloc` pass so instrumentation does
 not distort the reported timing pass. Its peak is an estimate of Python
@@ -422,7 +429,9 @@ This writes CSVs and an expected-results summary only under the ignored
 `benchmark_output/` directory. Map `Vendor ID` ↔ `Supplier` and
 `Invoice Number` ↔ `Invoice Ref`, with `Invoice Amount` ↔ `Gross Amount`.
 The summary defaults to tolerance `0.01`; use `--tolerance 0` for exact mode.
-Without `--write`, generation stays in memory. Do not commit generated files.
+Add `--workload grouped --mode grouped_by_key` to generate the grouped-detail
+workload and its grouped expected-results summary. Without `--write`, generation
+stays in memory. Do not commit generated files.
 
 Timings depend on hardware, Python version, and workload composition. They are
 developer observations, not CI performance thresholds or capacity guarantees.
