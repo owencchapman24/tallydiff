@@ -1,5 +1,5 @@
 from collections import Counter
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal, localcontext
 from itertools import product
 
@@ -8,6 +8,7 @@ import pytest
 from tallydiff import (
     FindingCategory,
     ReconciliationIntegrityError,
+    ReconciliationMode,
     Source,
     SourceRecord,
     reconcile,
@@ -449,3 +450,342 @@ def test_tolerance_boundary_and_accepted_sum_ignore_the_callers_decimal_context(
         assert result.tolerated_delta_total == Decimal("-0.0100")
         assert result.control_difference == result.finding_delta_sum == Decimal("-0.0201")
         assert not any(context.flags.values())
+
+
+@pytest.mark.parametrize("tolerance", ["0", "0.01"])
+def test_explicit_unique_preserves_default_and_legacy_categories(tolerance: str) -> None:
+    a = [
+        record(Source.A, 1, ("a-only",), "0"),
+        record(Source.A, 2, ("duplicate",), "50"),
+        record(Source.A, 3, ("duplicate",), "50"),
+        record(Source.A, 4, ("exact",), "100"),
+        record(Source.A, 5, ("mismatch",), "100"),
+        record(Source.A, 6, ("small-delta",), "100"),
+    ]
+    b = [
+        record(Source.B, 1, ("b-only",), "0"),
+        record(Source.B, 2, ("duplicate",), "100.001"),
+        record(Source.B, 3, ("exact",), "100"),
+        record(Source.B, 4, ("mismatch",), "101"),
+        record(Source.B, 5, ("small-delta",), "100.005"),
+    ]
+    default = reconcile(a, b, amount_tolerance=Decimal(tolerance))
+    explicit = reconcile(a, b, amount_tolerance=Decimal(tolerance), mode=ReconciliationMode.UNIQUE)
+
+    assert default.mode is explicit.mode is ReconciliationMode.UNIQUE
+    assert default == explicit
+    assert [finding.category for finding in explicit.findings] == [
+        FindingCategory.A_ONLY,
+        FindingCategory.B_ONLY,
+        FindingCategory.DUPLICATE_AMBIGUOUS,
+        FindingCategory.EXACT_MATCH,
+        FindingCategory.AMOUNT_MISMATCH,
+        (
+            FindingCategory.WITHIN_TOLERANCE
+            if tolerance == "0.01"
+            else FindingCategory.AMOUNT_MISMATCH
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["unique", "grouped_by_key", "invalid", "", None, 0, True, Decimal("0"), Source.A],
+)
+def test_reconcile_rejects_invalid_mode_types(mode: object) -> None:
+    with pytest.raises(TypeError, match="mode must be a ReconciliationMode enum member"):
+        reconcile([], [], mode=mode)
+
+
+def test_invalid_mode_is_rejected_before_consuming_inputs() -> None:
+    a = record(Source.A, 1, ("INV",), "1")
+    b = record(Source.B, 1, ("INV",), "1")
+    records_a, records_b = iter([a]), iter([b])
+
+    with pytest.raises(TypeError, match="mode.*ReconciliationMode"):
+        reconcile(records_a, records_b, mode="grouped_by_key")
+
+    assert next(records_a) is a
+    assert next(records_b) is b
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_empty_reconciliation_retains_requested_mode(mode: ReconciliationMode) -> None:
+    result = reconcile(iter(()), iter(()), mode=mode)
+
+    assert result.mode is mode
+    assert result.findings == result.exceptions == result.tolerated_findings == ()
+    assert result.total_a == result.total_b == Decimal("0")
+    assert result.control_difference == result.finding_delta_sum == Decimal("0")
+
+
+@pytest.mark.parametrize("tolerance", ["0", "1"])
+@pytest.mark.parametrize(
+    ("amounts_a", "amounts_b", "total"),
+    [
+        (["300"], ["300"], "300"),
+        (["300"], ["100", "200"], "300"),
+        (["100", "200"], ["300"], "300"),
+        (["100", "200"], ["150", "150"], "300"),
+        (["100", "-100"], ["50", "-50"], "0"),
+        (["-10", "-20"], ["-30"], "-30"),
+        (["0.0001", "0.0002"], ["0.0003"], "0.0003"),
+    ],
+    ids=["one-one", "one-many", "many-one", "many-many", "offsets", "credits", "sub-cent"],
+)
+def test_grouped_exact_compares_totals_without_pairing_rows(
+    amounts_a: list[str], amounts_b: list[str], total: str, tolerance: str
+) -> None:
+    a = [record(Source.A, row, ("V", "INV"), amount) for row, amount in enumerate(amounts_a, 1)]
+    b = [record(Source.B, row, ("V", "INV"), amount) for row, amount in enumerate(amounts_b, 1)]
+
+    result = reconcile(
+        a, b, amount_tolerance=Decimal(tolerance), mode=ReconciliationMode.GROUPED_BY_KEY
+    )
+
+    assert result.mode is ReconciliationMode.GROUPED_BY_KEY
+    assert len(result.findings) == 1
+    finding = result.findings[0]
+    assert finding.category is FindingCategory.EXACT_MATCH
+    assert (
+        finding.amount_a == finding.amount_b == result.total_a == result.total_b == Decimal(total)
+    )
+    assert finding.delta == result.control_difference == result.finding_delta_sum == Decimal("0")
+    assert finding.rows_a == tuple(a) and finding.rows_b == tuple(b)
+    assert result.exceptions == result.tolerated_findings == ()
+
+
+@pytest.mark.parametrize(
+    ("last_b", "tolerance", "category", "delta"),
+    [
+        ("51", "0", FindingCategory.AMOUNT_MISMATCH, "-1"),
+        ("50.005", "0.01", FindingCategory.WITHIN_TOLERANCE, "-0.005"),
+        ("49.995", "0.01", FindingCategory.WITHIN_TOLERANCE, "0.005"),
+        ("50.01", "0.01", FindingCategory.WITHIN_TOLERANCE, "-0.01"),
+        ("49.99", "0.01", FindingCategory.WITHIN_TOLERANCE, "0.01"),
+        ("50.0101", "0.01", FindingCategory.AMOUNT_MISMATCH, "-0.0101"),
+        ("50.0001", "0", FindingCategory.AMOUNT_MISMATCH, "-0.0001"),
+        ("50.0001", "0.0001", FindingCategory.WITHIN_TOLERANCE, "-0.0001"),
+    ],
+    ids=[
+        "mismatch",
+        "negative-inside",
+        "positive-inside",
+        "negative-boundary",
+        "positive-boundary",
+        "outside",
+        "zero-tolerance",
+        "sub-cent-boundary",
+    ],
+)
+def test_grouped_tolerance_preserves_true_group_delta(
+    last_b: str, tolerance: str, category: FindingCategory, delta: str
+) -> None:
+    a = [record(Source.A, 1, ("INV",), "40"), record(Source.A, 2, ("INV",), "60")]
+    b = [record(Source.B, 1, ("INV",), "50"), record(Source.B, 2, ("INV",), last_b)]
+
+    result = reconcile(
+        a, b, amount_tolerance=Decimal(tolerance), mode=ReconciliationMode.GROUPED_BY_KEY
+    )
+
+    finding = result.findings[0]
+    assert finding.category is category
+    assert finding.amount_a == result.total_a == Decimal("100")
+    assert finding.amount_b == result.total_b
+    assert finding.delta == result.control_difference == result.finding_delta_sum == Decimal(delta)
+    assert finding.rows_a == tuple(a) and finding.rows_b == tuple(b)
+    assert result.amount_tolerance == Decimal(tolerance)
+    accepted = category is FindingCategory.WITHIN_TOLERANCE
+    assert result.tolerated_findings == ((finding,) if accepted else ())
+    assert result.tolerated_delta_total == (Decimal(delta) if accepted else Decimal("0"))
+    assert result.exceptions == (() if accepted else (finding,))
+
+
+@pytest.mark.parametrize("source", [Source.A, Source.B])
+@pytest.mark.parametrize("tolerance", ["0", "1000"])
+@pytest.mark.parametrize(
+    ("amounts", "total"),
+    [(["10", "-3"], "7"), (["100", "-100"], "0"), (["0", "0"], "0")],
+    ids=["nonzero-net", "zero-net", "zero-rows"],
+)
+def test_grouped_one_sided_presence_outranks_totals_and_tolerance(
+    source: Source, tolerance: str, amounts: list[str], total: str
+) -> None:
+    rows = [record(source, row, ("INV",), amount) for row, amount in enumerate(amounts, 1)]
+    a, b = (rows, []) if source is Source.A else ([], rows)
+
+    result = reconcile(
+        a, b, amount_tolerance=Decimal(tolerance), mode=ReconciliationMode.GROUPED_BY_KEY
+    )
+
+    finding = result.findings[0]
+    assert finding.category is (
+        FindingCategory.A_ONLY if source is Source.A else FindingCategory.B_ONLY
+    )
+    assert finding.rows_a == tuple(a) and finding.rows_b == tuple(b)
+    assert finding.amount_a == result.total_a == (Decimal(total) if a else Decimal("0"))
+    assert finding.amount_b == result.total_b == (Decimal(total) if b else Decimal("0"))
+    expected_delta = Decimal(total) if a else Decimal(total).copy_negate()
+    assert finding.delta == result.control_difference == result.finding_delta_sum == expected_delta
+    assert result.exceptions == (finding,)
+    assert result.tolerated_findings == ()
+
+
+@pytest.mark.parametrize(
+    ("count_a", "count_b", "category"),
+    [
+        (2, 1, FindingCategory.WITHIN_TOLERANCE),
+        (1, 2, FindingCategory.WITHIN_TOLERANCE),
+        (2, 2, FindingCategory.EXACT_MATCH),
+        (2, 0, FindingCategory.A_ONLY),
+        (0, 2, FindingCategory.B_ONLY),
+    ],
+)
+def test_grouped_never_emits_ambiguity_while_unique_ignores_tolerance(
+    count_a: int, count_b: int, category: FindingCategory
+) -> None:
+    a = [record(Source.A, row, ("INV",), "0.001") for row in range(1, count_a + 1)]
+    b = [record(Source.B, row, ("INV",), "0.001") for row in range(1, count_b + 1)]
+    grouped = reconcile(a, b, amount_tolerance=Decimal("1"), mode=ReconciliationMode.GROUPED_BY_KEY)
+    unique = reconcile(a, b, amount_tolerance=Decimal("1"), mode=ReconciliationMode.UNIQUE)
+
+    assert grouped.findings[0].category is category
+    assert grouped.findings[0].category is not FindingCategory.DUPLICATE_AMBIGUOUS
+    assert unique.findings[0].category is FindingCategory.DUPLICATE_AMBIGUOUS
+    assert unique.exceptions == unique.findings
+    assert unique.tolerated_findings == ()
+    assert grouped.findings[0].rows_a == unique.findings[0].rows_a == tuple(a)
+    assert grouped.findings[0].rows_b == unique.findings[0].rows_b == tuple(b)
+    assert grouped.control_difference == grouped.finding_delta_sum == unique.control_difference
+    assert unique.control_difference == unique.finding_delta_sum
+
+
+def test_grouped_duplicate_evidence_retains_identity_order_and_immutability() -> None:
+    raw = {"invoice": "INV", "amount": "2.00"}
+    a = [SourceRecord(Source.A, row, ("INV",), Decimal("2.00"), raw) for row in (9, 2)]
+    b = [record(Source.B, 8, ("INV",), "3"), record(Source.B, 1, ("INV",), "1")]
+    raw["amount"] = "999"
+    result = reconcile(a, b, mode=ReconciliationMode.GROUPED_BY_KEY)
+
+    finding = result.findings[0]
+    assert finding.category is FindingCategory.EXACT_MATCH
+    assert finding.rows_a[0] is a[1] and finding.rows_a[1] is a[0]
+    assert finding.rows_b[0] is b[1] and finding.rows_b[1] is b[0]
+    assert all(dict(row.raw_fields) == {"invoice": "INV", "amount": "2.00"} for row in a)
+    with pytest.raises(TypeError):
+        finding.rows_a[0].raw_fields["amount"] = "0"
+    with pytest.raises(FrozenInstanceError):
+        finding.rows_a[0].amount = Decimal("0")
+    with pytest.raises(FrozenInstanceError):
+        finding.rows_a = ()
+
+
+def test_grouped_mixed_findings_preserve_control_totals_rows_order_and_one_pass_inputs() -> None:
+    a = [
+        record(Source.A, 9, ("V", "exact"), "100"),
+        record(Source.A, 2, ("V", "exact"), "200"),
+        record(Source.A, 8, ("V", "tolerated"), "40"),
+        record(Source.A, 3, ("V", "tolerated"), "60"),
+        record(Source.A, 7, ("V", "mismatch"), "10"),
+        record(Source.A, 4, ("V", "mismatch"), "20"),
+        record(Source.A, 6, ("V", "a-only"), "5"),
+        record(Source.A, 5, ("V", "a-only"), "-2"),
+        record(Source.A, 11, ("V", "a-zero"), "100"),
+        record(Source.A, 12, ("V", "a-zero"), "-100"),
+    ]
+    b = [
+        record(Source.B, 9, ("V", "exact"), "150"),
+        record(Source.B, 2, ("V", "exact"), "150"),
+        record(Source.B, 8, ("V", "tolerated"), "50"),
+        record(Source.B, 3, ("V", "tolerated"), "50.005"),
+        record(Source.B, 7, ("V", "mismatch"), "5"),
+        record(Source.B, 4, ("V", "mismatch"), "20"),
+        record(Source.B, 6, ("V", "b-only"), "1"),
+        record(Source.B, 5, ("V", "b-only"), "2"),
+        record(Source.B, 11, ("V", "b-zero"), "10"),
+        record(Source.B, 12, ("V", "b-zero"), "-10"),
+    ]
+    result = reconcile(
+        iter(a),
+        (row for row in b),
+        amount_tolerance=Decimal("0.01"),
+        mode=ReconciliationMode.GROUPED_BY_KEY,
+    )
+
+    assert result == reconcile(
+        reversed(a),
+        reversed(b),
+        amount_tolerance=Decimal("0.01"),
+        mode=ReconciliationMode.GROUPED_BY_KEY,
+    )
+    assert [finding.key for finding in result.findings] == [
+        ("V", name)
+        for name in ("a-only", "a-zero", "b-only", "b-zero", "exact", "mismatch", "tolerated")
+    ]
+    assert [finding.category for finding in result.findings] == [
+        FindingCategory.A_ONLY,
+        FindingCategory.A_ONLY,
+        FindingCategory.B_ONLY,
+        FindingCategory.B_ONLY,
+        FindingCategory.EXACT_MATCH,
+        FindingCategory.AMOUNT_MISMATCH,
+        FindingCategory.WITHIN_TOLERANCE,
+    ]
+    assert result.total_a == Decimal("433")
+    assert result.total_b == Decimal("428.005")
+    assert result.control_difference == result.finding_delta_sum == Decimal("4.995")
+    assert result.tolerated_delta_total == Decimal("-0.005")
+    assert len(result.exceptions) == 5
+    accounted = [row for finding in result.findings for row in (*finding.rows_a, *finding.rows_b)]
+    assert Counter(map(id, accounted)) == Counter(map(id, [*a, *b]))
+    assert len(accounted) == len(a) + len(b) == 20
+    for finding in result.findings:
+        assert [row.source_row for row in finding.rows_a] == sorted(
+            row.source_row for row in finding.rows_a
+        )
+        assert [row.source_row for row in finding.rows_b] == sorted(
+            row.source_row for row in finding.rows_b
+        )
+
+
+@pytest.mark.parametrize("cancel_large_amounts", [False, True])
+def test_grouped_large_decimals_and_tolerance_ignore_callers_context(
+    cancel_large_amounts: bool,
+) -> None:
+    a = [record(Source.A, 1, ("INV",), "1E+1000"), record(Source.A, 2, ("INV",), "0.0001")]
+    b = [record(Source.B, 1, ("INV",), "1E+1000"), record(Source.B, 2, ("INV",), "0.0002")]
+    if cancel_large_amounts:
+        a.append(record(Source.A, 3, ("INV",), "-1E+1000"))
+        b.append(record(Source.B, 3, ("INV",), "-1E+1000"))
+    prefix = "0" if cancel_large_amounts else "1" + "0" * 1000
+    expected_a, expected_b = Decimal(prefix + ".0001"), Decimal(prefix + ".0002")
+
+    with localcontext() as context:
+        context.prec = 1
+        context.Emax = 2
+        context.Emin = -2
+        for signal in context.traps:
+            context.traps[signal] = True
+        context.clear_flags()
+        before = context.copy()
+
+        result = reconcile(
+            a, b, amount_tolerance=Decimal("0.0001"), mode=ReconciliationMode.GROUPED_BY_KEY
+        )
+
+        finding = result.findings[0]
+        assert finding.category is FindingCategory.WITHIN_TOLERANCE
+        assert finding.amount_a == result.total_a == expected_a
+        assert finding.amount_b == result.total_b == expected_b
+        assert (
+            finding.delta
+            == result.control_difference
+            == result.finding_delta_sum
+            == Decimal("-0.0001")
+        )
+        assert result.tolerated_delta_total == Decimal("-0.0001")
+        assert context.prec == before.prec
+        assert context.Emax == before.Emax
+        assert context.Emin == before.Emin
+        assert context.traps == before.traps
+        assert context.flags == before.flags

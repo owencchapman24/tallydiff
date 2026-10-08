@@ -11,6 +11,7 @@ from tallydiff.models import (
     CompositeKey,
     FindingCategory,
     ReconciliationFinding,
+    ReconciliationMode,
     ReconciliationResult,
     Source,
     SourceRecord,
@@ -26,17 +27,22 @@ def reconcile(
     records_b: Iterable[SourceRecord],
     *,
     amount_tolerance: Decimal = Decimal("0"),
+    mode: ReconciliationMode = ReconciliationMode.UNIQUE,
 ) -> ReconciliationResult:
     """Reconcile validated records by exact keys, ordered by key and source row.
 
     Inputs are snapshotted once so validation cannot consume one-pass iterables.
-    ``amount_tolerance`` must be a finite, nonnegative Decimal. Only unique
-    pairs with a nonzero absolute delta at or below it are accepted as within
-    tolerance; exact equality stays exact. All deltas retain their true values.
+    ``amount_tolerance`` must be a finite, nonnegative Decimal. Two-sided keys
+    with a nonzero absolute delta at or below it are accepted as within tolerance
+    when eligible under the mode; exact equality stays exact. All deltas retain
+    their true values. ``mode`` must be a ReconciliationMode enum member.
 
-    Duplicate keys are never paired heuristically. If either side contains more
-    than one row for a key, every row for that key is retained in a single
-    ``DUPLICATE_AMBIGUOUS`` finding.
+    In UNIQUE mode, multiple rows on either side always produce a single
+    ``DUPLICATE_AMBIGUOUS`` finding, regardless of tolerance or absent rows.
+    GROUPED_BY_KEY compares the exact totals of all rows for each key, with
+    presence taking precedence over amounts. Every source row is retained in
+    both modes. Grouped results make no claim that individual rows correspond;
+    rows are never paired heuristically.
     """
 
     if not isinstance(amount_tolerance, Decimal):
@@ -45,6 +51,8 @@ def reconcile(
         raise ValueError("amount_tolerance must be finite")
     if amount_tolerance < 0:
         raise ValueError("amount_tolerance must be nonnegative")
+    if not isinstance(mode, ReconciliationMode):
+        raise TypeError("mode must be a ReconciliationMode enum member")
 
     records_a = tuple(records_a)
     records_b = tuple(records_b)
@@ -60,7 +68,7 @@ def reconcile(
         rows_b = tuple(grouped_b.get(key, ()))
         amount_a = _sum_amounts(rows_a)
         amount_b = _sum_amounts(rows_b)
-        category = _classify(rows_a, rows_b, amount_a, amount_b, amount_tolerance)
+        category = _classify(rows_a, rows_b, amount_a, amount_b, amount_tolerance, mode)
 
         findings.append(
             ReconciliationFinding(
@@ -78,6 +86,7 @@ def reconcile(
         total_b=_sum_amounts(records_b),
         findings=tuple(findings),
         amount_tolerance=amount_tolerance,
+        mode=mode,
     )
     _assert_integrity(result, records_a, records_b)
     return result
@@ -119,8 +128,9 @@ def _classify(
     amount_a: Decimal,
     amount_b: Decimal,
     amount_tolerance: Decimal,
+    mode: ReconciliationMode,
 ) -> FindingCategory:
-    if len(rows_a) > 1 or len(rows_b) > 1:
+    if mode is ReconciliationMode.UNIQUE and (len(rows_a) > 1 or len(rows_b) > 1):
         return FindingCategory.DUPLICATE_AMBIGUOUS
     if rows_a and not rows_b:
         return FindingCategory.A_ONLY

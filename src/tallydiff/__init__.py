@@ -8,6 +8,7 @@ from tallydiff.ingest import IngestionError, ingest_csv, inspect_csv_columns
 from tallydiff.models import (
     FindingCategory,
     ReconciliationFinding,
+    ReconciliationMode,
     ReconciliationResult,
     Source,
     SourceRecord,
@@ -29,6 +30,7 @@ __all__ = [
     "ProfileError",
     "ReconciliationFinding",
     "ReconciliationIntegrityError",
+    "ReconciliationMode",
     "ReconciliationResult",
     "Source",
     "SourceRecord",
