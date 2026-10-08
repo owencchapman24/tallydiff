@@ -19,12 +19,30 @@ def _exception_downloads(app: AppTest) -> list:
     return [button for button in app.download_button if button.label == "Download exception report"]
 
 
-def _uploaded_app(data_a: bytes, data_b: bytes) -> AppTest:
+def _uploaded_app(
+    data_a: bytes, data_b: bytes, *, name_a="file_a.csv", name_b="file_b.csv"
+) -> AppTest:
     app = AppTest.from_file(str(ROOT / "src/tallydiff/app.py"), default_timeout=15).run()
     assert not app.exception
     assert not _exception_downloads(app)
-    app.file_uploader(key="upload_A").set_value(("file_a.csv", data_a, "text/csv"))
-    app.file_uploader(key="upload_B").set_value(("file_b.csv", data_b, "text/csv"))
+    app.file_uploader(key="upload_A").set_value(
+        (
+            name_a,
+            data_a,
+            "text/csv"
+            if name_a.endswith(".csv")
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    )
+    app.file_uploader(key="upload_B").set_value(
+        (
+            name_b,
+            data_b,
+            "text/csv"
+            if name_b.endswith(".csv")
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    )
     return app.run()
 
 
@@ -427,3 +445,184 @@ def test_profile_download_tracks_current_configuration_validity() -> None:
     app.selectbox(key="map_key_a_1").set_value("id")
     app.selectbox(key="map_key_b_1").set_value("id").run()
     assert not app.download_button  # Repeated selections cannot be saved.
+
+
+def _worksheet(app: AppTest, side: str):
+    return next(widget for widget in app.selectbox if widget.label == f"File {side} worksheet")
+
+
+def _acceptance_mapping(app: AppTest) -> None:
+    app.button(key="add_key").click().run()
+    for key, value in (
+        ("map_key_a_0", "Vendor ID"),
+        ("map_key_b_0", "Supplier"),
+        ("map_key_a_1", "Invoice Number"),
+        ("map_key_b_1", "Invoice Ref"),
+        ("map_amount_a", "Invoice Amount"),
+        ("map_amount_b", "Gross Amount"),
+    ):
+        app.selectbox(key=key).set_value(value)
+    app.run()
+
+
+@pytest.mark.parametrize("formats", [("xlsx", "xlsx"), ("csv", "xlsx"), ("xlsx", "csv")])
+def test_excel_and_mixed_ui_245_evidence_and_profile(acceptance_workbooks, formats) -> None:
+    data = [
+        acceptance_workbooks[index]
+        if kind == "xlsx"
+        else (ROOT / "sample_data" / f"file_{side}.csv").read_bytes()
+        for index, (side, kind) in enumerate(zip(("a", "b"), formats, strict=True))
+    ]
+    app = _uploaded_app(*data, name_a=f"a.{formats[0]}", name_b=f"b.{formats[1]}")
+    for side, kind in zip(("A", "B"), formats, strict=True):
+        assert any(f"Detected file type: {kind.upper()}" == item.value for item in app.caption)
+        if kind == "xlsx":
+            assert _worksheet(app, side).value == f"Ledger {side}"
+    _acceptance_mapping(app)
+    profile = export_mapping_profile(
+        ColumnMapping(
+            (("Vendor ID", "Supplier"), ("Invoice Number", "Invoice Ref")),
+            "Invoice Amount",
+            "Gross Amount",
+        )
+    )
+    # A version-1 profile remains usable across filenames, sheets, and formats.
+    app.file_uploader(key="profile_upload").set_value(
+        ("csv_mapping.json", profile, "application/json")
+    ).run()
+    app.button(key="apply_profile").click().run()
+    app.button(key="run").click().run()
+    assert not app.exception and not app.error
+    metrics = {metric.label: metric.value for metric in app.metric}
+    assert metrics["File A control total"] == "2550"
+    assert metrics["File B control total"] == "2305"
+    assert metrics["Net difference (A - B)"] == "+245"
+    assert metrics["Exact match"] == metrics["Amount mismatch"] == "1"
+    assert metrics["File A only"] == metrics["File B only"] == "1"
+    assert metrics["Duplicate / ambiguous"] == "0"
+    assert app.dataframe[0].value["Delta (A - B)"].tolist() == ["+45", "+500", "-300"]
+    assert len(_exception_downloads(app)) == 1
+    _select_first_exception(app)
+    assert app.dataframe[1].value["Original value"].tolist() == ["V001", "1042", "1250"]
+    assert app.dataframe[2].value["Original value"].tolist() == ["V001", "1042", "1205"]
+    for side, kind in zip(("A", "B"), formats, strict=True):
+        if kind == "xlsx":
+            assert any(f"worksheet 'Ledger {side}'" in item.value for item in app.text)
+
+    completed = app.session_state["completed"]
+    incompatible = export_mapping_profile(
+        ColumnMapping(
+            (("Vendor ID", "missing"),),
+            "Invoice Amount",
+            "Gross Amount",
+        ),
+        amount_tolerance=Decimal("0.01"),
+    )
+    app.file_uploader(key="profile_upload").set_value(
+        ("bad.json", incompatible, "application/json")
+    ).run()
+    app.button(key="apply_profile").click().run()
+    assert not app.exception
+    assert 'File B is missing required column "missing"' in app.error[0].value
+    assert app.session_state["completed"] == completed
+    assert app.session_state["key_count"] == 2
+    assert app.text_input(key="amount_tolerance").value == "0"
+    assert len(_exception_downloads(app)) == 1
+
+
+def test_multi_sheet_requires_explicit_selection_and_resets_schema(xlsx_bytes) -> None:
+    data = xlsx_bytes(
+        {
+            " First é ": [["id", "amount"], ["INV", 2]],
+            "Other": [["reference", "gross"], ["INV", 3]],
+        },
+        configure=lambda book: setattr(book, "active", 1),
+    )
+    app = _uploaded_app(data, b"id,amount\nINV,1\n", name_a="multi.xlsx")
+    sheet = _worksheet(app, "A")
+    assert sheet.options == [" First é ", "Other"]
+    assert sheet.value is None  # The active worksheet is not selected implicitly.
+    assert not app.button and not app.download_button
+    sheet.set_value(" First é ").run()
+    _simple_mapping(app)
+    app.button(key="run").click().run()
+    assert len(_exception_downloads(app)) == 1
+    assert app.session_state["completed"][1].control_difference == 1
+    _worksheet(app, "A").set_value("Other").run()
+    assert not app.exception
+    assert app.selectbox(key="map_key_a_0").options == ["reference", "gross"]
+    assert app.selectbox(key="map_key_a_0").value is None
+    assert app.selectbox(key="map_key_b_0").value is None
+    assert app.button(key="run").disabled
+    assert not app.metric and not app.download_button
+    _worksheet(app, "A").set_value(" First é ").run()
+    assert not app.metric and not _exception_downloads(app)
+
+
+@pytest.mark.parametrize("side", ["A", "B"])
+def test_same_schema_sheet_changes_invalidate_result_identity(xlsx_bytes, side) -> None:
+    data = xlsx_bytes(
+        {
+            "One": [["id", "amount"], ["INV", 2]],
+            "Two": [["id", "amount"], ["INV", 3]],
+        }
+    )
+    kwargs = {"name_a" if side == "A" else "name_b": "multi.xlsx"}
+    inputs = (data, b"id,amount\nINV,1\n") if side == "A" else (b"id,amount\nINV,1\n", data)
+    app = _uploaded_app(*inputs, **kwargs)
+    _worksheet(app, side).set_value("One").run()
+    _simple_mapping(app)
+    app.button(key="run").click().run()
+    old_identity = app.session_state["completed"][0]
+    _worksheet(app, side).set_value("Two").run()
+    assert not app.metric and not _exception_downloads(app)
+    _simple_mapping(app)
+    app.button(key="run").click().run()
+    assert not app.exception
+    assert app.session_state["completed"][0] != old_identity
+    assert app.session_state["completed"][1].control_difference == (2 if side == "A" else -2)
+    _worksheet(app, side).set_value("One").run()
+    assert not app.metric and not _exception_downloads(app)
+
+
+def test_replacing_workbook_requires_fresh_multi_sheet_selection(xlsx_bytes) -> None:
+    data = xlsx_bytes(
+        {"One": [["id", "amount"], ["INV", 1]], "Two": [["id", "amount"], ["INV", 2]]}
+    )
+    app = _uploaded_app(data, b"id,amount\nINV,1\n", name_a="first.xlsx")
+    _worksheet(app, "A").set_value("One").run()
+    _simple_mapping(app)
+    app.button(key="run").click().run()
+    replacement = xlsx_bytes(
+        {"One": [["id", "amount"], ["INV", 3]], "Two": [["id", "amount"], ["INV", 4]]}
+    )
+    app.file_uploader(key="upload_A").set_value(
+        (
+            "second.xlsx",
+            replacement,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    ).run()
+    assert _worksheet(app, "A").value is None
+    assert not app.metric and not _exception_downloads(app)
+    assert not app.exception
+
+
+def test_xlsx_formula_error_is_readable_and_blocks_download(xlsx_bytes) -> None:
+    data = xlsx_bytes({"Data": [["id", "amount"], ["INV", "=100+1"]]})
+    app = _uploaded_app(b"id,amount\nINV,101\n", data, name_b="formula.xlsx")
+    _simple_mapping(app)
+    app.button(key="run").click().run()
+    assert not app.exception
+    assert len(app.error) == 1
+    message = app.error[0].value
+    assert "File B, worksheet 'Data', worksheet row 2, column 'amount'" in message
+    assert "formula" in message and "export/paste as values" in message
+    assert not app.metric and not _exception_downloads(app)
+
+
+def test_corrupt_xlsx_ui_has_concise_error() -> None:
+    app = _uploaded_app(b"not a workbook", b"id,amount\nINV,1\n", name_a="broken.xlsx")
+    assert not app.exception
+    assert "File A: could not read XLSX workbook" in app.error[0].value
+    assert not app.metric and not app.download_button

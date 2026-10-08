@@ -190,3 +190,33 @@ def test_configuration_identity_includes_exact_decimal_tolerance() -> None:
     assert (
         len({identity(Decimal(value)) for value in ("0", "0.01", "0.010000000000000000001")}) == 3
     )
+
+
+def test_configuration_identity_includes_each_selected_worksheet() -> None:
+    mapping = ColumnMapping((("id", "id"),), "amount", "amount")
+
+    def identity(a=None, b=None):
+        return configuration_id(
+            b"same",
+            b"same",
+            mapping,
+            name_a="a.xlsx",
+            name_b="b.xlsx",
+            worksheet_a=a,
+            worksheet_b=b,
+        )
+
+    assert (
+        len(
+            {
+                identity(),
+                identity("One"),
+                identity("Two"),
+                identity(b="One"),
+                identity("One", "One"),
+                identity("One", "Two"),
+            }
+        )
+        == 6
+    )
+    assert identity("One", "Two") == identity("One", "Two")

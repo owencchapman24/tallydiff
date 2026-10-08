@@ -18,6 +18,7 @@ from tallydiff.profiles import (
     export_mapping_profile,
     load_mapping_profile,
 )
+from tallydiff.xlsx import ingest_xlsx, inspect_xlsx_columns, inspect_xlsx_sheets
 
 __all__ = [
     "AmountParseError",
@@ -34,7 +35,10 @@ __all__ = [
     "export_exceptions_csv",
     "export_mapping_profile",
     "ingest_csv",
+    "ingest_xlsx",
     "inspect_csv_columns",
+    "inspect_xlsx_columns",
+    "inspect_xlsx_sheets",
     "load_mapping_profile",
     "parse_amount",
     "reconcile",

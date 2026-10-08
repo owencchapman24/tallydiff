@@ -20,15 +20,20 @@ class IngestionError(ValueError):
         source_row: int | None = None,
         column: str | None = None,
         value: object = None,
+        worksheet: str | None = None,
     ) -> None:
         self.source = source
+        self.worksheet = worksheet
         self.source_row = source_row
         self.column = column
         self.value = value
         self.reason = reason
         location = f"File {source.value}"
+        if worksheet is not None:
+            location += f", worksheet {worksheet!r}"
         if source_row is not None:
-            location += f", source record {source_row}"
+            row_label = "worksheet row" if worksheet is not None else "source record"
+            location += f", {row_label} {source_row}"
         if column is not None:
             location += f", column {column!r}"
         detail = f" (value {value!r})" if value is not None else ""

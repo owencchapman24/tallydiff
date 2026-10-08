@@ -39,6 +39,8 @@ def configuration_id(
     name_a: str,
     name_b: str,
     amount_tolerance: Decimal = Decimal("0"),
+    worksheet_a: str | None = None,
+    worksheet_b: str | None = None,
 ) -> str:
     """Identify the files, ordered selections, and tolerance behind a displayed result."""
 
@@ -48,8 +50,8 @@ def configuration_id(
     if amount_tolerance.is_zero():
         tolerance_identity = "0"
     identity = [
-        [name_a, hashlib.sha256(data_a).hexdigest()],
-        [name_b, hashlib.sha256(data_b).hexdigest()],
+        [name_a, hashlib.sha256(data_a).hexdigest(), worksheet_a],
+        [name_b, hashlib.sha256(data_b).hexdigest(), worksheet_b],
         mapping.key_pairs,
         mapping.amount_a,
         mapping.amount_b,
