@@ -35,5 +35,28 @@ jobs:
         run: uv run ruff check .
       - name: Check formatting
         run: uv run ruff format --check .
-      - name: Build source distribution and wheel
-        run: uv build
+      - name: Build and inspect release artifacts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          canaries = (
+              "%SystemDrive%/cache/release-canary.txt",
+              "benchmark_output/release-canary.csv",
+              "local-review.patch",
+              "untracked-local-note.txt",
+              ".vscode/release-canary.json",
+              ".idea/release-canary.xml",
+              ".pytest_cache/release-canary.txt",
+              ".uv-cache/release-canary.txt",
+              "build/release-canary.txt",
+              "dist/release-canary.txt",
+              "src/tallydiff/review.patch",
+              "src/tallydiff/__pycache__/release-canary.pyc",
+          )
+          for name in canaries:
+              target = Path(name)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text("Release exclusion canary\n", encoding="utf-8")
+          PY
+          uv build
+          uv run python -m scripts.check_release_artifacts

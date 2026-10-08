@@ -1,8 +1,16 @@
+from dataclasses import FrozenInstanceError
 from decimal import Decimal
 
 import pytest
 
-from tallydiff import FindingCategory, Source, SourceRecord, reconcile
+from tallydiff import (
+    FindingCategory,
+    ReconciliationMode,
+    ReconciliationResult,
+    Source,
+    SourceRecord,
+    reconcile,
+)
 
 
 @pytest.mark.parametrize("amount", [0.1, 10, "10.00", True, None])
@@ -72,3 +80,30 @@ def test_raw_fields_are_an_immutable_snapshot() -> None:
 def test_raw_fields_must_be_a_string_mapping(raw_fields: object) -> None:
     with pytest.raises(TypeError, match="raw_fields.*mapping of strings"):
         SourceRecord(Source.A, 1, ("INV",), Decimal("1"), raw_fields)
+
+
+def test_result_default_mode_preserves_existing_constructor_positions() -> None:
+    default = ReconciliationResult(Decimal("10"), Decimal("9"), ())
+    with_tolerance = ReconciliationResult(Decimal("10"), Decimal("9"), (), Decimal("0.01"))
+
+    assert default.mode is with_tolerance.mode is ReconciliationMode.UNIQUE
+    assert default.amount_tolerance == Decimal("0")
+    assert with_tolerance.amount_tolerance == Decimal("0.01")
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_result_retains_explicit_mode(mode: ReconciliationMode) -> None:
+    result = ReconciliationResult(Decimal("0"), Decimal("0"), (), mode=mode)
+
+    assert result.mode is mode
+    with pytest.raises(FrozenInstanceError):
+        result.mode = ReconciliationMode.UNIQUE
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["unique", "grouped_by_key", "invalid", "", None, 0, True, Decimal("0"), Source.A],
+)
+def test_result_rejects_invalid_mode_types(mode: object) -> None:
+    with pytest.raises(TypeError, match="mode must be a ReconciliationMode enum member"):
+        ReconciliationResult(Decimal("0"), Decimal("0"), (), mode=mode)

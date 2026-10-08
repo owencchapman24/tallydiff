@@ -1,22 +1,28 @@
 # TallyDiff
 
-**TallyDiff v0.2.0** compares two structured financial exports locally and explains
-which records account for their difference. Pair exact key columns, such as
-vendor and invoice number, then review unequal amounts, missing records, and
-duplicate keys with their source evidence.
+**TallyDiff v0.3.0** compares two structured financial exports locally and explains
+which key groups account for their difference. Pair exact key columns, such as
+vendor and invoice number, then compare unique records or explicitly aggregate
+all rows sharing each key. Review differences with every original source row.
 
 - **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
   worksheet per workbook; multiple worksheets require an explicit choice.
+- **Two reconciliation modes**: **Unique records** keeps duplicate keys ambiguous;
+  **Group by matching key** compares exact-key totals without inferring individual
+  row correspondence.
 - **Absolute amount tolerance**, defaulting to zero. Accepted nonzero differences
   remain visible in a distinct **Within tolerance** category and review table.
-- **Reusable mapping profiles** for ordered key pairs, amount columns, and
-  tolerance. Version 1 profiles work across formats with matching column names.
+- **Reusable mapping profiles** for ordered key pairs, amount columns, tolerance,
+  and reconciliation mode. Current profiles use schema version 2; valid version 1
+  profiles remain supported and load as Unique records.
 - **Exact Decimal arithmetic** after parsing. XLSX numeric cells first convert
   through decimal text; Excel display formatting is not reconstructed.
 - **Conservative formula handling**: formulas in selected key or amount fields
   block ingestion. Formulas are never calculated and cached results are not used.
 - **Traceable exceptions and CSV export**, with every source row accounted for
   and all finding deltas explaining the control-total difference.
+- **Display-only exception review** with key search, category and minimum-delta
+  filters, and deterministic sorting. The exception export always stays complete.
 
 Equal totals alone never imply a reconciliation. TallyDiff reports differences;
 it does not decide which source is authoritative. See [known limitations](#known-limitations)
@@ -25,8 +31,9 @@ and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exp
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
 The screenshot shows the synthetic +245 CSV example in the earlier interface.
-The same result remains valid in v0.2.0; current controls also include tolerance,
-mapping profiles, and XLSX worksheet selection.
+The same Unique records result remains valid in v0.3.0. This image predates
+reconciliation modes, review controls, tolerance, mapping profiles, and XLSX
+worksheet selection; it does not show the full current workflow.
 
 ## Quick start
 
@@ -59,7 +66,8 @@ The files in `sample_data/` contain only synthetic records.
    | Key field 2 | Invoice Number | Invoice Ref |
    | Amount | Invoice Amount | Gross Amount |
 
-3. Leave **Amount tolerance** at its default `0`, then click **Run reconciliation**.
+3. Leave **Reconciliation mode** at **Unique records** and **Amount tolerance** at
+   its default `0`, then click **Run reconciliation**.
    Expect File A total **2550**, File B total **2305**, and net difference **+245**. The four key groups are:
 
    | Matching key | Category | Delta (A - B) |
@@ -76,23 +84,47 @@ The files in `sample_data/` contain only synthetic records.
 
 The pair order defines the composite key. Incomplete mappings or repeated key
 column selections disable reconciliation. A changed file or worksheet resets
-mappings; any file, worksheet, mapping, or tolerance change clears the result and
-download until you run again. Selecting an exception or accepted variance preserves the current result.
+mappings; any file, worksheet, mapping, mode, or tolerance change clears the
+result and download until you run again. Review controls and evidence selection
+preserve the current result.
+
+## Reconciliation modes
+
+**Unique records** is the default. Exactly one source row on each side is eligible
+for an exact, tolerated, or mismatched comparison. More than one row on either
+side makes the entire exact-key group **Duplicate / ambiguous**, even when totals
+agree, offset to zero, or the other side is absent. All rows remain visible.
+
+**Group by matching key** totals every row sharing the explicitly mapped composite
+key independently on each side, then compares those totals. For example, File A
+rows of `100` and `200` versus a File B row of `300` form an exact group. This
+supports one-to-many, many-to-one, and many-to-many key groups without guessing
+row pairs. Presence takes precedence over net amount: a zero-net group with no
+File B rows remains **File A only**, and vice versa.
+
+**Key-total agreement does not establish individual-row correspondence.** Grouped
+mode performs no subset-sum search, allocation, or inferred many-to-many matching.
+The result discloses its mode and keeps this disclaimer visible. Its **Grouped
+exact key totals** table offers selectable evidence only for exact findings with
+multiple source rows on at least one side. The overall **Exact match** count still
+includes one-to-one exact findings. All counts represent key groups, not rows.
 
 ## Absolute amount tolerance
 
 **Amount tolerance** accepts ordinary monetary text in the same units as the
-selected amount columns. It defaults to `0`, requiring exact equality for unique pairs.
+selected amount columns. It defaults to `0`, requiring exact equality in either mode.
 Negative, blank, malformed, and non-finite values block reconciliation. The
 existing monetary grammar is used directly to construct a Decimal; no float
 conversion or rounding occurs, and more than two decimal places are supported.
 
-Tolerance applies only to a key with exactly one record on each side. Exact
+Tolerance applies to eligible keys present on both sides: single records in
+Unique records mode, or complete key totals in Group by matching key mode. Exact
 equality remains **Exact match**. A nonzero difference is **Within tolerance**
 when `abs(A - B) <= tolerance` (inclusive); larger differences are **Amount
 mismatch**. At tolerance `0.01`, `100.00` versus `100.01` is within tolerance with
 a true delta of `-0.01`; `100.00` versus `100.02` remains an amount mismatch.
-One-sided records and duplicate / ambiguous groups always require review.
+One-sided groups always require review, including zero-net grouped keys. Duplicate
+/ ambiguous groups in Unique records mode remain exceptions regardless of tolerance.
 
 Within-tolerance findings are accepted variances, excluded from ordinary
 exceptions and their CSV report. The summary shows the tolerance used and the
@@ -109,16 +141,17 @@ include all true deltas; tolerance never zeroes, rounds, or hides arithmetic.
 
 For recurring exports with the same logical columns, save the current valid
 configuration with **Download mapping profile**. The app offers this download
-once the ordered key pairs, both amount columns, and tolerance are valid; you do
+once the ordered key pairs, both amount columns, mode, and tolerance are valid; you do
 not need to run reconciliation first. The default filename is
 `tallydiff_profile.json`, and you may rename it outside TallyDiff.
 
 A profile remembers ordered File A ↔ File B key pairs, both amount columns,
-and the exact Decimal tolerance, including fractional trailing zeroes such as
+reconciliation mode, and the exact Decimal tolerance, including trailing zeroes such as
 `0.0100`. It contains column names and configuration only: no uploaded source
-records, source filenames or hashes, financial amounts, totals, findings, or
-timestamps. Profiles stay local; TallyDiff uses no external service, profile
-directory, database, account, browser storage, or automatic filesystem writes.
+records, source filenames or hashes, worksheet names, financial amounts, totals,
+findings, timestamps, or machine-specific paths. Profiles stay local; TallyDiff
+uses no external service, profile directory, database, account, browser storage,
+or automatic filesystem writes.
 Saving is an explicit download to a location you choose.
 
 To reuse a profile:
@@ -129,7 +162,7 @@ To reuse a profile:
    not change the current configuration.
 3. Click **Apply profile**. TallyDiff validates the entire profile and every
    required column on its configured side before changing any setting.
-4. Check the populated key pairs, amount columns, and tolerance, then click
+4. Check the populated key pairs, amount columns, mode, and tolerance, then click
    **Run reconciliation**. Applying a valid profile clears any prior result and
    exception download, even if its configuration is identical.
 5. Edit any populated control normally if needed, and download a new profile
@@ -137,7 +170,7 @@ To reuse a profile:
 
 Column names must match exactly on the correct side, including case and
 whitespace. Extra columns and changed filenames or header order are allowed.
-Version 1 profiles are format-agnostic: they contain no input type or worksheet
+Profiles are format-agnostic: they contain no input type or worksheet
 name, and work with any CSV/XLSX combination exposing the required columns.
 Missing or renamed required columns produce an error naming the unavailable
 columns; nothing is partially applied or guessed. A rejected profile leaves the
@@ -149,7 +182,7 @@ Profiles use UTF-8 JSON with a stable format identifier and schema version:
 ```json
 {
   "format": "tallydiff-mapping-profile",
-  "version": 1,
+  "version": 2,
   "key_pairs": [
     {"file_a": "Vendor ID", "file_b": "Supplier"},
     {"file_a": "Invoice Number", "file_b": "Invoice Ref"}
@@ -158,13 +191,18 @@ Profiles use UTF-8 JSON with a stable format identifier and schema version:
     "file_a": "Invoice Amount",
     "file_b": "Gross Amount"
   },
-  "amount_tolerance": "0.0100"
+  "amount_tolerance": "0.0100",
+  "reconciliation_mode": "grouped_by_key"
 }
 ```
 
 Tolerance is a JSON string parsed directly with the monetary grammar; JSON
-numeric tolerances are rejected. Version 1 requires exactly the documented
-fields and structures. Invalid JSON, duplicate object fields, unsupported
+numeric tolerances are rejected. Schema version 2 requires exactly the documented
+fields, including `reconciliation_mode`, whose only values are `"unique"` and
+`"grouped_by_key"`. Valid schema version 1 profiles contain the same fields except
+`reconciliation_mode` and always load as **Unique records**. Current downloads
+always use schema version 2. Package version **0.3.0** and profile schema version
+**2** are separate versions. Invalid JSON, duplicate object fields, unsupported
 formats or versions, blank or repeated key selections, invalid amount names,
 and invalid or negative tolerance are rejected with a concise message.
 
@@ -246,22 +284,24 @@ Processing is local and in memory using openpyxl; Excel/LibreOffice are not
 required. Legacy `.xls`, macro-enabled `.xlsm`, templates, encrypted workbooks,
 formula calculation, table/pivot interpretation, named ranges, and reconciling
 multiple sheets at once are unsupported. The exception download remains CSV;
-TallyDiff does not write Excel workbooks. Mapping-profile version 1 stays unchanged
-and stores only mappings and tolerance, independent of format, filename, or sheet.
+TallyDiff does not write Excel workbooks. Schema version 2 profiles store mappings,
+tolerance, and mode independently of input format, filename, or sheet; valid
+version 1 profiles continue to load as Unique records.
 
 ## Correctness and traceability
 
-| Category | Meaning |
-| --- | --- |
-| Exact match | One record on each side with equal amounts. |
-| Within tolerance | One record on each side with a nonzero absolute delta at or below tolerance. |
-| Amount mismatch | One record on each side with an absolute delta above tolerance. |
-| File A only | One File A record and no File B record. |
-| File B only | One File B record and no File A record. |
-| Duplicate / ambiguous | More than one record on either side; all records need review. |
+| Category | Unique records | Group by matching key |
+| --- | --- | --- |
+| Exact match | One row on each side with equal amounts. | Both sides present with equal key totals. |
+| Within tolerance | One row on each side with a nonzero absolute delta at or below tolerance. | Both sides present with a nonzero absolute key-total delta at or below tolerance. |
+| Amount mismatch | One row on each side with an absolute delta above tolerance. | Both sides present with an absolute key-total delta above tolerance. |
+| File A only | One File A row and no File B row. | One or more File A rows and no File B rows, even with a zero net amount. |
+| File B only | One File B row and no File A row. | One or more File B rows and no File A rows, even with a zero net amount. |
+| Duplicate / ambiguous | More than one row on either side; all rows need review. | Not emitted: every exact-key group is compared by presence and totals. |
 
-Duplicates take precedence over the other categories. They are never silently
-paired or discarded, even when their aggregate amounts agree or offset to zero.
+In Unique records mode, duplicates take precedence over other categories, even
+when amounts agree or offset to zero. Grouped mode checks presence before totals.
+Neither mode silently pairs or discards source rows.
 Counts represent key groups, while the evidence panels retain every source row.
 A missing side shows an em dash in the table and a blank amount in the export;
 a present zero-dollar record shows its actual Decimal amount, such as `0.00`.
@@ -280,12 +320,39 @@ by source record number. Cell-value evidence is preserved in immutable snapshots
 XLSX source numbers are actual worksheet rows. The CSV header is record **1**, and the first data record is **2**; a quoted multiline
 field is still part of one record, so these are not necessarily physical line numbers.
 
+## Exception review controls
+
+The exception table supports these display-only controls:
+
+- **Search matching keys** finds a case-insensitive substring within any key
+  component. Surrounding search whitespace is ignored; matching keys themselves
+  are not normalized, fuzzily matched, or interpreted as regular expressions.
+- **Exception categories** selects amount mismatch, File A only, File B only,
+  and duplicate / ambiguous groups. All are selected initially; selecting none
+  shows no exceptions.
+- **Minimum absolute delta** defaults to `0` and includes the boundary. Blank
+  means zero. Invalid or negative input shows an error without clearing the
+  completed reconciliation. This filter does not change amount tolerance.
+- **Exception sort order** defaults to ascending matching key, with absolute delta
+  options largest or smallest first. Equal absolute deltas use the key as a
+  deterministic tie-breaker.
+
+**Showing X of Y exception groups** distinguishes displayed and total counts. A view
+with no matches leaves the completed result available. Selecting any visible row
+opens every original source row for that finding, including multi-row groups.
+Exact grouped totals and accepted variances retain separate evidence tables.
+
+Review controls and evidence selection do not change configuration identity,
+profiles, reconciliation metrics, control totals, or the exception download.
+**Download exception report always contains all exceptions**, including those
+hidden by the current search or filters.
+
 ## Exception report
 
-**Download exception report** saves `tallydiff_exceptions.csv` for the currently
-displayed reconciliation. There is one row per exception key group, including
-zero-delta ambiguous groups. Exact matches and accepted within-tolerance findings
-are excluded; the UI offers no exception download when there are no exceptions.
+**Download exception report** saves `tallydiff_exceptions.csv` for the complete
+reconciliation result, including exceptions hidden by review controls. There
+is one row per exception key group, including zero-delta ambiguous and one-sided
+groups. Exact matches and accepted within-tolerance findings are excluded; the UI offers no exception download when there are no exceptions.
 When accepted variance exists, exception-report deltas alone need not equal the
 control difference: add the net accepted variance shown in the UI.
 
@@ -330,18 +397,20 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `xlsx.py` | Worksheet/header discovery and atomic XLSX validation into the same source records. |
 | `configuration.py` | Shared ordered column mappings and manual mapping validation. |
 | `profiles.py` | Validated JSON profile import/export and directional column compatibility. |
-| `presentation.py` | UTF-8 decoding, configuration identity and display strings. |
+| `presentation.py` | UTF-8 decoding, configuration identity, review filtering/sorting and display strings. |
 | `export.py` | Ordinary CSV bytes, reusing UI-independent labels and Decimal formatting. |
 | `app.py` | Streamlit controls, error messages, results, download and source evidence. |
 
 Public Python APIs are exposed through `tallydiff`. The engine and export layer
 have no Streamlit dependency. The UI performs no financial calculations.
 Results carry a SHA-256 identity covering file contents, filenames, ordered key
-pairs, amount selections, selected worksheets, and the effective Decimal tolerance; each rerun checks
-it before showing results or a download. Profile filenames and JSON formatting
-do not enter this identity; equivalent tolerance values share an identity while
-profile serialization preserves their fractional trailing zeroes. Expected validation failures are shown explicitly; unexpected errors
-are not broadly swallowed.
+pairs, amount selections, selected worksheets, mode, and the effective Decimal
+tolerance; each rerun checks it before showing results or a download. Review
+search, categories, minimum delta, sort order, evidence selection, profile filenames,
+and JSON formatting do not enter this identity. Equivalent tolerance values share
+an identity while profile serialization preserves their fractional trailing zeroes.
+Expected validation failures are shown explicitly; unexpected errors are not
+broadly swallowed.
 
 ## Development and verification
 
@@ -351,21 +420,35 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv build
+uv run python -m scripts.check_release_artifacts
+git diff --check
 ```
 
 `uv.lock` pins runtime and development dependencies; `--locked` rejects a stale
 lockfile. Streamlit and openpyxl are runtime dependencies; pytest and Ruff are development
-dependencies. `uv build` uses Hatchling to build a source distribution and wheel
-in the ignored `dist/` directory. The documented app workflow uses the repository
-checkout, which includes the local Streamlit configuration and synthetic samples.
+dependencies. Normal `uv build` uses an isolated Hatchling build to create a source
+distribution and wheel in the ignored `dist/` directory. Explicit build selection
+limits the wheel to runtime package files and metadata. The source distribution
+retains source, tests, developer scripts, project metadata, README, synthetic
+samples, the screenshot, CI workflow, and local Streamlit configuration.
+
+Build exclusions also reject `%SystemDrive%/`, `benchmark_output/`, caches, build
+output, virtual environments, review patches, and IDE files, even when present in
+the local tree. `.gitignore` provides additional workspace hygiene. The stdlib
+artifact guard checks both archives without extraction: exact intended file sets,
+metadata versions, and source bytes must match the current checkout. The documented
+app workflow uses that checkout, including its local configuration and samples.
 
 [CI](.github/workflows/ci.yml) runs these gates on every push and pull request
 using Python **3.12** (the minimum) and **3.14**. It starts from a clean checkout,
-installs locked dependencies without restoring an environment cache, and builds
-both package formats. Actions are pinned to commits; uv is pinned to **0.12.23**.
+installs locked dependencies without restoring an environment cache, and normally
+builds both package formats with isolation. Deliberately seeded local-artifact
+canaries exercise packaging exclusions before the artifact guard inspects both
+archives. Actions are pinned to commits; uv is pinned to **0.12.23**.
 There is no deployment or publishing step.
 
-Tests cover row accounting and control-total invariants, duplicate cardinalities,
+Tests cover both modes, grouped cardinalities and evidence, row accounting and
+control-total invariants, duplicate ambiguity in Unique records mode,
 Decimal precision and context isolation, invalid monetary text, CSV validation,
 encoding, mappings, missing versus zero amounts, evidence and export read-back.
 Streamlit [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest)
@@ -373,7 +456,10 @@ exercises uploads, mappings, the sample workflow, source evidence, error states,
 download visibility, and stale-result invalidation. Tolerance tests cover inclusive
 boundaries, high precision, invalid types and values, duplicate and one-sided
 precedence, accepted variance totals, separate review, and export exclusion.
-Profile tests cover strict schema validation, exact Decimal round trips, key order,
+Review tests cover display-only filtering/sorting, correct filtered-row evidence,
+and complete exports. Artifact tests cover archive contamination, omissions,
+metadata, and source mismatches. Profile tests cover strict version 1/2 schema
+validation, migration to Unique records, exact Decimal round trips, key order,
 directional compatibility, atomic application, editable controls, download
 validity, configuration privacy, and stale-result clearing. XLSX tests cover
 worksheet selection, cell conversion, formula/error rejection, row references,
@@ -382,9 +468,9 @@ corrupt inputs, resource closure, mixed-format results, and stale worksheet chan
 ## Realistic-data validation (developer tooling)
 
 The seeded generator in `scripts/synthetic_data.py` creates entirely synthetic,
-reproducible CSV pairs with different headers and a two-column key. Every 100 key
-groups include 70 equal pairs, 10 small variances, 8 larger variances, 4 A-only,
-4 B-only, and 4 ambiguous groups. Credits, zeros, sub-cent values, leading-zero
+reproducible CSV pairs with different headers and a two-column key. In the retained
+legacy workload, every 100 key groups include 70 equal pairs, 10 small variances,
+8 larger variances, 4 A-only, 4 B-only, and 4 ambiguous groups. Credits, zeros, sub-cent values, leading-zero
 identifiers, shuffled records, quoted commas/newlines, and Unicode are included.
 Expected counts and totals come from construction plans and integer
 ten-thousandths; the generator does not import TallyDiff.
@@ -397,14 +483,21 @@ uv run python -m scripts.benchmark --memory
 uv run python -m scripts.benchmark --groups 50000 --tolerances 0.01 --profile
 ```
 
-The benchmark defaults to 1,000, 10,000, and 50,000 **key groups** (about 980,
-9,800, and 49,000 records per file), in exact and `0.01` tolerance modes. It
-separately times CSV generation, header inspection/mapping/ingestion,
-reconciliation, exception serialization, and independent verification, plus
-total elapsed time. Verification checks categories, totals, row accounting, and
-exported exception keys against the generator's truth. This benchmark exercises
-CSV ingestion; its timings do not measure XLSX parsing. No product behavior is
-changed by these scripts.
+The benchmark defaults to the grouped-detail workload at 1,000, 10,000, and
+50,000 **key groups**, comparing both `unique` and `grouped_by_key` with exact
+and `0.01` tolerance on the same seeded exports. Every 100 groups include
+40 one-to-one exact, 10 small variances, 10 mismatches, 10 one-sided keys,
+and 30 multi-row keys: split totals, credits, zeros, offsets, large sub-cent
+amounts, and zero-net one-sided groups. Use `--workload legacy --modes unique`
+for the earlier workload, or `--groups 10000 50000 100000 --tolerances 0.01`
+for a larger comparison. It separately times CSV generation, header
+inspection/mapping/ingestion, reconciliation, exception serialization, and
+independent verification, plus
+total elapsed time. Verification checks every key/category, group amounts and
+signed deltas, counts, control and tolerated totals, exact source-row accounting,
+and exported exception keys against the independent integer construction plans.
+This benchmark exercises CSV ingestion; its timings do not measure XLSX parsing.
+No product behavior is changed by these scripts.
 
 `--memory` adds a separate, slower `tracemalloc` pass so instrumentation does
 not distort the reported timing pass. Its peak is an estimate of Python
@@ -422,7 +515,14 @@ This writes CSVs and an expected-results summary only under the ignored
 `benchmark_output/` directory. Map `Vendor ID` ↔ `Supplier` and
 `Invoice Number` ↔ `Invoice Ref`, with `Invoice Amount` ↔ `Gross Amount`.
 The summary defaults to tolerance `0.01`; use `--tolerance 0` for exact mode.
-Without `--write`, generation stays in memory. Do not commit generated files.
+Add `--workload grouped --mode grouped_by_key` to generate the grouped-detail
+workload and its grouped expected-results summary. Without `--write`, generation
+stays in memory. Do not commit generated files.
+
+Independent deterministic synthetic validation has exercised **100,000 key
+groups** in both modes, including row accounting, control totals, exception
+exports, and repeatability. Integration tests also validate CSV ↔ CSV, CSV ↔ XLSX,
+XLSX ↔ CSV, and XLSX ↔ XLSX in both modes. These checks use synthetic data only.
 
 Timings depend on hardware, Python version, and workload composition. They are
 developer observations, not CI performance thresholds or capacity guarantees.
@@ -431,12 +531,14 @@ developer observations, not CI performance thresholds or capacity guarantees.
 
 ### Reconciliation kernel
 
-`reconcile(records_a, records_b, *, amount_tolerance=Decimal("0"))` preserves the
-exact-equality classification when tolerance is omitted or zero. Tolerance must be a
+`reconcile(records_a, records_b, *, amount_tolerance=Decimal("0"),
+mode=ReconciliationMode.UNIQUE)` defaults to Unique records and exact equality.
+`mode` must be a `ReconciliationMode` enum member (`UNIQUE` or `GROUPED_BY_KEY`);
+strings and other types raise `TypeError` before inputs are consumed. Tolerance must be a
 finite, nonnegative `Decimal`; other types raise `TypeError`, and non-finite or
 negative Decimals raise `ValueError`. No numeric coercion is performed.
 
-`ReconciliationResult.amount_tolerance` records the configured value.
+`ReconciliationResult.mode` and `.amount_tolerance` record the configured values.
 `result.tolerated_findings` contains accepted nonzero differences, and
 `result.tolerated_delta_total` is their exact signed net delta.
 `finding.is_exception` and `result.exceptions` exclude exact and within-tolerance
@@ -450,8 +552,10 @@ every group, including accepted variances.
   each file; the same row number may appear in both files.
 - Keys are compared exactly, without trimming or case conversion. Raw fields are
   preserved in an immutable copy for traceability.
-- Every input row appears in exactly one finding. Multiple rows on either side of
-  a key produce one ambiguous group containing all rows, even with equal totals.
+- Every input row appears in exactly one finding. In Unique records mode, multiple
+  rows on either side produce one ambiguous group containing all rows, even with
+  equal totals. In grouped mode, all exact-key rows contribute to their side total;
+  a missing side remains one-sided regardless of its opposite net amount.
 - Findings are sorted by key, and rows within each finding by source row number.
   Inputs are snapshotted once, including one-pass iterables.
 - Totals and deltas use exact Decimal arithmetic isolated from the caller's Decimal
@@ -463,11 +567,13 @@ every group, including accepted variances.
 the UI use it. The existing `tallydiff.presentation.ColumnMapping` import remains
 available for compatibility, and public profile APIs are exposed via `tallydiff`:
 
-- `export_mapping_profile(mapping, *, amount_tolerance=Decimal("0")) -> bytes`
+- `export_mapping_profile(mapping, *, amount_tolerance=Decimal("0"),
+  reconciliation_mode=ReconciliationMode.UNIQUE) -> bytes`
   validates a complete configuration and returns UTF-8 JSON without writing files.
 - `load_mapping_profile(data: bytes | str) -> MappingProfile` returns immutable,
-  validated `mapping` and `amount_tolerance` fields. It accepts a UTF-8 BOM on byte
-  input and raises `ProfileError` for invalid profile contents.
+  validated `mapping`, `amount_tolerance`, and `reconciliation_mode` fields. Schema
+  version 1 loads with `ReconciliationMode.UNIQUE`; current exports use version 2.
+  It accepts a UTF-8 BOM on byte input and raises `ProfileError` for invalid contents.
 - `profile.validate_columns(columns_a, columns_b)` raises `ProfileError` listing
   missing directional columns; extra columns are allowed. Call it before applying
   settings to currently uploaded files.
@@ -522,7 +628,7 @@ result = reconcile(records_a, records_b)  # control difference: Decimal("45.00")
 - Blank records, extra or missing fields, malformed quoting, invalid amounts,
   and text read/decoding errors block ingestion. A valid header with no data
   produces an empty tuple. Duplicate **data keys** are retained for the engine
-  to report as ambiguous groups.
+  to classify according to the selected reconciliation mode.
 - Caller-owned streams are consumed from their current position and never closed.
   Open files with `newline=""` and an explicit encoding. For UTF-8 files with an
   optional byte-order mark, use `encoding="utf-8-sig"`; ingestion does not infer
@@ -586,10 +692,14 @@ when ingesting CSV). No malformed amount is converted to zero.
   reconstruct leading zeroes; store meaningful leading zeroes as text. Date/time
   keys use openpyxl's ISO representation and may differ from a text date export.
 - Column mappings require exact names on the configured side. Key matching trims
-  surrounding whitespace only. There is no automatic mapping, fuzzy matching,
-  many-to-one pairing, or authority determination. Tolerance is one global
-  absolute amount, with no percentage or per-row tolerance.
-- Configuration reuse uses explicit version-1 JSON profile uploads/downloads.
+  surrounding whitespace only, with no further automatic key normalization,
+  automatic mapping, or fuzzy matching. Grouped mode aggregates only by that
+  explicit exact key; it does not infer individual-row correspondence, subset-sum
+  matches, allocations, or many-to-many matching. Tolerance is one global absolute
+  amount, with no percentage or per-row tolerance. TallyDiff does not determine
+  authority, make accounting decisions, or automate journal entries.
+- Configuration reuse uses explicit schema-version-2 JSON profile downloads,
+  with valid version 1 profiles supported as Unique records.
   Profiles require compatible columns and contain no financial records, results,
   source filenames, or hashes. There is no managed profile library, database,
   reconciliation history, accounting-system integration, authentication, or cloud

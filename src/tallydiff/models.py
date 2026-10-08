@@ -20,6 +20,13 @@ class Source(StrEnum):
     B = "B"
 
 
+class ReconciliationMode(StrEnum):
+    """Whether exact keys require unique rows or compare all source-row totals."""
+
+    UNIQUE = "unique"
+    GROUPED_BY_KEY = "grouped_by_key"
+
+
 class FindingCategory(StrEnum):
     """Mutually exclusive outcome for one exact reconciliation key."""
 
@@ -107,6 +114,11 @@ class ReconciliationResult:
     total_b: Decimal
     findings: tuple[ReconciliationFinding, ...]
     amount_tolerance: Decimal = Decimal("0")
+    mode: ReconciliationMode = ReconciliationMode.UNIQUE
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, ReconciliationMode):
+            raise TypeError("mode must be a ReconciliationMode enum member")
 
     @property
     def control_difference(self) -> Decimal:

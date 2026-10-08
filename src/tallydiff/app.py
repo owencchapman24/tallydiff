@@ -1,5 +1,6 @@
 """Run with: uv run streamlit run src/tallydiff/app.py."""
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from hashlib import sha256
@@ -15,6 +16,7 @@ from tallydiff import (
     ProfileError,
     ReconciliationFinding,
     ReconciliationIntegrityError,
+    ReconciliationMode,
     ReconciliationResult,
     Source,
     SourceRecord,
@@ -31,11 +33,15 @@ from tallydiff import (
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
+    EXCEPTION_CATEGORIES,
+    EXCEPTION_SORT_LABELS,
+    MODE_LABELS,
     configuration_id,
     decode_upload,
     display_amount,
     evidence_rows,
     finding_rows,
+    review_exceptions,
 )
 
 
@@ -121,7 +127,8 @@ def _choose_file(source: Source) -> _Input | None:
 def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
     st.subheader("Mapping profile")
     st.caption(
-        "Reuse column mappings and amount tolerance with a local JSON profile. "
+        "Reuse column mappings, amount tolerance, and reconciliation mode "
+        "with a local JSON profile. "
         "Profiles contain no uploaded records or reconciliation results."
     )
     upload = st.file_uploader("Mapping profile JSON", type=["json"], key="profile_upload")
@@ -142,6 +149,7 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
             st.session_state.map_amount_a = profile.mapping.amount_a
             st.session_state.map_amount_b = profile.mapping.amount_b
             st.session_state.amount_tolerance = format(profile.amount_tolerance, "f")
+            st.session_state.reconciliation_mode = profile.reconciliation_mode
             st.session_state.profile_notice = True
             st.rerun()
     if st.session_state.pop("profile_notice", False):
@@ -242,6 +250,64 @@ def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_ke
             _show_evidence(finding.rows_b, Source.B)
 
 
+def _show_exception_review(findings: tuple[ReconciliationFinding, ...], *, identity: str) -> None:
+    query = st.text_input(
+        "Search matching keys",
+        key=f"review_search_{identity}",
+        help="Case-insensitive substring search within each matching-key component.",
+    )
+    categories = st.multiselect(
+        "Exception categories",
+        EXCEPTION_CATEGORIES,
+        default=EXCEPTION_CATEGORIES,
+        format_func=CATEGORY_LABELS.__getitem__,
+        key=f"review_categories_{identity}",
+    )
+    left, right = st.columns(2)
+    with left:
+        minimum_text = st.text_input(
+            "Minimum absolute delta",
+            value="0",
+            key=f"review_minimum_{identity}",
+            help="Display groups at or above this absolute difference. "
+            "Zero includes zero-delta exceptions. This does not change amount tolerance.",
+        )
+    with right:
+        sort_order = st.selectbox(
+            "Exception sort order",
+            tuple(EXCEPTION_SORT_LABELS),
+            format_func=EXCEPTION_SORT_LABELS.__getitem__,
+            key=f"review_sort_{identity}",
+        )
+    try:
+        minimum = parse_amount(minimum_text.strip() or "0")
+        if minimum < 0:
+            raise AmountParseError("must be zero or greater")
+    except AmountParseError as exc:
+        st.error(f"Minimum absolute delta: {exc}.")
+        st.caption(f"Showing 0 of {len(findings):,} exception groups.")
+        st.info("Enter a valid minimum absolute delta to display exception groups.")
+        return
+    visible = review_exceptions(
+        findings,
+        query=query,
+        categories=categories,
+        minimum_abs_delta=minimum,
+        sort_order=sort_order,
+    )
+    st.caption(f"Showing {len(visible):,} of {len(findings):,} exception groups.")
+    if not visible:
+        st.info("No exception groups match the current review filters.")
+        return
+    # A different view must not reuse a selection index from another row order.
+    view_id = sha256(
+        json.dumps(
+            [query, [category.value for category in categories], minimum_text, sort_order]
+        ).encode("utf-8")
+    ).hexdigest()
+    _show_finding_table(visible, table_key=f"exceptions_{identity}_{view_id}")
+
+
 def _show_results(
     result: ReconciliationResult, mapping: ColumnMapping, identity: str, name_a: str, name_b: str
 ) -> None:
@@ -252,6 +318,12 @@ def _show_results(
         st.text(f"Key {index}: {left}  \u2194  {right}")
     st.text(f"Amount: {mapping.amount_a}  \u2194  {mapping.amount_b}")
     st.text(f"Amount tolerance: {display_amount(result.amount_tolerance)} (absolute difference)")
+    st.text(f"Reconciliation mode: {MODE_LABELS[result.mode]}")
+    if result.mode is ReconciliationMode.GROUPED_BY_KEY:
+        st.caption(
+            "Grouped results compare totals for each matching key; "
+            "they do not claim that individual rows correspond."
+        )
 
     a, b, difference = st.columns(3)
     a.metric("File A control total", display_amount(result.total_a))
@@ -262,9 +334,7 @@ def _show_results(
     counts = Counter(finding.category for finding in result.findings)
     for column, category in zip(st.columns(len(FindingCategory)), FindingCategory, strict=True):
         column.metric(CATEGORY_LABELS[category], str(counts[category]))
-    st.caption(
-        "Counts are key groups. A duplicate / ambiguous group can contain multiple source rows."
-    )
+    st.caption("Counts are matching key groups. Each group can contain multiple source rows.")
 
     exceptions = result.exceptions
     tolerated = result.tolerated_findings
@@ -275,13 +345,20 @@ def _show_results(
         if tolerated:
             st.success("Reconciled within configured tolerance. No exceptions to review.")
         else:
-            st.success("All key groups match exactly. No exceptions to review.")
+            st.success(
+                "All matching key totals agree exactly. No exceptions to review."
+                if result.mode is ReconciliationMode.GROUPED_BY_KEY
+                else "All key groups match exactly. No exceptions to review."
+            )
     elif result.control_difference == 0:
         st.warning(f"Control totals agree, but {len(exceptions)} key groups still require review.")
     else:
         st.warning(f"{len(exceptions)} key groups require review.")
     if exceptions:
         st.subheader("Exceptions")
+        st.caption(
+            "Review filters affect the displayed table only. The exception export remains complete."
+        )
         st.download_button(
             "Download exception report",
             data=export_exceptions_csv(result),
@@ -290,7 +367,7 @@ def _show_results(
             key=f"download_{identity}",
             on_click="ignore",
         )
-        _show_finding_table(exceptions, table_key=f"exceptions_{identity}")
+        _show_exception_review(exceptions, identity=identity)
     if tolerated:
         st.subheader("Within tolerance")
         st.metric(
@@ -302,6 +379,16 @@ def _show_results(
             "exception report. Opposing accepted deltas can cancel in this net amount."
         )
         _show_finding_table(tolerated, table_key=f"tolerated_{identity}")
+    if result.mode is ReconciliationMode.GROUPED_BY_KEY:
+        exact = tuple(
+            finding
+            for finding in result.findings
+            if finding.category is FindingCategory.EXACT_MATCH
+            and (len(finding.rows_a) > 1 or len(finding.rows_b) > 1)
+        )
+        if exact:
+            st.subheader("Grouped exact key totals")
+            _show_finding_table(exact, table_key=f"exact_{identity}")
 
 
 def _clear_result() -> None:
@@ -332,12 +419,29 @@ def main() -> None:
     _profile_controls(columns_a, columns_b)
     mapping = _map_columns(columns_a, columns_b)
     st.header("3. Run reconciliation")
+    st.session_state.setdefault("reconciliation_mode", ReconciliationMode.UNIQUE)
+    mode = st.radio(
+        "Reconciliation mode",
+        tuple(ReconciliationMode),
+        format_func=MODE_LABELS.__getitem__,
+        key="reconciliation_mode",
+        horizontal=True,
+        on_change=_clear_result,
+    )
+    st.caption(
+        "Rows sharing the same matching key are totaled on each side "
+        "and the key totals are compared. "
+        "This does not claim that individual rows correspond."
+        if mode is ReconciliationMode.GROUPED_BY_KEY
+        else "Duplicate matching keys remain ambiguous and require review."
+    )
     st.session_state.setdefault("amount_tolerance", "0")
     tolerance_text = st.text_input(
         "Amount tolerance",
         value=None,
         key="amount_tolerance",
-        help="Maximum absolute difference for a unique pair, in your amount units. "
+        help="Maximum absolute difference between amounts for a matching key, "
+        "in your amount units. "
         "The boundary is inclusive; 0 requires exact equality. Actual deltas stay visible.",
         on_change=_clear_result,
     )
@@ -358,6 +462,7 @@ def main() -> None:
             worksheet_a=file_a.worksheet,
             worksheet_b=file_b.worksheet,
             amount_tolerance=amount_tolerance,
+            reconciliation_mode=mode,
         )
         if amount_tolerance is not None
         else None
@@ -371,7 +476,9 @@ def main() -> None:
     elif amount_tolerance is not None:
         st.download_button(
             "Download mapping profile",
-            data=export_mapping_profile(mapping, amount_tolerance=amount_tolerance),
+            data=export_mapping_profile(
+                mapping, amount_tolerance=amount_tolerance, reconciliation_mode=mode
+            ),
             file_name="tallydiff_profile.json",
             mime="application/json",
             key="download_profile",
@@ -407,7 +514,9 @@ def main() -> None:
                 st.error(str(exc))
         if len(records) == 2:
             try:
-                result = reconcile(records[0], records[1], amount_tolerance=amount_tolerance)
+                result = reconcile(
+                    records[0], records[1], amount_tolerance=amount_tolerance, mode=mode
+                )
             except ReconciliationIntegrityError as exc:
                 st.error(f"Reconciliation integrity check failed: {exc}")
             else:

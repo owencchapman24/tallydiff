@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tallydiff"
-version = "0.2.0"
+version = "0.3.0"
 description = "Traceable reconciliation for structured financial exports."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,48 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.9",
+]
+
+[tool.hatch.build]
+skip-excluded-dirs = true
+exclude = [
+    "**/%SystemDrive%/**",
+    "**/benchmark_output/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
+    "**/.uv-cache/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/.vscode/**",
+    "**/.idea/**",
+    "**/.codex/**",
+    "**/.agents/**",
+    "*.py[cod]",
+    "*.patch",
+    "*.diff",
+    "*.orig",
+    "*.rej",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tallydiff"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/tallydiff/**/*.py",
+    "/tests/*.py",
+    "/scripts/*.py",
+    "/sample_data/*.csv",
+    "/docs/tallydiff-demo.png",
+    "/.github/workflows/ci.yml",
+    "/.streamlit/config.toml",
+    "/.gitignore",
+    "/pyproject.toml",
+    "/uv.lock",
+    "/README.md",
 ]
 
 [tool.pytest.ini_options]

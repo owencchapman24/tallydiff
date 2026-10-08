@@ -1,10 +1,12 @@
 import csv
 from collections import Counter
-from decimal import Decimal
+from dataclasses import replace
+from decimal import Decimal, localcontext
 from io import StringIO
 
 import pytest
 
+from scripts.benchmark import measure, verify_result
 from scripts.synthetic_data import (
     AMOUNT_A,
     AMOUNT_B,
@@ -18,14 +20,17 @@ from scripts.synthetic_data import (
 from tallydiff import (
     ColumnMapping,
     FindingCategory,
+    ReconciliationMode,
     Source,
     export_exceptions_csv,
     export_mapping_profile,
     ingest_csv,
+    ingest_xlsx,
     inspect_csv_columns,
     load_mapping_profile,
     reconcile,
 )
+from tallydiff.presentation import review_exceptions
 
 
 def test_generator_is_reproducible_and_scenario_mix_is_known_by_construction() -> None:
@@ -177,3 +182,274 @@ def test_row_shuffle_changes_trace_positions_without_changing_financial_results(
         )
         assert result == reconcile(reversed(a), reversed(b), amount_tolerance=Decimal("0.01"))
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("tolerance", [Decimal("0"), Decimal("0.01")])
+def test_grouped_workload_oracle_has_hand_auditable_counts_and_recipes(mode, tolerance) -> None:
+    pair = generate_pair(100, seed=42, workload="grouped")
+    assert pair == generate_pair(100, seed=42, workload="grouped")
+    assert pair != generate_pair(100, seed=43, workload="grouped")
+    truth = pair.expected(tolerance, mode=mode.value)
+    accepting = tolerance != 0
+    if mode is ReconciliationMode.UNIQUE:
+        counts = (40, 10 if accepting else 0, 10 if accepting else 20, 5, 5, 30)
+        tolerated = "0.0050" if accepting else "0"
+    else:
+        counts = (57, 15 if accepting else 0, 16 if accepting else 31, 6, 6, 0)
+        tolerated = "0.0100" if accepting else "0"
+    assert list(truth.category_counts.values()) == list(counts)
+    assert truth.tolerated_delta_total == Decimal(tolerated)
+    assert (truth.record_count_a, truth.record_count_b) == (187, 186)
+    assert len(truth.exception_keys) == 100 - counts[0] - counts[1]
+    scenarios = pair.scenarios
+    for index, shape in ((70, (1, 4)), (75, (4, 1)), (80, (4, 4))):
+        scenario = scenarios[index]
+        assert len(scenario.amounts_a) == 1 if shape[0] == 1 else len(scenario.amounts_a) >= 4
+        assert len(scenario.amounts_b) == 1 if shape[1] == 1 else len(scenario.amounts_b) >= 4
+        assert sum(scenario.amounts_a) == sum(scenario.amounts_b)
+    assert sum(scenarios[85].amounts_a) - sum(scenarios[85].amounts_b) == 100
+    assert sum(scenarios[90].amounts_a) - sum(scenarios[90].amounts_b) == 101
+    assert scenarios[95].amounts_b == () and sum(scenarios[95].amounts_a) == 0
+    assert scenarios[96].amounts_a == () and sum(scenarios[96].amounts_b) == 0
+    assert sum(scenarios[97].amounts_a) == sum(scenarios[97].amounts_b) == 0
+    assert set((*scenarios[98].amounts_a, *scenarios[98].amounts_b)) == {0}
+    assert sum(scenarios[99].amounts_a) - sum(scenarios[99].amounts_b) == 2501
+    assert scenarios[99].amounts_a[0] == 10**20 + 17
+    assert any(amount < 0 for scenario in scenarios[70:95] for amount in scenario.amounts_a)
+    assert len({scenario.key[1] for scenario in scenarios}) < len(scenarios)
+
+
+def test_expected_outcomes_do_not_import_or_call_product_code(monkeypatch) -> None:
+    import ast
+    import inspect
+
+    import scripts.synthetic_data as oracle
+
+    imports = [
+        node.module if isinstance(node, ast.ImportFrom) else alias.name
+        for node in ast.walk(ast.parse(inspect.getsource(oracle)))
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    ]
+    assert not any(name and name.startswith("tallydiff") for name in imports)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("The construction oracle called reconciliation")
+
+    monkeypatch.setattr("tallydiff.reconcile", forbidden)
+    monkeypatch.setattr("tallydiff.engine.reconcile", forbidden)
+    pair = oracle.generate_pair(100, seed=42, workload="grouped")
+    with localcontext() as context:
+        context.prec = 2
+        for mode in ("unique", "grouped_by_key"):
+            assert len(pair.expected(Decimal("0.01"), mode=mode).groups) == 100
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("tolerance", [Decimal("0"), Decimal("0.01")])
+@pytest.mark.parametrize(
+    "formats", [("csv", "csv"), ("xlsx", "xlsx"), ("csv", "xlsx"), ("xlsx", "csv")]
+)
+def test_grouped_workload_matches_independent_truth_in_every_format(
+    mode, tolerance, formats, xlsx_bytes
+) -> None:
+    pair = generate_pair(300, seed=314, workload="grouped")
+    mapping = ColumnMapping(tuple(zip(KEYS_A, KEYS_B, strict=True)), AMOUNT_A, AMOUNT_B)
+    profile = load_mapping_profile(
+        export_mapping_profile(mapping, amount_tolerance=tolerance, reconciliation_mode=mode)
+    )
+    assert profile.reconciliation_mode is mode
+    inputs = []
+    for source, text, kind, keys, amount in (
+        (Source.A, pair.csv_a, formats[0], mapping.keys_a, mapping.amount_a),
+        (Source.B, pair.csv_b, formats[1], mapping.keys_b, mapping.amount_b),
+    ):
+        options = {"source": source, "key_columns": keys, "amount_column": amount}
+        if kind == "csv":
+            records = ingest_csv(text, **options)
+        else:
+            # Monetary text cells preserve export precision, including large sub-cent values.
+            rows = list(csv.reader(StringIO(text, newline="")))
+            data = xlsx_bytes({"Ledger é": rows})
+            records = ingest_xlsx(data, worksheet="Ledger é", **options)
+        raw = list(csv.DictReader(StringIO(text, newline="")))
+        assert [dict(record.raw_fields) for record in records] == raw
+        assert [record.source_row for record in records] == list(range(2, len(records) + 2))
+        assert any("Café" in str(record.raw_fields) for record in records)
+        assert Counter((record.key, record.amount) for record in records) == Counter(
+            (scenario.key, decimal_units(units))
+            for scenario in pair.scenarios
+            for units in (scenario.amounts_a if source is Source.A else scenario.amounts_b)
+        )
+        inputs.append(records)
+    profile.validate_columns(tuple(inputs[0][0].raw_fields), tuple(inputs[1][0].raw_fields))
+    truth = pair.expected(tolerance, mode=mode.value)
+    result = reconcile(
+        *inputs, amount_tolerance=profile.amount_tolerance, mode=profile.reconciliation_mode
+    )
+    report = export_exceptions_csv(result)
+    verify_result(*inputs, result, report, truth)
+    assert result == reconcile(
+        *(reversed(records) for records in inputs), amount_tolerance=tolerance, mode=mode
+    )
+    assert result.total_a - result.total_b == sum(finding.delta for finding in result.findings)
+    by_key = {finding.key: finding for finding in result.findings}
+    for scenario in pair.scenarios:
+        finding = by_key[scenario.key]
+        multi = len(scenario.amounts_a) > 1 or len(scenario.amounts_b) > 1
+        if mode is ReconciliationMode.UNIQUE and multi:
+            assert finding.category is FindingCategory.DUPLICATE_AMBIGUOUS
+        elif mode is ReconciliationMode.GROUPED_BY_KEY:
+            assert finding.category is not FindingCategory.DUPLICATE_AMBIGUOUS
+            if scenario.kind == "a_only_zero_net":
+                assert finding.category is FindingCategory.A_ONLY and finding.delta == 0
+            elif scenario.kind == "b_only_zero_net":
+                assert finding.category is FindingCategory.B_ONLY and finding.delta == 0
+    exported_keys = {row["Matching key"] for row in csv.DictReader(StringIO(report.decode()))}
+    for finding in result.findings:
+        assert (" / ".join(finding.key) in exported_keys) == finding.is_exception
+
+
+@pytest.fixture(scope="module")
+def large_grouped_exports():
+    pair = generate_pair(40_000, seed=2026, workload="grouped")
+    a = ingest_csv(pair.csv_a, source=Source.A, key_columns=KEYS_A, amount_column=AMOUNT_A)
+    b = ingest_csv(pair.csv_b, source=Source.B, key_columns=KEYS_B, amount_column=AMOUNT_B)
+    return pair, a, b
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_large_grouped_result_integrity_review_and_complete_export(
+    large_grouped_exports, mode
+) -> None:
+    pair, a, b = large_grouped_exports
+    tolerance = Decimal("0.01")
+    truth = pair.expected(tolerance, mode=mode.value)
+    result = reconcile(a, b, amount_tolerance=tolerance, mode=mode)
+    original_findings = result.findings
+    exceptions = result.exceptions
+    report = export_exceptions_csv(result)
+    verify_result(a, b, result, report, truth)
+    assert result.total_a - result.total_b == sum(finding.delta for finding in result.findings)
+    assert result == reconcile(a, b, amount_tolerance=tolerance, mode=mode)
+    assert len(exceptions) == (20_000 if mode is ReconciliationMode.UNIQUE else 11_200)
+    exception_keys = set(truth.exception_keys)
+    expected = [group for group in truth.groups if group.key in exception_keys]
+    expected_keys = [group.key for group in expected]
+    assert [finding.key for finding in review_exceptions(exceptions)] == expected_keys
+    assert review_exceptions(exceptions, query=" \t ") == exceptions
+    assert [finding.key for finding in review_exceptions(exceptions, query="adj-000000099")] == [
+        pair.scenarios[99].key
+    ]
+    for category in (
+        FindingCategory.AMOUNT_MISMATCH,
+        FindingCategory.A_ONLY,
+        FindingCategory.B_ONLY,
+        FindingCategory.DUPLICATE_AMBIGUOUS,
+    ):
+        assert [
+            finding.key for finding in review_exceptions(exceptions, categories=(category,))
+        ] == [group.key for group in expected if group.category == category.value]
+    for minimum in (Decimal("0.0101"), Decimal("0.010100000000000000000001")):
+        visible = review_exceptions(exceptions, minimum_abs_delta=minimum)
+        assert [finding.key for finding in visible] == [
+            group.key
+            for group in expected
+            if decimal_units(abs(group.units_a - group.units_b)) >= minimum
+        ]
+    inclusive = review_exceptions(exceptions, minimum_abs_delta=Decimal("0.0101"))
+    above = review_exceptions(exceptions, minimum_abs_delta=Decimal("0.010100000000000000000001"))
+    assert len(inclusive) - len(above) == 1600
+    for order, descending in (("absolute_delta_desc", True), ("absolute_delta_asc", False)):
+        visible = review_exceptions(exceptions, sort_order=order)
+        ordered = sorted(
+            expected,
+            key=lambda group: (
+                (-1 if descending else 1) * abs(group.units_a - group.units_b),
+                group.key,
+            ),
+        )
+        assert [finding.key for finding in visible] == [group.key for group in ordered]
+        assert review_exceptions(tuple(reversed(exceptions)), sort_order=order) == visible
+    category = (
+        FindingCategory.DUPLICATE_AMBIGUOUS
+        if mode is ReconciliationMode.UNIQUE
+        else FindingCategory.AMOUNT_MISMATCH
+    )
+    combined = review_exceptions(
+        exceptions,
+        query="ADJ-",
+        categories=(category,),
+        minimum_abs_delta=Decimal("0.2501"),
+        sort_order="absolute_delta_desc",
+    )
+    planned = [
+        group
+        for group in expected
+        if group.category == category.value
+        and any("adj-" in component.casefold() for component in group.key)
+        and abs(group.units_a - group.units_b) >= 2501
+    ]
+    planned.sort(key=lambda group: (-abs(group.units_a - group.units_b), group.key))
+    assert len(combined) == len(planned) == 400
+    assert [finding.key for finding in combined] == [group.key for group in planned]
+    original_ids = {id(finding) for finding in exceptions}
+    assert all(id(finding) in original_ids for finding in combined)
+    assert result.findings is original_findings and result.exceptions == exceptions
+    assert export_exceptions_csv(result) == report
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_grouped_workload_physical_row_shuffles_preserve_financial_semantics(mode) -> None:
+    pairs = [generate_pair(500, seed=11, shuffle_seed=seed, workload="grouped") for seed in (1, 2)]
+    assert pairs[0].scenarios == pairs[1].scenarios
+    assert pairs[0].csv_a != pairs[1].csv_a and pairs[0].csv_b != pairs[1].csv_b
+    outputs = []
+    for pair in pairs:
+        a = ingest_csv(pair.csv_a, source=Source.A, key_columns=KEYS_A, amount_column=AMOUNT_A)
+        b = ingest_csv(pair.csv_b, source=Source.B, key_columns=KEYS_B, amount_column=AMOUNT_B)
+        result = reconcile(a, b, amount_tolerance=Decimal("0.01"), mode=mode)
+        outputs.append(
+            [(f.key, f.category, f.amount_a, f.amount_b, f.delta) for f in result.findings]
+        )
+    assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("tolerance", [Decimal("0"), Decimal("0.01")])
+def test_benchmark_exercises_each_mode_with_independent_verification(mode, tolerance) -> None:
+    measured = measure(100, 42, tolerance, mode=mode)
+    assert (measured.rows_a, measured.rows_b) == (187, 186)
+    if mode is ReconciliationMode.UNIQUE:
+        assert measured.exceptions == (60 if tolerance == 0 else 50)
+    else:
+        assert measured.exceptions == (43 if tolerance == 0 else 28)
+    assert measured.total >= measured.reconciliation >= 0
+
+
+@pytest.mark.parametrize("corruption", ["group_amount", "source_accounting", "export"])
+def test_benchmark_verifier_rejects_corrupted_results(corruption) -> None:
+    pair = generate_pair(100, seed=42, workload="grouped")
+    a = ingest_csv(pair.csv_a, source=Source.A, key_columns=KEYS_A, amount_column=AMOUNT_A)
+    b = ingest_csv(pair.csv_b, source=Source.B, key_columns=KEYS_B, amount_column=AMOUNT_B)
+    mode = ReconciliationMode.GROUPED_BY_KEY
+    truth = pair.expected(Decimal("0.01"), mode=mode.value)
+    result = reconcile(a, b, amount_tolerance=Decimal("0.01"), mode=mode)
+    report = export_exceptions_csv(result)
+    if corruption == "export":
+        report = b"Matching key\r\n"
+        message = "Exported exception groups"
+    else:
+        findings = list(result.findings)
+        index = next(index for index, finding in enumerate(findings) if len(finding.rows_a) > 1)
+        original = findings[index]
+        if corruption == "group_amount":
+            findings[index] = replace(original, amount_a=original.amount_a + Decimal("0.0001"))
+            message = "Group differs"
+        else:
+            findings[index] = replace(original, rows_a=(original.rows_a[0],) * len(original.rows_a))
+            message = "Source rows were not accounted for exactly once"
+        result = replace(result, findings=tuple(findings))
+    with pytest.raises(AssertionError, match=message):
+        verify_result(a, b, result, report, truth)

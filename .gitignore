@@ -15,3 +15,10 @@ build/
 .coverage.*
 htmlcov/
 benchmark_output/
+/%SystemDrive%/
+.vscode/
+.idea/
+*.patch
+*.diff
+*.orig
+*.rej
