@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tallydiff"
-version = "0.1.0"
+version = "0.2.0"
 description = "Traceable reconciliation for structured financial exports."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "openpyxl>=3.1.5",
     "streamlit>=1.65.0",
 ]
 
@@ -21,6 +22,7 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

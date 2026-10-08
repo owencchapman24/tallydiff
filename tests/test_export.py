@@ -166,3 +166,31 @@ def test_formula_like_keys_remain_verbatim_without_breaking_csv_columns() -> Non
         original = records[int(row["File A records"]) - 2]
         assert original.key == (row["Matching key"],)
         assert original.raw_fields["id"] == row["Matching key"]
+
+
+@pytest.mark.parametrize("include_mismatch", [False, True])
+def test_accepted_variance_is_excluded_from_exception_report(include_mismatch: bool) -> None:
+    a = [SourceRecord(Source.A, 2, ("ACCEPTED",), Decimal("100.00"))]
+    b = [SourceRecord(Source.B, 2, ("ACCEPTED",), Decimal("100.01"))]
+    if include_mismatch:
+        a.append(SourceRecord(Source.A, 3, ("OUTSIDE",), Decimal("100.00")))
+        b.append(SourceRecord(Source.B, 3, ("OUTSIDE",), Decimal("100.02")))
+    result = reconcile(a, b, amount_tolerance=Decimal("0.01"))
+    rows = _read_report(export_exceptions_csv(result))
+    assert rows == (
+        [
+            {
+                "Category": "Amount mismatch",
+                "Matching key": "OUTSIDE",
+                "File A amount": "100.00",
+                "File B amount": "100.02",
+                "Delta (A - B)": "-0.02",
+                "File A records": "3",
+                "File B records": "3",
+            }
+        ]
+        if include_mismatch
+        else []
+    )
+    exported_delta = sum((Decimal(row["Delta (A - B)"]) for row in rows), Decimal("0"))
+    assert exported_delta + result.tolerated_delta_total == result.control_difference

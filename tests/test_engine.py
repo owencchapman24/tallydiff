@@ -300,3 +300,152 @@ def test_integrity_check_rejects_an_unexplained_control_difference() -> None:
 
     with pytest.raises(ReconciliationIntegrityError, match="control-total difference"):
         _assert_integrity(result, rows, [])
+
+
+@pytest.mark.parametrize("explicit_zero", [False, True])
+def test_default_and_zero_tolerance_preserve_all_original_categories(explicit_zero: bool) -> None:
+    a = [
+        record(Source.A, 2, ("exact",), "100.00"),
+        record(Source.A, 3, ("mismatch",), "100.00"),
+        record(Source.A, 4, ("a-only",), "0.001"),
+        record(Source.A, 5, ("duplicate",), "50.00"),
+        record(Source.A, 6, ("duplicate",), "50.00"),
+    ]
+    b = [
+        record(Source.B, 2, ("exact",), "100.00"),
+        record(Source.B, 3, ("mismatch",), "100.01"),
+        record(Source.B, 4, ("b-only",), "0.001"),
+        record(Source.B, 5, ("duplicate",), "100.00"),
+    ]
+    result = reconcile(a, b, amount_tolerance=Decimal("0")) if explicit_zero else reconcile(a, b)
+    assert [finding.category for finding in result.findings] == [
+        FindingCategory.A_ONLY,
+        FindingCategory.B_ONLY,
+        FindingCategory.DUPLICATE_AMBIGUOUS,
+        FindingCategory.EXACT_MATCH,
+        FindingCategory.AMOUNT_MISMATCH,
+    ]
+    assert len(result.exceptions) == 4
+    assert result.tolerated_findings == ()
+    assert result.amount_tolerance == result.tolerated_delta_total == Decimal("0")
+    assert result.control_difference == result.finding_delta_sum == Decimal("-0.01")
+
+
+@pytest.mark.parametrize(
+    ("amount_a", "amount_b", "tolerance", "category", "delta"),
+    [
+        ("100.00", "100.00", "0.01", FindingCategory.EXACT_MATCH, "0.00"),
+        ("100.00", "99.99", "0.01", FindingCategory.WITHIN_TOLERANCE, "0.01"),
+        ("100.00", "100.01", "0.01", FindingCategory.WITHIN_TOLERANCE, "-0.01"),
+        ("100.00", "100.009", "0.01", FindingCategory.WITHIN_TOLERANCE, "-0.009"),
+        ("100.00", "100.0101", "0.01", FindingCategory.AMOUNT_MISMATCH, "-0.0101"),
+        ("100.00", "100.02", "0.01", FindingCategory.AMOUNT_MISMATCH, "-0.02"),
+        ("0.0000", "0.0001", "0.0001", FindingCategory.WITHIN_TOLERANCE, "-0.0001"),
+        ("-100.00", "-100.01", "0.01", FindingCategory.WITHIN_TOLERANCE, "0.01"),
+    ],
+)
+def test_absolute_tolerance_classification_preserves_true_delta(
+    amount_a: str, amount_b: str, tolerance: str, category: FindingCategory, delta: str
+) -> None:
+    a = record(Source.A, 2, ("INV",), amount_a)
+    b = record(Source.B, 2, ("INV",), amount_b)
+    result = reconcile([a], [b], amount_tolerance=Decimal(tolerance))
+    finding = result.findings[0]
+    assert finding.category is category
+    assert finding.amount_a == Decimal(amount_a)
+    assert finding.amount_b == Decimal(amount_b)
+    assert finding.delta == result.control_difference == result.finding_delta_sum == Decimal(delta)
+    assert result.amount_tolerance == Decimal(tolerance)
+    assert finding.rows_a[0] is a and finding.rows_b[0] is b
+    accepted = category is FindingCategory.WITHIN_TOLERANCE
+    assert result.tolerated_findings == ((finding,) if accepted else ())
+    assert result.tolerated_delta_total == (Decimal(delta) if accepted else Decimal("0"))
+    assert finding.is_exception is (category is FindingCategory.AMOUNT_MISMATCH)
+
+
+@pytest.mark.parametrize("tolerance", [0.01, 0, "0.01", True, None])
+def test_tolerance_rejects_non_decimal_values(tolerance: object) -> None:
+    with pytest.raises(TypeError, match="amount_tolerance must be a Decimal"):
+        reconcile([], [], amount_tolerance=tolerance)
+
+
+@pytest.mark.parametrize("tolerance", ["NaN", "sNaN", "Infinity", "-Infinity", "-0.01"])
+def test_tolerance_rejects_nonfinite_or_negative_decimals(tolerance: str) -> None:
+    with pytest.raises(ValueError, match="amount_tolerance must be (finite|nonnegative)"):
+        reconcile([], [], amount_tolerance=Decimal(tolerance))
+
+
+@pytest.mark.parametrize(("count_a", "count_b"), [(2, 1), (1, 2), (2, 2), (2, 0), (0, 2)])
+def test_duplicates_ignore_tolerance_even_when_the_group_delta_is_accepted(
+    count_a: int, count_b: int
+) -> None:
+    a = [record(Source.A, row, ("INV",), "0.001") for row in range(2, count_a + 2)]
+    b = [record(Source.B, row, ("INV",), "0.001") for row in range(2, count_b + 2)]
+    result = reconcile(a, b, amount_tolerance=Decimal("1"))
+    finding = result.findings[0]
+    assert finding.category is FindingCategory.DUPLICATE_AMBIGUOUS
+    assert finding.rows_a == tuple(a) and finding.rows_b == tuple(b)
+    assert result.exceptions == (finding,)
+    assert not result.tolerated_findings
+    assert result.control_difference == result.finding_delta_sum
+
+
+def test_one_sided_records_remain_exceptions_under_large_tolerance() -> None:
+    a = [record(Source.A, 2, ("A",), "0.001")]
+    b = [record(Source.B, 2, ("B",), "0.001")]
+    result = reconcile(a, b, amount_tolerance=Decimal("1000"))
+    assert [finding.category for finding in result.exceptions] == [
+        FindingCategory.A_ONLY,
+        FindingCategory.B_ONLY,
+    ]
+    assert not result.tolerated_findings
+    assert result.control_difference == result.finding_delta_sum == Decimal("0")
+
+
+def test_mixed_tolerated_deltas_remain_in_control_totals_and_keep_row_order() -> None:
+    a = [record(Source.A, row, (key,), "100.00") for row, key in enumerate("DCBA", start=2)]
+    b = [
+        record(Source.B, 2, ("A",), "100.01"),
+        record(Source.B, 3, ("B",), "99.99"),
+        record(Source.B, 4, ("C",), "99.995"),
+        record(Source.B, 5, ("D",), "100.02"),
+    ]
+    result = reconcile(iter(a), iter(b), amount_tolerance=Decimal("0.01"))
+    assert result == reconcile(reversed(a), reversed(b), amount_tolerance=Decimal("0.01"))
+    assert [finding.delta for finding in result.tolerated_findings] == [
+        Decimal("-0.01"),
+        Decimal("0.01"),
+        Decimal("0.005"),
+    ]
+    assert result.tolerated_delta_total == Decimal("0.005")
+    assert [finding.key for finding in result.exceptions] == [("D",)]
+    assert result.control_difference == result.finding_delta_sum == Decimal("-0.015")
+    assert (
+        len([row for finding in result.findings for row in (*finding.rows_a, *finding.rows_b)]) == 8
+    )
+
+
+def test_tolerance_boundary_and_accepted_sum_ignore_the_callers_decimal_context() -> None:
+    a = [
+        record(Source.A, 2, ("inside",), "1000.0000"),
+        record(Source.A, 3, ("outside",), "1000.0000"),
+    ]
+    b = [
+        record(Source.B, 2, ("inside",), "1000.0100"),
+        record(Source.B, 3, ("outside",), "1000.0101"),
+    ]
+    with localcontext() as context:
+        context.prec = 1
+        context.Emax = 2
+        context.Emin = -2
+        for signal in context.traps:
+            context.traps[signal] = True
+        context.clear_flags()
+        result = reconcile(a, b, amount_tolerance=Decimal("0.01"))
+        assert [finding.category for finding in result.findings] == [
+            FindingCategory.WITHIN_TOLERANCE,
+            FindingCategory.AMOUNT_MISMATCH,
+        ]
+        assert result.tolerated_delta_total == Decimal("-0.0100")
+        assert result.control_difference == result.finding_delta_sum == Decimal("-0.0201")
+        assert not any(context.flags.values())

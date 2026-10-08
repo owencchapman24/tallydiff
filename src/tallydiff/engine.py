@@ -24,15 +24,27 @@ class ReconciliationIntegrityError(RuntimeError):
 def reconcile(
     records_a: Iterable[SourceRecord],
     records_b: Iterable[SourceRecord],
+    *,
+    amount_tolerance: Decimal = Decimal("0"),
 ) -> ReconciliationResult:
     """Reconcile validated records by exact keys, ordered by key and source row.
 
     Inputs are snapshotted once so validation cannot consume one-pass iterables.
+    ``amount_tolerance`` must be a finite, nonnegative Decimal. Only unique
+    pairs with a nonzero absolute delta at or below it are accepted as within
+    tolerance; exact equality stays exact. All deltas retain their true values.
 
     Duplicate keys are never paired heuristically. If either side contains more
     than one row for a key, every row for that key is retained in a single
     ``DUPLICATE_AMBIGUOUS`` finding.
     """
+
+    if not isinstance(amount_tolerance, Decimal):
+        raise TypeError("amount_tolerance must be a Decimal")
+    if not amount_tolerance.is_finite():
+        raise ValueError("amount_tolerance must be finite")
+    if amount_tolerance < 0:
+        raise ValueError("amount_tolerance must be nonnegative")
 
     records_a = tuple(records_a)
     records_b = tuple(records_b)
@@ -48,7 +60,7 @@ def reconcile(
         rows_b = tuple(grouped_b.get(key, ()))
         amount_a = _sum_amounts(rows_a)
         amount_b = _sum_amounts(rows_b)
-        category = _classify(rows_a, rows_b, amount_a, amount_b)
+        category = _classify(rows_a, rows_b, amount_a, amount_b, amount_tolerance)
 
         findings.append(
             ReconciliationFinding(
@@ -65,6 +77,7 @@ def reconcile(
         total_a=_sum_amounts(records_a),
         total_b=_sum_amounts(records_b),
         findings=tuple(findings),
+        amount_tolerance=amount_tolerance,
     )
     _assert_integrity(result, records_a, records_b)
     return result
@@ -105,6 +118,7 @@ def _classify(
     rows_b: tuple[SourceRecord, ...],
     amount_a: Decimal,
     amount_b: Decimal,
+    amount_tolerance: Decimal,
 ) -> FindingCategory:
     if len(rows_a) > 1 or len(rows_b) > 1:
         return FindingCategory.DUPLICATE_AMBIGUOUS
@@ -114,6 +128,9 @@ def _classify(
         return FindingCategory.B_ONLY
     if amount_a == amount_b:
         return FindingCategory.EXACT_MATCH
+    delta = sum_decimals((amount_a, amount_b.copy_negate()))
+    if delta.copy_abs() <= amount_tolerance:
+        return FindingCategory.WITHIN_TOLERANCE
     return FindingCategory.AMOUNT_MISMATCH
 
 

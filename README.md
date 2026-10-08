@@ -1,17 +1,32 @@
 # TallyDiff
 
-TallyDiff compares two financial CSV exports and explains which records account
-for their difference. Use an ordered key, such as vendor plus invoice number, to
-review unequal amounts, missing records, and duplicate keys with their original
-source evidence.
+**TallyDiff v0.2.0** compares two structured financial exports locally and explains
+which records account for their difference. Pair exact key columns, such as
+vendor and invoice number, then review unequal amounts, missing records, and
+duplicate keys with their source evidence.
+
+- **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
+  worksheet per workbook; multiple worksheets require an explicit choice.
+- **Absolute amount tolerance**, defaulting to zero. Accepted nonzero differences
+  remain visible in a distinct **Within tolerance** category and review table.
+- **Reusable mapping profiles** for ordered key pairs, amount columns, and
+  tolerance. Version 1 profiles work across formats with matching column names.
+- **Exact Decimal arithmetic** after parsing. XLSX numeric cells first convert
+  through decimal text; Excel display formatting is not reconstructed.
+- **Conservative formula handling**: formulas in selected key or amount fields
+  block ingestion. Formulas are never calculated and cached results are not used.
+- **Traceable exceptions and CSV export**, with every source row accounted for
+  and all finding deltas explaining the control-total difference.
+
+Equal totals alone never imply a reconciliation. TallyDiff reports differences;
+it does not decide which source is authoritative. See [known limitations](#known-limitations)
+and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
-**v0.1.0** is a local Streamlit application: upload two files, map their columns,
-reconcile, inspect exceptions, and download a CSV report. Every source record is
-accounted for, ambiguous duplicates stay visible, and exception deltas explain
-the control-total difference. Equal totals alone never imply a reconciliation.
-TallyDiff reports differences; it does not decide which source is authoritative.
+The screenshot shows the synthetic +245 CSV example in the earlier interface.
+The same result remains valid in v0.2.0; current controls also include tolerance,
+mapping profiles, and XLSX worksheet selection.
 
 ## Quick start
 
@@ -44,8 +59,8 @@ The files in `sample_data/` contain only synthetic records.
    | Key field 2 | Invoice Number | Invoice Ref |
    | Amount | Invoice Amount | Gross Amount |
 
-3. Click **Run reconciliation**. Expect File A total **2550**, File B total
-   **2305**, and net difference **+245**. The four key groups are:
+3. Leave **Amount tolerance** at its default `0`, then click **Run reconciliation**.
+   Expect File A total **2550**, File B total **2305**, and net difference **+245**. The four key groups are:
 
    | Matching key | Category | Delta (A - B) |
    | --- | --- | --- |
@@ -60,14 +75,104 @@ The files in `sample_data/` contain only synthetic records.
    exception groups above, with blank amounts for the missing sides.
 
 The pair order defines the composite key. Incomplete mappings or repeated key
-column selections disable reconciliation. A changed file resets mappings; any
-file or mapping change clears the result and download until you run again.
-Selecting an exception preserves the current result.
+column selections disable reconciliation. A changed file or worksheet resets
+mappings; any file, worksheet, mapping, or tolerance change clears the result and
+download until you run again. Selecting an exception or accepted variance preserves the current result.
+
+## Absolute amount tolerance
+
+**Amount tolerance** accepts ordinary monetary text in the same units as the
+selected amount columns. It defaults to `0`, requiring exact equality for unique pairs.
+Negative, blank, malformed, and non-finite values block reconciliation. The
+existing monetary grammar is used directly to construct a Decimal; no float
+conversion or rounding occurs, and more than two decimal places are supported.
+
+Tolerance applies only to a key with exactly one record on each side. Exact
+equality remains **Exact match**. A nonzero difference is **Within tolerance**
+when `abs(A - B) <= tolerance` (inclusive); larger differences are **Amount
+mismatch**. At tolerance `0.01`, `100.00` versus `100.01` is within tolerance with
+a true delta of `-0.01`; `100.00` versus `100.02` remains an amount mismatch.
+One-sided records and duplicate / ambiguous groups always require review.
+
+Within-tolerance findings are accepted variances, excluded from ordinary
+exceptions and their CSV report. The summary shows the tolerance used and the
+Within tolerance group count. A separate **Within tolerance** table retains both
+amounts, the actual delta, and selectable original source evidence. Its **Net
+accepted variance (A - B)** is a signed sum: opposing deltas can cancel, while
+the count and individual rows still expose every accepted difference.
+
+With only exact matches and accepted differences, the app says **Reconciled
+within configured tolerance**. The control totals and net difference always
+include all true deltas; tolerance never zeroes, rounds, or hides arithmetic.
+
+## Portable mapping profiles
+
+For recurring exports with the same logical columns, save the current valid
+configuration with **Download mapping profile**. The app offers this download
+once the ordered key pairs, both amount columns, and tolerance are valid; you do
+not need to run reconciliation first. The default filename is
+`tallydiff_profile.json`, and you may rename it outside TallyDiff.
+
+A profile remembers ordered File A ↔ File B key pairs, both amount columns,
+and the exact Decimal tolerance, including fractional trailing zeroes such as
+`0.0100`. It contains column names and configuration only: no uploaded source
+records, source filenames or hashes, financial amounts, totals, findings, or
+timestamps. Profiles stay local; TallyDiff uses no external service, profile
+directory, database, account, browser storage, or automatic filesystem writes.
+Saving is an explicit download to a location you choose.
+
+To reuse a profile:
+
+1. Upload the new File A and File B exports (CSV or XLSX). Select worksheets
+   for workbooks before applying a profile.
+2. Under **Mapping profile**, upload the saved JSON file. Selecting a file does
+   not change the current configuration.
+3. Click **Apply profile**. TallyDiff validates the entire profile and every
+   required column on its configured side before changing any setting.
+4. Check the populated key pairs, amount columns, and tolerance, then click
+   **Run reconciliation**. Applying a valid profile clears any prior result and
+   exception download, even if its configuration is identical.
+5. Edit any populated control normally if needed, and download a new profile
+   when the new configuration is valid. Profiles never lock the controls.
+
+Column names must match exactly on the correct side, including case and
+whitespace. Extra columns and changed filenames or header order are allowed.
+Version 1 profiles are format-agnostic: they contain no input type or worksheet
+name, and work with any CSV/XLSX combination exposing the required columns.
+Missing or renamed required columns produce an error naming the unavailable
+columns; nothing is partially applied or guessed. A rejected profile leaves the
+current configuration and any result for it intact. Update mappings manually
+when schemas change, then save a new profile.
+
+Profiles use UTF-8 JSON with a stable format identifier and schema version:
+
+```json
+{
+  "format": "tallydiff-mapping-profile",
+  "version": 1,
+  "key_pairs": [
+    {"file_a": "Vendor ID", "file_b": "Supplier"},
+    {"file_a": "Invoice Number", "file_b": "Invoice Ref"}
+  ],
+  "amount_columns": {
+    "file_a": "Invoice Amount",
+    "file_b": "Gross Amount"
+  },
+  "amount_tolerance": "0.0100"
+}
+```
+
+Tolerance is a JSON string parsed directly with the monetary grammar; JSON
+numeric tolerances are rejected. Version 1 requires exactly the documented
+fields and structures. Invalid JSON, duplicate object fields, unsupported
+formats or versions, blank or repeated key selections, invalid amount names,
+and invalid or negative tolerance are rejected with a concise message.
 
 ## Supported inputs
 
-- Two comma-delimited CSV files with headers, encoded as UTF-8 with an optional
-  BOM. Header names and selections are exact. Header-only files are valid.
+- Each input may independently be comma-delimited UTF-8 CSV (optional BOM) or
+  `.xlsx`: CSV ↔ CSV, CSV ↔ XLSX, XLSX ↔ CSV, and XLSX ↔ XLSX are supported.
+  Header names and selections are exact. Header-only inputs are valid.
 - One or more explicitly paired key columns in the same logical order, and one
   amount column per file. Matching trims surrounding key whitespace only;
   leading zeroes, case, punctuation, and internal whitespace remain significant.
@@ -79,12 +184,78 @@ Selecting an exception preserves the current result.
 
 See the [monetary grammar](#monetary-text-grammar) for the full accepted syntax.
 
+## XLSX worksheet and cell policies
+
+Upload an ordinary, unencrypted **.xlsx** workbook with text column names in
+**worksheet row 1** and structured data underneath. A workbook with one ordinary
+worksheet selects it automatically. With multiple worksheets, select one explicitly;
+TallyDiff never guesses by name or uses Excel's active-sheet setting. Names are
+shown exactly, in workbook order, including hidden/very-hidden worksheets.
+Chartsheets are not reconciliation worksheets. Only the selected sheet is ingested.
+Changing a worksheet clears mappings, results, and the exception download.
+
+Headers must be nonblank, unique text, matched exactly. Numeric/date/formula
+headers, merged-header interpretation, multiple header rows, and arbitrary layouts
+are unsupported. Empty cells after the last header name are unused columns;
+any populated data beyond the named columns blocks ingestion. Trailing wholly
+empty rows, including format-only rows, are ignored. A wholly blank row inside
+the populated data region blocks ingestion with its row number. Partially populated
+rows remain subject to required-key and amount validation; they are never dropped.
+
+**Amounts:** numeric cells exposed by openpyxl as int/float must be finite and
+convert through Python's shortest deterministic decimal text, using
+`Decimal(str(value))`: numeric `100` → `100`, `100.01` → `100.01`, and
+`-42.5` → `-42.5`. TallyDiff preserves the decimal value represented by that
+openpyxl value. It does not reconstruct Excel's underlying binary representation
+or recover precision already lost in the workbook. No `Decimal(float)` conversion
+occurs. Text amounts use the same strict monetary grammar as CSV, including
+`$1,200.00` and `(42.50)`. Blank, boolean, error, date/time, and non-finite amounts
+block ingestion.
+
+**Keys:** text retains leading zeroes, case, internal whitespace, and punctuation;
+only surrounding whitespace is trimmed for matching. Finite numeric keys become
+canonical decimal text without locale formatting, exponent notation, or insignificant
+fractional zeroes. Numeric `123` remains `"123"`, even with a `000000` number format;
+text `"000123"` remains a different key. Store identifiers as **text** in Excel
+when leading zeroes matter. Date/datetime/time keys use stable ISO text as exposed
+by openpyxl; a date-formatted serial can appear as a datetime ending in
+`T00:00:00`. Keep source types consistent when matching dates across exports.
+Blank, boolean, Excel error, formula, and duration keys are rejected.
+
+**Formulas:** workbooks load read-only with `data_only=False`. A formula in any
+selected key or amount cell blocks ingestion with File A/B, worksheet, row, and
+column context. Export or paste those reconciliation fields **as values** first.
+TallyDiff never evaluates formulas or uses cached results. Ordinary formulas in
+unselected evidence columns are retained as formula text.
+
+**Evidence:** XLSX evidence shows deterministic **source cell values**, not Excel's
+visual formatting: original text, numeric decimal text, ISO date/time text,
+`TRUE`/`FALSE`, formula/error text, and empty strings for blank cells. Duration
+values in unrelated evidence columns use their textual duration representation.
+Number formats never infer currency, add commas/currency signs, restore leading
+zeroes, invent trailing zeroes, round, or quantize amounts. For example, a cell
+with underlying `1234.5` and display format `$#,##0.00` retains `1234.5`.
+Styles, colors, comments, and calculated formula values are not preserved.
+
+XLSX source references use **actual worksheet row numbers**: header row 1, first
+data row 2. CSV references count logical CSV records, so multiline fields do not
+advance the source number. Keep the original workbook and selected sheet with
+any exception report to locate its evidence.
+
+Processing is local and in memory using openpyxl; Excel/LibreOffice are not
+required. Legacy `.xls`, macro-enabled `.xlsm`, templates, encrypted workbooks,
+formula calculation, table/pivot interpretation, named ranges, and reconciling
+multiple sheets at once are unsupported. The exception download remains CSV;
+TallyDiff does not write Excel workbooks. Mapping-profile version 1 stays unchanged
+and stores only mappings and tolerance, independent of format, filename, or sheet.
+
 ## Correctness and traceability
 
 | Category | Meaning |
 | --- | --- |
 | Exact match | One record on each side with equal amounts. |
-| Amount mismatch | One record on each side with unequal amounts. |
+| Within tolerance | One record on each side with a nonzero absolute delta at or below tolerance. |
+| Amount mismatch | One record on each side with an absolute delta above tolerance. |
 | File A only | One File A record and no File B record. |
 | File B only | One File B record and no File A record. |
 | Duplicate / ambiguous | More than one record on either side; all records need review. |
@@ -101,18 +272,22 @@ The engine checks both row accounting and this invariant on every run:
 File A control total - File B control total = sum of all finding deltas
 ```
 
-Amounts are parsed and calculated using `Decimal`, without floats, rounding,
-quantization, or tolerances. Findings are sorted by key, and evidence by source
-record number. Raw field values are preserved in immutable snapshots. The CSV
-header is record **1**, and the first data record is **2**; a quoted multiline
+Monetary text is parsed directly to `Decimal`. XLSX numeric cells first convert
+from openpyxl's int/float value through decimal text, as described above. All
+subsequent arithmetic uses exact `Decimal`, without rounding or quantization.
+Tolerance changes classification only. Findings are sorted by key, and evidence
+by source record number. Cell-value evidence is preserved in immutable snapshots.
+XLSX source numbers are actual worksheet rows. The CSV header is record **1**, and the first data record is **2**; a quoted multiline
 field is still part of one record, so these are not necessarily physical line numbers.
 
 ## Exception report
 
 **Download exception report** saves `tallydiff_exceptions.csv` for the currently
 displayed reconciliation. There is one row per exception key group, including
-zero-delta ambiguous groups. Exact matches are excluded; the UI offers no
-exception download when there are no exceptions.
+zero-delta ambiguous groups. Exact matches and accepted within-tolerance findings
+are excluded; the UI offers no exception download when there are no exceptions.
+When accepted variance exists, exception-report deltas alone need not equal the
+control difference: add the net accepted variance shown in the UI.
 
 Columns, in order: `Category`, `Matching key`, `File A amount`, `File B amount`,
 `Delta (A - B)`, `File A records`, `File B records`. Matching key components use
@@ -120,8 +295,8 @@ Columns, in order: `Category`, `Matching key`, `File A amount`, `File B amount`,
 Decimal text. Missing-side amounts are blank; a present `0.00` remains `0.00`.
 
 Each side lists **all** participating source record numbers, separated by `; `,
-including every duplicate. Keep the original CSV files and the configuration
-shown in the UI: those references provide traceability without duplicating every
+including every duplicate. Keep the original input files, selected worksheet
+names, and the configuration shown in the UI: those references provide traceability without duplicating every
 raw field in the report. The joined key is a display label, not a serialization
 for reconstructing composite keys that themselves contain ` / `.
 
@@ -152,15 +327,20 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `models.py` | Validated source records, immutable evidence, findings and totals. |
 | `engine.py` | Exact grouping, classification, deterministic ordering and integrity checks. |
 | `ingest.py` | Header discovery and atomic CSV validation with explicit mappings. |
-| `presentation.py` | UTF-8 decoding, mapping validation, configuration identity and display strings. |
+| `xlsx.py` | Worksheet/header discovery and atomic XLSX validation into the same source records. |
+| `configuration.py` | Shared ordered column mappings and manual mapping validation. |
+| `profiles.py` | Validated JSON profile import/export and directional column compatibility. |
+| `presentation.py` | UTF-8 decoding, configuration identity and display strings. |
 | `export.py` | Ordinary CSV bytes, reusing UI-independent labels and Decimal formatting. |
 | `app.py` | Streamlit controls, error messages, results, download and source evidence. |
 
 Public Python APIs are exposed through `tallydiff`. The engine and export layer
 have no Streamlit dependency. The UI performs no financial calculations.
 Results carry a SHA-256 identity covering file contents, filenames, ordered key
-pairs, and amount selections; each rerun checks it before showing results or a
-download. Expected validation failures are shown explicitly; unexpected errors
+pairs, amount selections, selected worksheets, and the effective Decimal tolerance; each rerun checks
+it before showing results or a download. Profile filenames and JSON formatting
+do not enter this identity; equivalent tolerance values share an identity while
+profile serialization preserves their fractional trailing zeroes. Expected validation failures are shown explicitly; unexpected errors
 are not broadly swallowed.
 
 ## Development and verification
@@ -174,7 +354,7 @@ uv build
 ```
 
 `uv.lock` pins runtime and development dependencies; `--locked` rejects a stale
-lockfile. Streamlit is the runtime dependency; pytest and Ruff are development
+lockfile. Streamlit and openpyxl are runtime dependencies; pytest and Ruff are development
 dependencies. `uv build` uses Hatchling to build a source distribution and wheel
 in the ignored `dist/` directory. The documented app workflow uses the repository
 checkout, which includes the local Streamlit configuration and synthetic samples.
@@ -190,11 +370,78 @@ Decimal precision and context isolation, invalid monetary text, CSV validation,
 encoding, mappings, missing versus zero amounts, evidence and export read-back.
 Streamlit [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest)
 exercises uploads, mappings, the sample workflow, source evidence, error states,
-download visibility, and stale-result invalidation.
+download visibility, and stale-result invalidation. Tolerance tests cover inclusive
+boundaries, high precision, invalid types and values, duplicate and one-sided
+precedence, accepted variance totals, separate review, and export exclusion.
+Profile tests cover strict schema validation, exact Decimal round trips, key order,
+directional compatibility, atomic application, editable controls, download
+validity, configuration privacy, and stale-result clearing. XLSX tests cover
+worksheet selection, cell conversion, formula/error rejection, row references,
+corrupt inputs, resource closure, mixed-format results, and stale worksheet changes.
+
+## Realistic-data validation (developer tooling)
+
+The seeded generator in `scripts/synthetic_data.py` creates entirely synthetic,
+reproducible CSV pairs with different headers and a two-column key. Every 100 key
+groups include 70 equal pairs, 10 small variances, 8 larger variances, 4 A-only,
+4 B-only, and 4 ambiguous groups. Credits, zeros, sub-cent values, leading-zero
+identifiers, shuffled records, quoted commas/newlines, and Unicode are included.
+Expected counts and totals come from construction plans and integer
+ten-thousandths; the generator does not import TallyDiff.
+
+Run the normal CI-sized integration validation or the developer benchmark:
+
+```bash
+uv run pytest tests/test_realistic_data.py
+uv run python -m scripts.benchmark --memory
+uv run python -m scripts.benchmark --groups 50000 --tolerances 0.01 --profile
+```
+
+The benchmark defaults to 1,000, 10,000, and 50,000 **key groups** (about 980,
+9,800, and 49,000 records per file), in exact and `0.01` tolerance modes. It
+separately times CSV generation, header inspection/mapping/ingestion,
+reconciliation, exception serialization, and independent verification, plus
+total elapsed time. Verification checks categories, totals, row accounting, and
+exported exception keys against the generator's truth. This benchmark exercises
+CSV ingestion; its timings do not measure XLSX parsing. No product behavior is
+changed by these scripts.
+
+`--memory` adds a separate, slower `tracemalloc` pass so instrumentation does
+not distort the reported timing pass. Its peak is an estimate of Python
+allocations across the fixture and pipeline, including expected results; it is
+not whole-process RSS or native Arrow/browser memory. `--profile` prints
+standard-library cProfile cumulative costs from another instrumented pass.
+
+For manual testing in Streamlit, explicitly write a larger pair:
+
+```bash
+uv run python -m scripts.synthetic_data --groups 10000 --seed 42 --write
+```
+
+This writes CSVs and an expected-results summary only under the ignored
+`benchmark_output/` directory. Map `Vendor ID` ↔ `Supplier` and
+`Invoice Number` ↔ `Invoice Ref`, with `Invoice Amount` ↔ `Gross Amount`.
+The summary defaults to tolerance `0.01`; use `--tolerance 0` for exact mode.
+Without `--write`, generation stays in memory. Do not commit generated files.
+
+Timings depend on hardware, Python version, and workload composition. They are
+developer observations, not CI performance thresholds or capacity guarantees.
 
 ## Python API contracts
 
 ### Reconciliation kernel
+
+`reconcile(records_a, records_b, *, amount_tolerance=Decimal("0"))` preserves the
+exact-equality classification when tolerance is omitted or zero. Tolerance must be a
+finite, nonnegative `Decimal`; other types raise `TypeError`, and non-finite or
+negative Decimals raise `ValueError`. No numeric coercion is performed.
+
+`ReconciliationResult.amount_tolerance` records the configured value.
+`result.tolerated_findings` contains accepted nonzero differences, and
+`result.tolerated_delta_total` is their exact signed net delta.
+`finding.is_exception` and `result.exceptions` exclude exact and within-tolerance
+groups. `result.findings`, control totals, and the integrity invariant include
+every group, including accepted variances.
 
 - Inputs are already-parsed `SourceRecord` objects. Amounts must be finite `Decimal`
   values; floats, other numeric types, NaN, and infinity are rejected.
@@ -208,7 +455,25 @@ download visibility, and stale-result invalidation.
 - Findings are sorted by key, and rows within each finding by source row number.
   Inputs are snapshotted once, including one-pass iterables.
 - Totals and deltas use exact Decimal arithmetic isolated from the caller's Decimal
-  context. No rounding, quantization, or tolerance is applied.
+  context. No rounding or quantization is applied; tolerance affects classification only.
+
+### Mapping profiles
+
+`ColumnMapping` now lives in `tallydiff.configuration` because both profiles and
+the UI use it. The existing `tallydiff.presentation.ColumnMapping` import remains
+available for compatibility, and public profile APIs are exposed via `tallydiff`:
+
+- `export_mapping_profile(mapping, *, amount_tolerance=Decimal("0")) -> bytes`
+  validates a complete configuration and returns UTF-8 JSON without writing files.
+- `load_mapping_profile(data: bytes | str) -> MappingProfile` returns immutable,
+  validated `mapping` and `amount_tolerance` fields. It accepts a UTF-8 BOM on byte
+  input and raises `ProfileError` for invalid profile contents.
+- `profile.validate_columns(columns_a, columns_b)` raises `ProfileError` listing
+  missing directional columns; extra columns are allowed. Call it before applying
+  settings to currently uploaded files.
+
+These APIs do not ingest financial records, run reconciliation, or access the
+filesystem. Profiles configure the existing reconciliation path.
 
 ### CSV ingestion
 
@@ -267,6 +532,22 @@ result = reconcile(records_a, records_b)  # control difference: Decimal("45.00")
 when applicable. Display `str(error)` for a concise diagnostic instead of a
 traceback. Ingestion stops at the first error; it does not return partial results.
 
+### XLSX ingestion
+
+`inspect_xlsx_sheets(data: bytes, *, source=...)` lists ordinary worksheets in
+stored order, including hidden worksheets. `inspect_xlsx_columns(data, *, source=...,
+worksheet=...)` validates the selected sheet's row-1 text headers.
+
+`ingest_xlsx(data, *, source=..., worksheet=..., key_columns=..., amount_column=...)`
+validates one worksheet and returns the same immutable `SourceRecord` tuple as CSV
+ingestion. `source_row` is the actual worksheet row. Workbooks load read-only and
+close on success or failure. See the [XLSX policies](#xlsx-worksheet-and-cell-policies)
+for cell conversion, formulas, evidence, and blank-row behavior.
+
+Expected workbook/input failures raise contextual `IngestionError`; unexpected
+downstream programming errors propagate. `IngestionError` also exposes `worksheet`
+for XLSX diagnostics. The engine and mapping-profile APIs remain format-agnostic.
+
 ### Monetary text grammar
 
 `parse_amount` constructs `Decimal` directly from validated source text. There is
@@ -291,18 +572,35 @@ when ingesting CSV). No malformed amount is converted to zero.
 
 ## Known limitations
 
-- CSV only, UTF-8 input, two files at a time, one amount field per file, and
-  U.S.-style monetary syntax. No Excel ingestion or export, locale inference,
-  currency conversion, or automatic sign correction.
-- Exact keys after surrounding-whitespace trimming. No fuzzy matching,
-  tolerances, automatic mappings, or decisions about the authoritative source.
-- No saved configurations, database, reconciliation history, accounting-system
-  integrations, authentication, or cloud service. The app is intended to run
-  locally from the repository root, not as a shared hosted service.
-- Inputs, evidence, and report bytes are held in memory. There is no streaming
-  ingestion or large-file performance guarantee.
-- CSV does not carry spreadsheet cell types. Reports retain raw key text and
-  exact numeric strings; follow the spreadsheet-safety guidance above.
+- Each run compares two CSV/XLSX inputs with one amount column per side. CSV must
+  be comma-delimited UTF-8 (optional BOM); monetary text uses U.S.-style syntax.
+  `.xlsx` is supported; `.xls`, `.xlsm`, templates, and encrypted workbooks are not.
+  There is no Excel export, locale inference, currency conversion, or automatic
+  sign correction.
+- XLSX uses one ordinary worksheet with text headers in row 1. Selected key/amount
+  formulas are rejected; formulas are never recalculated and cached results are
+  never used. Arbitrary layouts, merged headers, table/pivot interpretation, named
+  ranges, and reconciling several worksheets at once are unsupported.
+- XLSX evidence represents underlying cell values, not Excel display formatting,
+  styles, comments, or calculated formula values. Numeric identifiers do not
+  reconstruct leading zeroes; store meaningful leading zeroes as text. Date/time
+  keys use openpyxl's ISO representation and may differ from a text date export.
+- Column mappings require exact names on the configured side. Key matching trims
+  surrounding whitespace only. There is no automatic mapping, fuzzy matching,
+  many-to-one pairing, or authority determination. Tolerance is one global
+  absolute amount, with no percentage or per-row tolerance.
+- Configuration reuse uses explicit version-1 JSON profile uploads/downloads.
+  Profiles require compatible columns and contain no financial records, results,
+  source filenames, or hashes. There is no managed profile library, database,
+  reconciliation history, accounting-system integration, authentication, or cloud
+  service. Run locally from the repository root, not as a shared hosted service.
+- Inputs, evidence, and reports are held in memory. There is no streaming
+  reconciliation or large-file capacity guarantee. Developer benchmarks measure
+  the documented synthetic CSV workload, not XLSX parsing or whole-browser memory.
+- CSV reports retain key text and exact numeric strings. Import untrusted reports
+  as text with formula evaluation disabled; CSV quoting does not prevent spreadsheet
+  formula execution. Composite-key labels joined with ` / ` are display text, not
+  a reversible key serialization; use the original inputs and source references.
 
 No real or confidential financial data should be committed to this repository.
-No software license has been selected; a LICENSE decision remains with the owner.
+The repository intentionally has no software license; that decision remains with the owner.
