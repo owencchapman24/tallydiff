@@ -3,6 +3,8 @@
 Developer fixtures only. This module deliberately does not import TallyDiff.
 The legacy workload is retained; the grouped workload adds 30 multi-row keys
 per hundred groups, with split detail, credits, offsets, and zero-net groups.
+The separate normalization workload reuses those amounts with side-specific raw
+composite keys and canonical matching keys known directly from construction.
 """
 
 import argparse
@@ -30,7 +32,21 @@ KEYS_B = HEADERS_B[:2]
 AMOUNT_A = HEADERS_A[-1]
 AMOUNT_B = HEADERS_B[-1]
 MODES = ("unique", "grouped_by_key")
-WORKLOADS = ("legacy", "grouped")
+WORKLOADS = ("legacy", "grouped", "normalization")
+NORMALIZATION_RULES = (
+    {
+        "casefold": True,
+        "collapse_whitespace": True,
+        "remove_punctuation": True,
+        "strip_leading_zeros": False,
+    },
+    {
+        "casefold": False,
+        "collapse_whitespace": False,
+        "remove_punctuation": False,
+        "strip_leading_zeros": True,
+    },
+)
 
 CATEGORIES = (
     "exact_match",
@@ -55,6 +71,9 @@ class Scenario:
     kind: str
     amounts_a: tuple[int, ...]
     amounts_b: tuple[int, ...]
+    raw_key_a: tuple[str, str] | None = None
+    raw_key_b: tuple[str, str] | None = None
+    key_variant: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +84,16 @@ class ExpectedGroup:
     rows_b: int
     units_a: int
     units_b: int
+    raw_key_a: tuple[str, str] | None = None
+    raw_key_b: tuple[str, str] | None = None
+
+    @property
+    def is_exception(self) -> bool:
+        return self.category not in ("exact_match", "within_tolerance")
+
+    @property
+    def delta_units(self) -> int:
+        return self.units_a - self.units_b
 
     @property
     def delta(self) -> Decimal:
@@ -85,11 +114,7 @@ class GroundTruth:
 
     @property
     def exception_keys(self) -> tuple[tuple[str, str], ...]:
-        return tuple(
-            group.key
-            for group in self.groups
-            if group.category not in ("exact_match", "within_tolerance")
-        )
+        return tuple(group.key for group in self.groups if group.is_exception)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -103,6 +128,7 @@ class GroundTruth:
             "control_difference": str(self.control_difference),
             "tolerated_delta_total": str(self.tolerated_delta_total),
             "exceptions": len(self.exception_keys),
+            "tolerated": self.category_counts["within_tolerance"],
         }
 
 
@@ -156,6 +182,8 @@ class SyntheticPair:
                     len(scenario.amounts_b),
                     units_a,
                     units_b,
+                    scenario.raw_key_a,
+                    scenario.raw_key_b,
                 )
             )
         return GroundTruth(
@@ -273,6 +301,105 @@ def _grouped_scenario(index: int, rng: Random) -> Scenario:
     return Scenario(key, "large_subcent_mismatch", (huge, -10_000, 0), (huge - 15_001, 2500, 0))
 
 
+def _normalization_scenario(index: int, rng: Random) -> Scenario:
+    """Use grouped amounts unchanged and define canonical/raw keys directly.
+
+    The vendor number and invoice quotient uniquely identify the index. Each
+    source uses exactly one raw full key per plan, including all its detail rows.
+    No transformation implementation is used to infer the intended canonical key.
+    """
+
+    amounts = _grouped_scenario(index, rng)
+    vendor = f"{index % 137:06d}"
+    invoice = str(index // 137)
+    canonical_vendor = f"vendor{vendor} west"
+    variant = index % 12
+    variants = (
+        ("case_only", (f"Vendor{vendor} West", invoice), (f"VENDOR{vendor} WEST", invoice)),
+        (
+            "repeated_spaces",
+            (f"vendor{vendor}   west", invoice),
+            (canonical_vendor, invoice),
+        ),
+        ("tabs", (f"vendor{vendor}\twest", invoice), (f"vendor{vendor}\t\twest", invoice)),
+        (
+            "unicode_spaces",
+            (f"vendor{vendor}\u00a0west", invoice),
+            (f"vendor{vendor}\u2003west", invoice),
+        ),
+        ("ascii_punctuation", (f"vendor-{vendor} west", invoice), (canonical_vendor, invoice)),
+        (
+            "unicode_punctuation",
+            (f"vendor—{vendor} west", invoice),
+            (f"vendor“{vendor}” west", invoice),
+        ),
+        ("zeros_only", (canonical_vendor, invoice.zfill(9)), (canonical_vendor, invoice)),
+        (
+            "combined",
+            (f"Vendor-{vendor}\tWest", invoice.zfill(9)),
+            (f"VENDOR{vendor}   WEST", invoice),
+        ),
+        (
+            "unicode_casefold",
+            (f"Straße{vendor} west", invoice),
+            (f"STRASSE{vendor} west", invoice),
+        ),
+        ("canonical", (canonical_vendor, invoice), (canonical_vendor, invoice)),
+        (
+            "exact_vendor_padded_invoice",
+            (canonical_vendor, invoice.zfill(9)),
+            (canonical_vendor, invoice.zfill(12)),
+        ),
+        (
+            "unicode_combined",
+            (f"VENDOR–{vendor}\u202fWEST", invoice.zfill(9)),
+            (f"vendor_{vendor}\twest", invoice),
+        ),
+    )
+    name, raw_a, raw_b = variants[variant]
+    if name == "unicode_casefold":
+        canonical_vendor = f"strasse{vendor} west"
+    return Scenario(
+        (canonical_vendor, invoice),
+        amounts.kind,
+        amounts.amounts_a,
+        amounts.amounts_b,
+        raw_a if amounts.amounts_a else None,
+        raw_b if amounts.amounts_b else None,
+        name,
+    )
+
+
+def _validate_normalization_keys(scenarios: tuple[Scenario, ...]) -> None:
+    """Guard the construction's one-to-one raw/canonical relationship per source.
+
+    Distinct plans cannot share a canonical key or an original key. All rows in
+    one plan reuse its single raw key, so detail rows are exact duplicates rather
+    than distinct originals converging. This check needs no normalization code.
+    """
+
+    canonical = set()
+    originals_a = {}
+    originals_b = {}
+    for scenario in scenarios:
+        if scenario.key in canonical:
+            raise AssertionError(f"Duplicate canonical construction key: {scenario.key}")
+        canonical.add(scenario.key)
+        for amounts, raw_key, originals in (
+            (scenario.amounts_a, scenario.raw_key_a, originals_a),
+            (scenario.amounts_b, scenario.raw_key_b, originals_b),
+        ):
+            if not amounts:
+                if raw_key is not None:
+                    raise AssertionError("Absent source must not have a raw key")
+                continue
+            if raw_key is None or len(raw_key) != 2 or not all(raw_key):
+                raise AssertionError("Every present source must have a raw composite key")
+            if raw_key in originals:
+                raise AssertionError(f"Original key reused across canonical plans: {raw_key}")
+            originals[raw_key] = scenario.key
+
+
 def _money_text(units: int, variant: int) -> str:
     whole, fraction = divmod(abs(units), 10_000)
     places = 4 if units % 100 or variant % 9 == 0 else 2
@@ -303,8 +430,9 @@ def _csv(scenarios: tuple[Scenario, ...], side: str, shuffle_seed: int) -> str:
     )
     for index, amount, variant in rows:
         scenario = scenarios[index]
-        vendor, invoice = scenario.key
-        if index % 23 == 0:
+        raw_key = scenario.raw_key_a if side == "A" else scenario.raw_key_b
+        vendor, invoice = raw_key if raw_key is not None else scenario.key
+        if scenario.key_variant is None and index % 23 == 0:
             vendor = f" {vendor} " if side == "A" else vendor
             invoice = f" {invoice} " if side == "B" else invoice
         writer.writerow(
@@ -332,10 +460,16 @@ def generate_pair(
     if isinstance(groups, bool) or not isinstance(groups, int) or groups < 100:
         raise ValueError("groups must be an integer of at least 100 to include every scenario")
     if workload not in WORKLOADS:
-        raise ValueError("workload must be legacy or grouped")
+        raise ValueError(f"workload must be one of {WORKLOADS}")
     rng = Random(seed)
-    recipe = _scenario if workload == "legacy" else _grouped_scenario
+    recipe = {
+        "legacy": _scenario,
+        "grouped": _grouped_scenario,
+        "normalization": _normalization_scenario,
+    }[workload]
     scenarios = tuple(recipe(index, rng) for index in range(groups))
+    if workload == "normalization":
+        _validate_normalization_keys(scenarios)
     order_seed = seed if shuffle_seed is None else shuffle_seed
     return SyntheticPair(
         _csv(scenarios, "A", order_seed), _csv(scenarios, "B", order_seed + 1), scenarios
@@ -359,6 +493,7 @@ def main() -> None:
             "seed": args.seed,
             "workload": args.workload,
             "amount_tolerance": args.tolerance,
+            "key_normalization": NORMALIZATION_RULES if args.workload == "normalization" else None,
             **pair.expected(Decimal(args.tolerance), mode=args.mode).summary(),
         },
         indent=2,
