@@ -586,14 +586,13 @@ def test_import_and_preflight_leave_engine_exact_matching_and_duplicates_unchang
 def test_importing_normalization_does_not_change_engine_behavior() -> None:
     script = """
 from decimal import Decimal
-from sys import modules
 
 from tallydiff import FindingCategory, Source, SourceRecord, reconcile
 
-assert "tallydiff.normalization" not in modules
 first = SourceRecord(Source.A, 2, ("ACME-01",), Decimal("1"))
 second = SourceRecord(Source.B, 2, ("ACME01",), Decimal("1"))
 before = reconcile([first], [second])
+assert before.key_normalization is None
 
 import tallydiff.normalization
 

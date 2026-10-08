@@ -16,10 +16,32 @@ from tallydiff.models import (
     Source,
     SourceRecord,
 )
+from tallydiff.normalization import (
+    NormalizationCollision,
+    find_normalization_collisions,
+    normalize_key,
+)
+from tallydiff.normalization_config import KeyNormalizationConfig
 
 
 class ReconciliationIntegrityError(RuntimeError):
     """Raised when an internal reconciliation invariant is violated."""
+
+
+class NormalizationCollisionError(ValueError):
+    """Reconciliation is blocked; both sources retain their full collision evidence."""
+
+    def __init__(
+        self,
+        collisions_a: tuple[NormalizationCollision, ...],
+        collisions_b: tuple[NormalizationCollision, ...],
+    ) -> None:
+        self.collisions_a = tuple(collisions_a)
+        self.collisions_b = tuple(collisions_b)
+        super().__init__(
+            "Normalization collisions block reconciliation "
+            f"(File A: {len(self.collisions_a)}, File B: {len(self.collisions_b)})."
+        )
 
 
 def reconcile(
@@ -28,10 +50,17 @@ def reconcile(
     *,
     amount_tolerance: Decimal = Decimal("0"),
     mode: ReconciliationMode = ReconciliationMode.UNIQUE,
+    key_normalization: KeyNormalizationConfig | None = None,
 ) -> ReconciliationResult:
-    """Reconcile validated records by exact keys, ordered by key and source row.
+    """Reconcile validated records by matching keys, ordered by key and source row.
 
     Inputs are snapshotted once so validation cannot consume one-pass iterables.
+    None for key_normalization preserves exact matching. An explicit configuration
+    applies explicit rules to matching keys only; findings retain original records.
+    Source integrity and all key arities are validated before normalization.
+    Blank components fail with source/row/component context. Same-source collisions
+    in either input block both modes, retaining evidence for both files in a
+    NormalizationCollisionError before any findings or result are constructed.
     ``amount_tolerance`` must be a finite, nonnegative Decimal. Two-sided keys
     with a nonzero absolute delta at or below it are accepted as within tolerance
     when eligible under the mode; exact equality stays exact. All deltas retain
@@ -53,14 +82,29 @@ def reconcile(
         raise ValueError("amount_tolerance must be nonnegative")
     if not isinstance(mode, ReconciliationMode):
         raise TypeError("mode must be a ReconciliationMode enum member")
+    if key_normalization is not None and not isinstance(key_normalization, KeyNormalizationConfig):
+        raise TypeError("key_normalization must be a KeyNormalizationConfig or None")
 
     records_a = tuple(records_a)
     records_b = tuple(records_b)
     _validate_source_records(records_a, Source.A)
     _validate_source_records(records_b, Source.B)
 
-    grouped_a = _group_by_key(records_a)
-    grouped_b = _group_by_key(records_b)
+    if key_normalization is not None:
+        for source, source_records in ((Source.A, records_a), (Source.B, records_b)):
+            for record in source_records:
+                if len(record.key) != len(key_normalization.component_rules):
+                    raise ValueError(
+                        f"File {source.value} source row {record.source_row}: "
+                        "configuration length must equal key length"
+                    )
+        collisions_a = find_normalization_collisions(records_a, key_normalization, source=Source.A)
+        collisions_b = find_normalization_collisions(records_b, key_normalization, source=Source.B)
+        if collisions_a or collisions_b:
+            raise NormalizationCollisionError(collisions_a, collisions_b)
+
+    grouped_a = _group_by_key(records_a, key_normalization=key_normalization)
+    grouped_b = _group_by_key(records_b, key_normalization=key_normalization)
 
     findings: list[ReconciliationFinding] = []
     for key in sorted(grouped_a.keys() | grouped_b.keys()):
@@ -87,6 +131,7 @@ def reconcile(
         findings=tuple(findings),
         amount_tolerance=amount_tolerance,
         mode=mode,
+        key_normalization=key_normalization,
     )
     _assert_integrity(result, records_a, records_b)
     return result
@@ -95,6 +140,8 @@ def reconcile(
 def _validate_source_records(records: Sequence[SourceRecord], expected_source: Source) -> None:
     seen_rows: set[int] = set()
     for record in records:
+        if not isinstance(record, SourceRecord):
+            raise TypeError("records must contain only SourceRecord objects")
         if record.source is not expected_source:
             raise ValueError(
                 f"record at source row {record.source_row} belongs to File {record.source.value}, "
@@ -109,10 +156,17 @@ def _validate_source_records(records: Sequence[SourceRecord], expected_source: S
 
 def _group_by_key(
     records: Iterable[SourceRecord],
+    *,
+    key_normalization: KeyNormalizationConfig | None = None,
 ) -> dict[CompositeKey, list[SourceRecord]]:
     grouped: dict[CompositeKey, list[SourceRecord]] = defaultdict(list)
     for record in records:
-        grouped[record.key].append(record)
+        key = (
+            record.key
+            if key_normalization is None
+            else normalize_key(record.key, key_normalization)
+        )
+        grouped[key].append(record)
     for rows in grouped.values():
         rows.sort(key=lambda record: record.source_row)
     return dict(grouped)
