@@ -15,6 +15,7 @@ from tallydiff import (
     ProfileError,
     ReconciliationFinding,
     ReconciliationIntegrityError,
+    ReconciliationMode,
     ReconciliationResult,
     Source,
     SourceRecord,
@@ -31,6 +32,7 @@ from tallydiff import (
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
+    MODE_LABELS,
     configuration_id,
     decode_upload,
     display_amount,
@@ -121,7 +123,8 @@ def _choose_file(source: Source) -> _Input | None:
 def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
     st.subheader("Mapping profile")
     st.caption(
-        "Reuse column mappings and amount tolerance with a local JSON profile. "
+        "Reuse column mappings, amount tolerance, and reconciliation mode "
+        "with a local JSON profile. "
         "Profiles contain no uploaded records or reconciliation results."
     )
     upload = st.file_uploader("Mapping profile JSON", type=["json"], key="profile_upload")
@@ -142,6 +145,7 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
             st.session_state.map_amount_a = profile.mapping.amount_a
             st.session_state.map_amount_b = profile.mapping.amount_b
             st.session_state.amount_tolerance = format(profile.amount_tolerance, "f")
+            st.session_state.reconciliation_mode = profile.reconciliation_mode
             st.session_state.profile_notice = True
             st.rerun()
     if st.session_state.pop("profile_notice", False):
@@ -252,6 +256,12 @@ def _show_results(
         st.text(f"Key {index}: {left}  \u2194  {right}")
     st.text(f"Amount: {mapping.amount_a}  \u2194  {mapping.amount_b}")
     st.text(f"Amount tolerance: {display_amount(result.amount_tolerance)} (absolute difference)")
+    st.text(f"Reconciliation mode: {MODE_LABELS[result.mode]}")
+    if result.mode is ReconciliationMode.GROUPED_BY_KEY:
+        st.caption(
+            "Grouped results compare totals for each matching key; "
+            "they do not claim that individual rows correspond."
+        )
 
     a, b, difference = st.columns(3)
     a.metric("File A control total", display_amount(result.total_a))
@@ -262,9 +272,7 @@ def _show_results(
     counts = Counter(finding.category for finding in result.findings)
     for column, category in zip(st.columns(len(FindingCategory)), FindingCategory, strict=True):
         column.metric(CATEGORY_LABELS[category], str(counts[category]))
-    st.caption(
-        "Counts are key groups. A duplicate / ambiguous group can contain multiple source rows."
-    )
+    st.caption("Counts are matching key groups. Each group can contain multiple source rows.")
 
     exceptions = result.exceptions
     tolerated = result.tolerated_findings
@@ -275,7 +283,11 @@ def _show_results(
         if tolerated:
             st.success("Reconciled within configured tolerance. No exceptions to review.")
         else:
-            st.success("All key groups match exactly. No exceptions to review.")
+            st.success(
+                "All matching key totals agree exactly. No exceptions to review."
+                if result.mode is ReconciliationMode.GROUPED_BY_KEY
+                else "All key groups match exactly. No exceptions to review."
+            )
     elif result.control_difference == 0:
         st.warning(f"Control totals agree, but {len(exceptions)} key groups still require review.")
     else:
@@ -302,6 +314,16 @@ def _show_results(
             "exception report. Opposing accepted deltas can cancel in this net amount."
         )
         _show_finding_table(tolerated, table_key=f"tolerated_{identity}")
+    if result.mode is ReconciliationMode.GROUPED_BY_KEY:
+        exact = tuple(
+            finding
+            for finding in result.findings
+            if finding.category is FindingCategory.EXACT_MATCH
+            and (len(finding.rows_a) > 1 or len(finding.rows_b) > 1)
+        )
+        if exact:
+            st.subheader("Grouped exact key totals")
+            _show_finding_table(exact, table_key=f"exact_{identity}")
 
 
 def _clear_result() -> None:
@@ -332,12 +354,29 @@ def main() -> None:
     _profile_controls(columns_a, columns_b)
     mapping = _map_columns(columns_a, columns_b)
     st.header("3. Run reconciliation")
+    st.session_state.setdefault("reconciliation_mode", ReconciliationMode.UNIQUE)
+    mode = st.radio(
+        "Reconciliation mode",
+        tuple(ReconciliationMode),
+        format_func=MODE_LABELS.__getitem__,
+        key="reconciliation_mode",
+        horizontal=True,
+        on_change=_clear_result,
+    )
+    st.caption(
+        "Rows sharing the same matching key are totaled on each side "
+        "and the key totals are compared. "
+        "This does not claim that individual rows correspond."
+        if mode is ReconciliationMode.GROUPED_BY_KEY
+        else "Duplicate matching keys remain ambiguous and require review."
+    )
     st.session_state.setdefault("amount_tolerance", "0")
     tolerance_text = st.text_input(
         "Amount tolerance",
         value=None,
         key="amount_tolerance",
-        help="Maximum absolute difference for a unique pair, in your amount units. "
+        help="Maximum absolute difference between amounts for a matching key, "
+        "in your amount units. "
         "The boundary is inclusive; 0 requires exact equality. Actual deltas stay visible.",
         on_change=_clear_result,
     )
@@ -358,6 +397,7 @@ def main() -> None:
             worksheet_a=file_a.worksheet,
             worksheet_b=file_b.worksheet,
             amount_tolerance=amount_tolerance,
+            reconciliation_mode=mode,
         )
         if amount_tolerance is not None
         else None
@@ -371,7 +411,9 @@ def main() -> None:
     elif amount_tolerance is not None:
         st.download_button(
             "Download mapping profile",
-            data=export_mapping_profile(mapping, amount_tolerance=amount_tolerance),
+            data=export_mapping_profile(
+                mapping, amount_tolerance=amount_tolerance, reconciliation_mode=mode
+            ),
             file_name="tallydiff_profile.json",
             mime="application/json",
             key="download_profile",
@@ -407,7 +449,9 @@ def main() -> None:
                 st.error(str(exc))
         if len(records) == 2:
             try:
-                result = reconcile(records[0], records[1], amount_tolerance=amount_tolerance)
+                result = reconcile(
+                    records[0], records[1], amount_tolerance=amount_tolerance, mode=mode
+                )
             except ReconciliationIntegrityError as exc:
                 st.error(f"Reconciliation integrity check failed: {exc}")
             else:

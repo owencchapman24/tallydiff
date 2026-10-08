@@ -1,10 +1,21 @@
+import json
 from dataclasses import replace
 from decimal import Decimal, localcontext
 
 import pytest
 
-from tallydiff import IngestionError, Source, SourceRecord, ingest_csv, reconcile
+from tallydiff import (
+    IngestionError,
+    ReconciliationMode,
+    Source,
+    SourceRecord,
+    export_mapping_profile,
+    ingest_csv,
+    load_mapping_profile,
+    reconcile,
+)
 from tallydiff.presentation import (
+    MODE_LABELS,
     ColumnMapping,
     configuration_id,
     decode_upload,
@@ -220,3 +231,79 @@ def test_configuration_identity_includes_each_selected_worksheet() -> None:
         == 6
     )
     assert identity("One", "Two") == identity("One", "Two")
+
+
+def test_configuration_identity_includes_canonical_mode_and_preserves_default() -> None:
+    mapping = ColumnMapping((("id", "ref"),), "amount", "gross")
+    kwargs = {"name_a": "a.csv", "name_b": "b.csv", "amount_tolerance": Decimal("0.01")}
+    default = configuration_id(b"a", b"b", mapping, **kwargs)
+    unique = configuration_id(
+        b"a", b"b", mapping, **kwargs, reconciliation_mode=ReconciliationMode.UNIQUE
+    )
+    grouped = configuration_id(
+        b"a", b"b", mapping, **kwargs, reconciliation_mode=ReconciliationMode.GROUPED_BY_KEY
+    )
+
+    assert default == unique
+    assert grouped != unique
+    assert grouped == configuration_id(
+        b"a", b"b", mapping, **kwargs, reconciliation_mode=ReconciliationMode.GROUPED_BY_KEY
+    )
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_configuration_identity_does_not_depend_on_mode_display_labels(
+    monkeypatch: pytest.MonkeyPatch, mode: ReconciliationMode
+) -> None:
+    mapping = ColumnMapping((("id", "ref"),), "amount", "gross")
+    kwargs = {"name_a": "a.csv", "name_b": "b.csv", "reconciliation_mode": mode}
+    identity = configuration_id(b"a", b"b", mapping, **kwargs)
+
+    monkeypatch.setitem(MODE_LABELS, mode, "Another display label")
+
+    assert configuration_id(b"a", b"b", mapping, **kwargs) == identity
+
+
+@pytest.mark.parametrize("mode", ["unique", "grouped_by_key", None, True, 0])
+def test_configuration_identity_requires_a_mode_enum(mode: object) -> None:
+    mapping = ColumnMapping((("id", "ref"),), "amount", "gross")
+
+    with pytest.raises(TypeError, match="reconciliation_mode.*ReconciliationMode enum member"):
+        configuration_id(
+            b"a", b"b", mapping, name_a="a.csv", name_b="b.csv", reconciliation_mode=mode
+        )
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_profile_and_manual_configuration_have_same_identity_regardless_of_json(
+    mode: ReconciliationMode,
+) -> None:
+    mapping = ColumnMapping((("id", "ref"),), "amount", "gross")
+    data = export_mapping_profile(
+        mapping, amount_tolerance=Decimal("0.0100"), reconciliation_mode=mode
+    )
+    compact = json.dumps(json.loads(data), sort_keys=True, separators=(",", ":"))
+    manual = configuration_id(
+        b"a",
+        b"b",
+        mapping,
+        name_a="a.csv",
+        name_b="b.csv",
+        amount_tolerance=Decimal("0.01"),
+        reconciliation_mode=mode,
+    )
+
+    for serialized in (data, compact):
+        profile = load_mapping_profile(serialized)
+        assert (
+            configuration_id(
+                b"a",
+                b"b",
+                profile.mapping,
+                name_a="a.csv",
+                name_b="b.csv",
+                amount_tolerance=profile.amount_tolerance,
+                reconciliation_mode=profile.reconciliation_mode,
+            )
+            == manual
+        )

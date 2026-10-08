@@ -7,7 +7,13 @@ from decimal import Decimal
 
 from tallydiff.configuration import ColumnMapping as ColumnMapping
 from tallydiff.ingest import IngestionError
-from tallydiff.models import FindingCategory, ReconciliationFinding, Source, SourceRecord
+from tallydiff.models import (
+    FindingCategory,
+    ReconciliationFinding,
+    ReconciliationMode,
+    Source,
+    SourceRecord,
+)
 
 CATEGORY_LABELS = {
     FindingCategory.EXACT_MATCH: "Exact match",
@@ -16,6 +22,12 @@ CATEGORY_LABELS = {
     FindingCategory.A_ONLY: "File A only",
     FindingCategory.B_ONLY: "File B only",
     FindingCategory.DUPLICATE_AMBIGUOUS: "Duplicate / ambiguous",
+}
+
+
+MODE_LABELS = {
+    ReconciliationMode.UNIQUE: "Unique records",
+    ReconciliationMode.GROUPED_BY_KEY: "Group by matching key",
 }
 
 
@@ -39,11 +51,14 @@ def configuration_id(
     name_a: str,
     name_b: str,
     amount_tolerance: Decimal = Decimal("0"),
+    reconciliation_mode: ReconciliationMode = ReconciliationMode.UNIQUE,
     worksheet_a: str | None = None,
     worksheet_b: str | None = None,
 ) -> str:
-    """Identify the files, ordered selections, and tolerance behind a displayed result."""
+    """Identify the files, ordered selections, tolerance, and mode behind a displayed result."""
 
+    if not isinstance(reconciliation_mode, ReconciliationMode):
+        raise TypeError("reconciliation_mode must be a ReconciliationMode enum member")
     tolerance_identity = format(amount_tolerance, "f")
     if "." in tolerance_identity:
         tolerance_identity = tolerance_identity.rstrip("0").rstrip(".")
@@ -56,6 +71,7 @@ def configuration_id(
         mapping.amount_a,
         mapping.amount_b,
         tolerance_identity,
+        reconciliation_mode.value,
     ]
     return hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
 
