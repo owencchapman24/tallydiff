@@ -1,5 +1,6 @@
 """Run with: uv run streamlit run src/tallydiff/app.py."""
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from hashlib import sha256
@@ -32,12 +33,15 @@ from tallydiff import (
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
+    EXCEPTION_CATEGORIES,
+    EXCEPTION_SORT_LABELS,
     MODE_LABELS,
     configuration_id,
     decode_upload,
     display_amount,
     evidence_rows,
     finding_rows,
+    review_exceptions,
 )
 
 
@@ -246,6 +250,64 @@ def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_ke
             _show_evidence(finding.rows_b, Source.B)
 
 
+def _show_exception_review(findings: tuple[ReconciliationFinding, ...], *, identity: str) -> None:
+    query = st.text_input(
+        "Search matching keys",
+        key=f"review_search_{identity}",
+        help="Case-insensitive substring search within each matching-key component.",
+    )
+    categories = st.multiselect(
+        "Exception categories",
+        EXCEPTION_CATEGORIES,
+        default=EXCEPTION_CATEGORIES,
+        format_func=CATEGORY_LABELS.__getitem__,
+        key=f"review_categories_{identity}",
+    )
+    left, right = st.columns(2)
+    with left:
+        minimum_text = st.text_input(
+            "Minimum absolute delta",
+            value="0",
+            key=f"review_minimum_{identity}",
+            help="Display groups at or above this absolute difference. "
+            "Zero includes zero-delta exceptions. This does not change amount tolerance.",
+        )
+    with right:
+        sort_order = st.selectbox(
+            "Exception sort order",
+            tuple(EXCEPTION_SORT_LABELS),
+            format_func=EXCEPTION_SORT_LABELS.__getitem__,
+            key=f"review_sort_{identity}",
+        )
+    try:
+        minimum = parse_amount(minimum_text.strip() or "0")
+        if minimum < 0:
+            raise AmountParseError("must be zero or greater")
+    except AmountParseError as exc:
+        st.error(f"Minimum absolute delta: {exc}.")
+        st.caption(f"Showing 0 of {len(findings):,} exception groups.")
+        st.info("Enter a valid minimum absolute delta to display exception groups.")
+        return
+    visible = review_exceptions(
+        findings,
+        query=query,
+        categories=categories,
+        minimum_abs_delta=minimum,
+        sort_order=sort_order,
+    )
+    st.caption(f"Showing {len(visible):,} of {len(findings):,} exception groups.")
+    if not visible:
+        st.info("No exception groups match the current review filters.")
+        return
+    # A different view must not reuse a selection index from another row order.
+    view_id = sha256(
+        json.dumps(
+            [query, [category.value for category in categories], minimum_text, sort_order]
+        ).encode("utf-8")
+    ).hexdigest()
+    _show_finding_table(visible, table_key=f"exceptions_{identity}_{view_id}")
+
+
 def _show_results(
     result: ReconciliationResult, mapping: ColumnMapping, identity: str, name_a: str, name_b: str
 ) -> None:
@@ -294,6 +356,9 @@ def _show_results(
         st.warning(f"{len(exceptions)} key groups require review.")
     if exceptions:
         st.subheader("Exceptions")
+        st.caption(
+            "Review filters affect the displayed table only. The exception export remains complete."
+        )
         st.download_button(
             "Download exception report",
             data=export_exceptions_csv(result),
@@ -302,7 +367,7 @@ def _show_results(
             key=f"download_{identity}",
             on_click="ignore",
         )
-        _show_finding_table(exceptions, table_key=f"exceptions_{identity}")
+        _show_exception_review(exceptions, identity=identity)
     if tolerated:
         st.subheader("Within tolerance")
         st.metric(

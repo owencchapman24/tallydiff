@@ -1,5 +1,7 @@
+import csv
 import json
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,9 @@ from tallydiff import (
     ReconciliationMode,
     export_mapping_profile,
     load_mapping_profile,
+    reconcile,
 )
+from tallydiff.presentation import EXCEPTION_CATEGORIES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -931,3 +935,286 @@ def test_grouped_exact_table_excludes_one_to_one_but_counts_all_and_preserves_ev
         for row in range(3, 3 + len(amounts))
     ]
     assert {metric.label: metric.value for metric in app.metric}["Exact match"] == "2"
+
+
+@pytest.fixture
+def review_downloads(monkeypatch: pytest.MonkeyPatch) -> dict:
+    captured = {}
+    original = st.download_button
+
+    def capture(label, *args, **kwargs):
+        if label in ("Download exception report", "Download mapping profile"):
+            captured[label] = kwargs["data"]
+        return original(label, *args, **kwargs)
+
+    monkeypatch.setattr(st, "download_button", capture)
+    return captured
+
+
+def _review_app(mode=ReconciliationMode.UNIQUE, tolerance="0") -> AppTest:
+    app = _uploaded_app(
+        b"id,amount\nA_ONLY,5\nBIG,10\nCREDIT,0\nDUP,5\nDUP,-5\nSMALL,1\n"
+        b"EXACT,1\nGROUPED_EXACT,1\nGROUPED_EXACT,2\n",
+        b"id,amount\nBIG,0\nCREDIT,2\nDUP,0\nSMALL,1.0001\nEXACT,1\nGROUPED_EXACT,3\nB_ONLY,3\n",
+    )
+    _simple_mapping(app)
+    app.radio(key="reconciliation_mode").set_value(mode)
+    app.text_input(key="amount_tolerance").set_value(tolerance).run()
+    assert not any(widget.label == "Search matching keys" for widget in app.text_input)
+    app.button(key="run").click().run()
+    assert not app.exception
+    return app
+
+
+def _review_widget(app: AppTest, label: str):
+    return next(
+        widget
+        for widget in (*app.text_input, *app.multiselect, *app.selectbox)
+        if widget.label == label
+    )
+
+
+def _exception_table(app: AppTest):
+    return next(
+        (frame for frame in app.dataframe if frame.key and frame.key.startswith("exceptions_")),
+        None,
+    )
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_exception_review_defaults_show_all_with_fixed_exception_categories(mode) -> None:
+    app = _review_app(mode)
+    assert _review_widget(app, "Search matching keys").value == ""
+    assert _review_widget(app, "Minimum absolute delta").value == "0"
+    assert _review_widget(app, "Exception sort order").value == "matching_key"
+    categories = _review_widget(app, "Exception categories")
+    assert categories.value == list(EXCEPTION_CATEGORIES)
+    assert categories.options == [
+        "Amount mismatch",
+        "File A only",
+        "File B only",
+        "Duplicate / ambiguous",
+    ]
+    expected = ["A_ONLY", "BIG", "B_ONLY", "CREDIT", "SMALL"]
+    if mode is ReconciliationMode.UNIQUE:
+        expected = ["A_ONLY", "BIG", "B_ONLY", "CREDIT", "DUP", "GROUPED_EXACT", "SMALL"]
+    assert _exception_table(app).value["Matching key"].tolist() == expected
+    assert any(
+        item.value == f"Showing {len(expected)} of {len(expected)} exception groups."
+        for item in app.caption
+    )
+    assert any(
+        "Review filters affect the displayed table only. The exception export remains complete."
+        == item.value
+        for item in app.caption
+    )
+
+
+@pytest.mark.parametrize(
+    ("data_b", "tolerance"),
+    [(b"id,amount\n", "0"), (b"id,amount\nINV,1\n", "0"), (b"id,amount\nINV,1.01\n", "0.01")],
+)
+def test_exception_review_controls_are_absent_without_exceptions(data_b, tolerance) -> None:
+    data_a = b"id,amount\n" if data_b == b"id,amount\n" else b"id,amount\nINV,1\n"
+    app = _uploaded_app(data_a, data_b)
+    _simple_mapping(app)
+    app.text_input(key="amount_tolerance").set_value(tolerance).run()
+    app.button(key="run").click().run()
+
+    assert not app.exception
+    labels = {widget.label for widget in (*app.text_input, *app.selectbox, *app.multiselect)}
+    assert not labels.intersection(
+        {
+            "Search matching keys",
+            "Exception categories",
+            "Minimum absolute delta",
+            "Exception sort order",
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize(
+    ("label", "value", "visible_keys"),
+    [
+        ("Search matching keys", "big", ["BIG"]),
+        (
+            "Exception categories",
+            [FindingCategory.A_ONLY, FindingCategory.B_ONLY],
+            ["A_ONLY", "B_ONLY"],
+        ),
+        ("Minimum absolute delta", "3", ["A_ONLY", "BIG", "B_ONLY"]),
+        ("Exception sort order", "absolute_delta_desc", None),
+    ],
+)
+def test_review_controls_preserve_result_metrics_profile_and_complete_export(
+    monkeypatch, review_downloads, mode, label, value, visible_keys
+) -> None:
+    calls = []
+
+    def tracked_reconcile(*args, **kwargs):
+        calls.append(kwargs)
+        return reconcile(*args, **kwargs)
+
+    monkeypatch.setattr("tallydiff.reconcile", tracked_reconcile)
+    app = _review_app(mode)
+    completed = app.session_state["completed"]
+    metrics = {metric.label: metric.value for metric in app.metric}
+    original_export = review_downloads["Download exception report"]
+    original_profile = review_downloads["Download mapping profile"]
+    full_keys = [finding.key[0] for finding in completed[1].exceptions]
+    _review_widget(app, label).set_value(value).run()
+
+    assert not app.exception
+    assert len(calls) == 1
+    assert app.session_state["completed"][0] == completed[0]
+    assert app.session_state["completed"][1] is completed[1]
+    assert {metric.label: metric.value for metric in app.metric} == metrics
+    assert review_downloads["Download mapping profile"] == original_profile
+    assert review_downloads["Download exception report"] == original_export
+    assert [
+        row["Matching key"] for row in csv.DictReader(StringIO(original_export.decode()))
+    ] == full_keys
+    if visible_keys is None:
+        visible_keys = ["BIG", "A_ONLY", "B_ONLY", "CREDIT", "SMALL"]
+        if mode is ReconciliationMode.UNIQUE:
+            visible_keys += ["DUP", "GROUPED_EXACT"]
+    assert _exception_table(app).value["Matching key"].tolist() == visible_keys
+    assert any(
+        item.value == f"Showing {len(visible_keys)} of {len(full_keys)} exception groups."
+        for item in app.caption
+    )
+    assert app.text_input(key="amount_tolerance").value == "0"
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("Search matching keys", "missing"),
+        ("Exception categories", []),
+        ("Minimum absolute delta", "11"),
+    ],
+)
+def test_review_zero_matches_is_clear_and_keeps_complete_export(
+    review_downloads, label, value
+) -> None:
+    app = _review_app()
+    completed = app.session_state["completed"]
+    original_export = review_downloads["Download exception report"]
+    _review_widget(app, label).set_value(value).run()
+    app.run()
+
+    assert not app.exception
+    assert _exception_table(app) is None
+    assert any(item.value == "Showing 0 of 7 exception groups." for item in app.caption)
+    assert any(
+        "No exception groups match the current review filters." == item.value for item in app.info
+    )
+    assert _review_widget(app, label).value == value
+    assert app.session_state["completed"][1] is completed[1]
+    assert _exception_downloads(app)
+    assert review_downloads["Download exception report"] == original_export
+
+
+@pytest.mark.parametrize("value", ["-0.01", "NaN", "Infinity", "invalid"])
+def test_invalid_review_minimum_keeps_completed_result_and_export(review_downloads, value) -> None:
+    app = _review_app()
+    completed = app.session_state["completed"]
+    original_export = review_downloads["Download exception report"]
+    _review_widget(app, "Minimum absolute delta").set_value(value).run()
+
+    assert not app.exception
+    assert any("Minimum absolute delta:" in item.value for item in app.error)
+    assert _exception_table(app) is None
+    assert app.session_state["completed"][1] is completed[1]
+    assert review_downloads["Download exception report"] == original_export
+    assert not app.button(key="run").disabled
+    assert app.text_input(key="amount_tolerance").value == "0"
+    _review_widget(app, "Minimum absolute delta").set_value("0").run()
+    assert not app.exception and not app.error
+    assert len(_exception_table(app).value) == 7
+
+
+@pytest.mark.parametrize("value", ["", " \t"])
+def test_blank_review_minimum_is_equivalent_to_zero(value) -> None:
+    app = _review_app()
+    _review_widget(app, "Minimum absolute delta").set_value(value).run()
+
+    assert not app.exception and not app.error
+    assert len(_exception_table(app).value) == 7
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_filtered_finding_keeps_every_source_row_in_both_modes(mode) -> None:
+    app = _uploaded_app(
+        b"id,amount\nMULTI,100\nMULTI,200\nHIDDEN,7\n",
+        b"id,amount\nMULTI,100\nHIDDEN,6\n",
+    )
+    _simple_mapping(app)
+    app.radio(key="reconciliation_mode").set_value(mode).run()
+    app.button(key="run").click().run()
+    _review_widget(app, "Search matching keys").set_value("multi").run()
+    assert _exception_table(app).value["Matching key"].tolist() == ["MULTI"]
+
+    _select_first_finding(app)
+
+    assert not app.exception
+    assert [frame.value["Original value"].tolist() for frame in app.dataframe[1:]] == [
+        ["MULTI", "100"],
+        ["MULTI", "200"],
+        ["MULTI", "100"],
+    ]
+    assert [item.value for item in app.caption if item.value.startswith("Source record ")] == [
+        "Source record 2",
+        "Source record 3",
+        "Source record 2",
+    ]
+    assert any(item.value == "Showing 1 of 2 exception groups." for item in app.caption)
+
+
+def test_changing_exception_view_resets_selection_before_filtering_or_reordering() -> None:
+    app = _review_app()
+    table = _exception_table(app)
+    app.session_state[table.key] = {"selection": {"rows": [6], "columns": [], "cells": []}}
+    app.run()
+    assert any(item.value == "Selected key: SMALL" for item in app.text)
+
+    _review_widget(app, "Minimum absolute delta").set_value("3").run()
+    assert not app.exception
+    assert _exception_table(app).key != table.key
+    assert not any(item.value.startswith("Selected key:") for item in app.text)
+    _select_first_finding(app)
+    assert any(item.value == "Selected key: A_ONLY" for item in app.text)
+
+    _review_widget(app, "Exception sort order").set_value("absolute_delta_desc").run()
+    assert not app.exception
+    assert not any(item.value.startswith("Selected key:") for item in app.text)
+    _select_first_finding(app)
+    assert any(item.value == "Selected key: BIG" for item in app.text)
+    assert [frame.value["Original value"].tolist() for frame in app.dataframe[1:]] == [
+        ["BIG", "10"],
+        ["BIG", "0"],
+    ]
+
+
+def test_exception_filters_leave_tolerated_and_grouped_exact_evidence_separate() -> None:
+    app = _review_app(ReconciliationMode.GROUPED_BY_KEY, tolerance="0.001")
+    metrics = {metric.label: metric.value for metric in app.metric}
+    tolerated = next(frame for frame in app.dataframe if frame.key.startswith("tolerated_"))
+    exact = next(frame for frame in app.dataframe if frame.key.startswith("exact_"))
+    tolerated_rows, exact_rows = tolerated.value.copy(), exact.value.copy()
+
+    for label, value in (("Search matching keys", "missing"), ("Minimum absolute delta", "-1")):
+        _review_widget(app, label).set_value(value).run()
+        assert not app.exception
+        assert _exception_table(app) is None
+        assert {metric.label: metric.value for metric in app.metric} == metrics
+        current_tolerated = next(frame for frame in app.dataframe if frame.key == tolerated.key)
+        current_exact = next(frame for frame in app.dataframe if frame.key == exact.key)
+        assert current_tolerated.value.equals(tolerated_rows)
+        assert current_exact.value.equals(exact_rows)
+    app.session_state[exact.key] = {"selection": {"rows": [0], "columns": [], "cells": []}}
+    app.run()
+    assert not app.exception
+    assert any(item.value == "Selected key: DUP" for item in app.text)
+    assert len(app.dataframe) == 5

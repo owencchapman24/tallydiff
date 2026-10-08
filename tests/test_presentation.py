@@ -5,6 +5,7 @@ from decimal import Decimal, localcontext
 import pytest
 
 from tallydiff import (
+    FindingCategory,
     IngestionError,
     ReconciliationMode,
     Source,
@@ -15,6 +16,7 @@ from tallydiff import (
     reconcile,
 )
 from tallydiff.presentation import (
+    EXCEPTION_CATEGORIES,
     MODE_LABELS,
     ColumnMapping,
     configuration_id,
@@ -22,6 +24,7 @@ from tallydiff.presentation import (
     display_amount,
     evidence_rows,
     finding_rows,
+    review_exceptions,
 )
 
 
@@ -307,3 +310,219 @@ def test_profile_and_manual_configuration_have_same_identity_regardless_of_json(
             )
             == manual
         )
+
+
+@pytest.fixture
+def review_findings() -> tuple:
+    a = [
+        ((" V001 ", "INV-1042"), "100"),
+        (("V001", "INV-1043"), "10"),
+        (("V002", "INV-2000"), "2"),
+        (("V004", "DUP-4000"), "5"),
+        (("V004", "DUP-4000"), "-5"),
+        (("V005", "INV-5000"), "0.001"),
+    ]
+    b = [
+        ((" V001 ", "INV-1042"), "99.9999"),
+        (("V001", "INV-1043"), "5"),
+        (("V003", "CREDIT-3000"), "2"),
+        (("V004", "DUP-4000"), "0"),
+        (("V005", "INV-5000"), "0"),
+        (("V006", "INV-6000"), "10"),
+    ]
+    records = [
+        [
+            SourceRecord(source, row, key, Decimal(amount))
+            for row, (key, amount) in enumerate(values, 1)
+        ]
+        for source, values in ((Source.A, a), (Source.B, b))
+    ]
+    return tuple(reversed(reconcile(*records).exceptions))
+
+
+@pytest.mark.parametrize(
+    ("query", "vendors"),
+    [
+        ("", [" V001 ", "V001", "V002", "V003", "V004", "V005", "V006"]),
+        (" \t\n", [" V001 ", "V001", "V002", "V003", "V004", "V005", "V006"]),
+        ("v001", [" V001 ", "V001"]),
+        (" v001 ", [" V001 ", "V001"]),
+        ("INV", [" V001 ", "V001", "V002", "V005", "V006"]),
+        ("1042", [" V001 "]),
+        ("104", [" V001 ", "V001"]),
+        ("missing", []),
+        ("INV.*", []),
+        ("V001 / INV", []),
+    ],
+)
+def test_exception_review_searches_components_without_fuzzy_or_regex_matching(
+    review_findings, query, vendors
+) -> None:
+    visible = review_exceptions(review_findings, query=query)
+
+    assert [finding.key[0] for finding in visible] == vendors
+
+
+def test_exception_review_preserves_keys_findings_and_complete_source_evidence(
+    review_findings,
+) -> None:
+    inputs = list(review_findings)
+    snapshot = tuple(inputs)
+    keys = [finding.key for finding in inputs]
+    selected = review_exceptions(inputs, query="v001")
+
+    assert tuple(inputs) == snapshot
+    assert [finding.key for finding in inputs] == keys
+    assert selected[0].key == (" V001 ", "INV-1042")
+    assert selected[0] is inputs[-1]
+    duplicate = review_exceptions(inputs, query="dup")[0]
+    original = next(finding for finding in inputs if finding.key[0] == "V004")
+    assert duplicate is original
+    assert duplicate.rows_a is original.rows_a and duplicate.rows_b is original.rows_b
+    assert len(duplicate.rows_a) == 2 and len(duplicate.rows_b) == 1
+
+
+@pytest.mark.parametrize(
+    ("categories", "vendors"),
+    [
+        (EXCEPTION_CATEGORIES, [" V001 ", "V001", "V002", "V003", "V004", "V005", "V006"]),
+        ((FindingCategory.AMOUNT_MISMATCH,), [" V001 ", "V001", "V005"]),
+        ((FindingCategory.DUPLICATE_AMBIGUOUS,), ["V004"]),
+        ((FindingCategory.A_ONLY, FindingCategory.B_ONLY), ["V002", "V003", "V006"]),
+        ((), []),
+    ],
+)
+def test_exception_review_category_selection(review_findings, categories, vendors) -> None:
+    visible = review_exceptions(review_findings, categories=categories)
+
+    assert [finding.key[0] for finding in visible] == vendors
+
+
+@pytest.mark.parametrize(
+    ("minimum", "vendors"),
+    [
+        ("0", [" V001 ", "V001", "V002", "V003", "V004", "V005", "V006"]),
+        ("0.0001", [" V001 ", "V001", "V002", "V003", "V005", "V006"]),
+        ("0.00010000000000000001", ["V001", "V002", "V003", "V005", "V006"]),
+        ("0.001", ["V001", "V002", "V003", "V005", "V006"]),
+        ("0.00100000000000001", ["V001", "V002", "V003", "V006"]),
+        ("2", ["V001", "V002", "V003", "V006"]),
+        ("2.0000000000000001", ["V001", "V006"]),
+        ("5", ["V001", "V006"]),
+        ("5.0000000000000001", ["V006"]),
+        ("11", []),
+    ],
+)
+def test_exception_review_minimum_is_exact_inclusive_and_keeps_zero_by_default(
+    review_findings, minimum, vendors
+) -> None:
+    visible = review_exceptions(review_findings, minimum_abs_delta=Decimal(minimum))
+
+    assert [finding.key[0] for finding in visible] == vendors
+
+
+@pytest.mark.parametrize("minimum", [0, 0.01, "0", True, None])
+def test_exception_review_minimum_requires_decimal(review_findings, minimum: object) -> None:
+    with pytest.raises(TypeError, match="minimum_abs_delta must be a Decimal"):
+        review_exceptions(review_findings, minimum_abs_delta=minimum)
+
+
+@pytest.mark.parametrize("minimum", ["-0.0001", "NaN", "sNaN", "Infinity", "-Infinity"])
+def test_exception_review_rejects_negative_or_nonfinite_minimum(review_findings, minimum) -> None:
+    with pytest.raises(ValueError, match="minimum_abs_delta must be finite and zero or greater"):
+        review_exceptions(review_findings, minimum_abs_delta=Decimal(minimum))
+
+
+@pytest.mark.parametrize(
+    ("sort_order", "vendors"),
+    [
+        ("matching_key", [" V001 ", "V001", "V002", "V003", "V004", "V005", "V006"]),
+        ("absolute_delta_desc", ["V006", "V001", "V002", "V003", "V005", " V001 ", "V004"]),
+        ("absolute_delta_asc", ["V004", " V001 ", "V005", "V002", "V003", "V001", "V006"]),
+    ],
+)
+def test_exception_review_sorting_is_deterministic_with_key_ties_and_preserves_input(
+    review_findings, sort_order, vendors
+) -> None:
+    inputs = list(review_findings)
+    snapshot = tuple(inputs)
+    visible = review_exceptions(inputs, sort_order=sort_order)
+
+    assert [finding.key[0] for finding in visible] == vendors
+    assert review_exceptions(tuple(reversed(inputs)), sort_order=sort_order) == visible
+    assert tuple(inputs) == snapshot
+
+
+def test_exception_review_search_categories_minimum_and_sort_compose(review_findings) -> None:
+    visible = review_exceptions(
+        review_findings,
+        query="inv",
+        categories=(FindingCategory.AMOUNT_MISMATCH, FindingCategory.A_ONLY),
+        minimum_abs_delta=Decimal("0.001"),
+        sort_order="absolute_delta_desc",
+    )
+
+    assert len(visible) == 3
+    assert [finding.key[0] for finding in visible] == ["V001", "V002", "V005"]
+
+
+@pytest.mark.parametrize("sort_order", ["", "unknown"])
+def test_exception_review_rejects_unknown_sort_order(review_findings, sort_order) -> None:
+    with pytest.raises(ValueError, match="Unsupported exception sort order"):
+        review_exceptions(review_findings, sort_order=sort_order)
+
+
+@pytest.mark.parametrize(
+    "category", [FindingCategory.EXACT_MATCH, FindingCategory.WITHIN_TOLERANCE, "a_only"]
+)
+def test_exception_review_cannot_include_accepted_categories(review_findings, category) -> None:
+    with pytest.raises(ValueError, match="only exception category enum members"):
+        review_exceptions(review_findings, categories=(category,))
+
+
+def test_exception_review_decimal_filter_and_sort_ignore_low_precision_and_float_limits() -> None:
+    huge = Decimal("1" + "0" * 1000 + ".0001")
+    a = [
+        SourceRecord(Source.A, 1, ("A-large",), huge),
+        SourceRecord(Source.A, 2, ("C-small",), Decimal("0.0001")),
+    ]
+    b = [SourceRecord(Source.B, 1, ("B-large",), huge)]
+    findings = reconcile(a, b).exceptions
+    with localcontext() as context:
+        context.prec = 1
+        context.Emax = 2
+        context.Emin = -2
+        for signal in context.traps:
+            context.traps[signal] = True
+        context.clear_flags()
+
+        visible = review_exceptions(
+            findings, minimum_abs_delta=Decimal("0.0001"), sort_order="absolute_delta_desc"
+        )
+
+        assert [finding.key for finding in visible] == [("A-large",), ("B-large",), ("C-small",)]
+        assert (
+            review_exceptions(findings, minimum_abs_delta=Decimal("0.00010000000000000001"))
+            == findings[:2]
+        )
+        assert not any(context.flags.values())
+
+
+def test_exception_review_handles_ten_thousand_groups() -> None:
+    records = [
+        SourceRecord(Source.A, index + 1, (f"INV-{index:05d}",), Decimal(index % 10))
+        for index in range(10_000)
+    ]
+    findings = reconcile(records, []).exceptions
+
+    visible = review_exceptions(
+        tuple(reversed(findings)),
+        query="999",
+        minimum_abs_delta=Decimal("9"),
+        sort_order="absolute_delta_desc",
+    )
+
+    assert len(visible) == 10
+    assert [finding.key for finding in visible] == [
+        (f"INV-{index:05d}",) for index in range(999, 10_000, 1000)
+    ]
