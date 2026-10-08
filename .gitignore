@@ -15,4 +15,3 @@ build/
 .coverage.*
 htmlcov/
 benchmark_output/
-benchmark_output/

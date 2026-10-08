@@ -284,6 +284,38 @@ def test_corrupt_sheet_xml_and_missing_zip_part_are_contextual(xlsx_bytes):
             inspect_xlsx_sheets(stream.getvalue(), source=Source.A)
 
 
+def test_late_corrupt_sheet_is_contextual_and_closes_workbooks(xlsx_bytes, monkeypatch):
+    import tallydiff.xlsx as module
+
+    data = xlsx_bytes(
+        {"Data": [["id", "amount"], *[[f"INV{index}", index] for index in range(1000)]]}
+    )
+    broken = rewrite_xml(
+        data,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b"</sheetData>", b"</bad>"),
+    )
+    opened = []
+    original = module.load_workbook
+
+    def capture(*args, **kwargs):
+        workbook = original(*args, **kwargs)
+        opened.append(workbook)
+        return workbook
+
+    monkeypatch.setattr(module, "load_workbook", capture)
+    # The workbook and header load successfully; corruption appears only when
+    # the lazy worksheet parser reaches the end of the data region.
+    assert inspect_xlsx_sheets(broken, source=Source.B) == ("Data",)
+    assert inspect_xlsx_columns(broken, source=Source.B, worksheet="Data") == ("id", "amount")
+    with pytest.raises(IngestionError, match="could not read XLSX workbook") as error:
+        ingest(broken)
+    assert error.value.source == Source.B
+    assert error.value.worksheet == "Data"
+    assert len(opened) == 3
+    assert all(workbook._archive.fp is None for workbook in opened)
+
+
 def test_resources_closed_on_success_and_validation_failure(xlsx_bytes, monkeypatch):
     import tallydiff.xlsx as module
 

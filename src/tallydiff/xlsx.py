@@ -93,6 +93,37 @@ def _sheet(workbook: Workbook, worksheet: str, source: Source) -> ReadOnlyWorksh
     raise IngestionError(source, "selected worksheet does not exist", worksheet=worksheet)
 
 
+def _iter_rows(
+    sheet: ReadOnlyWorksheet, source: Source, worksheet: str
+) -> Iterator[tuple[Cell, ...]]:
+    # Read-only worksheets parse lazily. Catch parser failures only while advancing
+    # openpyxl's iterator, so errors in the caller's processing still propagate.
+    rows = sheet.iter_rows()
+    try:
+        while True:
+            try:
+                cells = next(rows)
+            except StopIteration:
+                return
+            except (
+                BadZipFile,
+                ParseError,
+                OSError,
+                EOFError,
+                KeyError,
+                ValueError,
+                IndexError,
+            ) as exc:
+                raise IngestionError(
+                    source,
+                    "could not read XLSX workbook; use an unencrypted, valid .xlsx export",
+                    worksheet=worksheet,
+                ) from exc
+            yield cells
+    finally:
+        rows.close()
+
+
 def _header(rows: Iterator[tuple[Cell, ...]], source: Source, worksheet: str) -> tuple[str, ...]:
     cells = list(next(rows, ()))
     while cells and cells[-1].value is None:
@@ -127,7 +158,7 @@ def _header(rows: Iterator[tuple[Cell, ...]], source: Source, worksheet: str) ->
 def inspect_xlsx_columns(data: bytes, *, source: Source, worksheet: str) -> tuple[str, ...]:
     """Validate row 1 only, with exact text headers and no display-format inference."""
     with _open(data, source, worksheet) as workbook:
-        rows = _sheet(workbook, worksheet, source).iter_rows()
+        rows = _iter_rows(_sheet(workbook, worksheet, source), source, worksheet)
         try:
             return _header(rows, source, worksheet)
         finally:
@@ -217,7 +248,7 @@ def ingest_xlsx(
         raise IngestionError(source, "select a nonblank amount column name", worksheet=worksheet)
     records = []
     with _open(data, source, worksheet) as workbook:
-        rows = _sheet(workbook, worksheet, source).iter_rows()
+        rows = _iter_rows(_sheet(workbook, worksheet, source), source, worksheet)
         try:
             header = _header(rows, source, worksheet)
             for column in (*keys, amount_column):

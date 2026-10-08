@@ -1,19 +1,32 @@
 # TallyDiff
 
-TallyDiff compares two financial CSV or XLSX exports and explains which records account
-for their difference. Use an ordered key, such as vendor plus invoice number, to
-review unequal amounts, missing records, and duplicate keys with their original
-source evidence.
+**TallyDiff v0.2.0** compares two structured financial exports locally and explains
+which records account for their difference. Pair exact key columns, such as
+vendor and invoice number, then review unequal amounts, missing records, and
+duplicate keys with their source evidence.
+
+- **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
+  worksheet per workbook; multiple worksheets require an explicit choice.
+- **Absolute amount tolerance**, defaulting to zero. Accepted nonzero differences
+  remain visible in a distinct **Within tolerance** category and review table.
+- **Reusable mapping profiles** for ordered key pairs, amount columns, and
+  tolerance. Version 1 profiles work across formats with matching column names.
+- **Exact Decimal arithmetic** after parsing. XLSX numeric cells first convert
+  through decimal text; Excel display formatting is not reconstructed.
+- **Conservative formula handling**: formulas in selected key or amount fields
+  block ingestion. Formulas are never calculated and cached results are not used.
+- **Traceable exceptions and CSV export**, with every source row accounted for
+  and all finding deltas explaining the control-total difference.
+
+Equal totals alone never imply a reconciliation. TallyDiff reports differences;
+it does not decide which source is authoritative. See [known limitations](#known-limitations)
+and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
-**v0.1.0** is the stable compatibility baseline. The **v0.2 development branch**
-adds optional global absolute amount tolerance, portable mapping profiles, and
-conservative XLSX ingestion to the local Streamlit app: upload two files, configure their columns, reconcile,
-inspect findings, and download a CSV exception report. Every source record is accounted for, ambiguous
-duplicates stay visible, and all finding deltas explain the control-total
-difference. Equal totals alone never imply a reconciliation.
-TallyDiff reports differences; it does not decide which source is authoritative.
+The screenshot shows the synthetic +245 CSV example in the earlier interface.
+The same result remains valid in v0.2.0; current controls also include tolerance,
+mapping profiles, and XLSX worksheet selection.
 
 ## Quick start
 
@@ -69,7 +82,7 @@ download until you run again. Selecting an exception or accepted variance preser
 ## Absolute amount tolerance
 
 **Amount tolerance** accepts ordinary monetary text in the same units as the
-selected amount columns. It defaults to `0`, preserving v0.1 exact-match behavior.
+selected amount columns. It defaults to `0`, requiring exact equality for unique pairs.
 Negative, blank, malformed, and non-finite values block reconciliation. The
 existing monetary grammar is used directly to construct a Decimal; no float
 conversion or rounding occurs, and more than two decimal places are supported.
@@ -362,7 +375,9 @@ boundaries, high precision, invalid types and values, duplicate and one-sided
 precedence, accepted variance totals, separate review, and export exclusion.
 Profile tests cover strict schema validation, exact Decimal round trips, key order,
 directional compatibility, atomic application, editable controls, download
-validity, configuration privacy, and stale-result clearing.
+validity, configuration privacy, and stale-result clearing. XLSX tests cover
+worksheet selection, cell conversion, formula/error rejection, row references,
+corrupt inputs, resource closure, mixed-format results, and stale worksheet changes.
 
 ## Realistic-data validation (developer tooling)
 
@@ -387,7 +402,8 @@ The benchmark defaults to 1,000, 10,000, and 50,000 **key groups** (about 980,
 separately times CSV generation, header inspection/mapping/ingestion,
 reconciliation, exception serialization, and independent verification, plus
 total elapsed time. Verification checks categories, totals, row accounting, and
-exported exception keys against the generator's truth. No product behavior is
+exported exception keys against the generator's truth. This benchmark exercises
+CSV ingestion; its timings do not measure XLSX parsing. No product behavior is
 changed by these scripts.
 
 `--memory` adds a separate, slower `tracemalloc` pass so instrumentation does
@@ -416,7 +432,7 @@ developer observations, not CI performance thresholds or capacity guarantees.
 ### Reconciliation kernel
 
 `reconcile(records_a, records_b, *, amount_tolerance=Decimal("0"))` preserves the
-v0.1 classifications when tolerance is omitted or zero. Tolerance must be a
+exact-equality classification when tolerance is omitted or zero. Tolerance must be a
 finite, nonnegative `Decimal`; other types raise `TypeError`, and non-finite or
 negative Decimals raise `ValueError`. No numeric coercion is performed.
 
@@ -516,6 +532,22 @@ result = reconcile(records_a, records_b)  # control difference: Decimal("45.00")
 when applicable. Display `str(error)` for a concise diagnostic instead of a
 traceback. Ingestion stops at the first error; it does not return partial results.
 
+### XLSX ingestion
+
+`inspect_xlsx_sheets(data: bytes, *, source=...)` lists ordinary worksheets in
+stored order, including hidden worksheets. `inspect_xlsx_columns(data, *, source=...,
+worksheet=...)` validates the selected sheet's row-1 text headers.
+
+`ingest_xlsx(data, *, source=..., worksheet=..., key_columns=..., amount_column=...)`
+validates one worksheet and returns the same immutable `SourceRecord` tuple as CSV
+ingestion. `source_row` is the actual worksheet row. Workbooks load read-only and
+close on success or failure. See the [XLSX policies](#xlsx-worksheet-and-cell-policies)
+for cell conversion, formulas, evidence, and blank-row behavior.
+
+Expected workbook/input failures raise contextual `IngestionError`; unexpected
+downstream programming errors propagate. `IngestionError` also exposes `worksheet`
+for XLSX diagnostics. The engine and mapping-profile APIs remain format-agnostic.
+
 ### Monetary text grammar
 
 `parse_amount` constructs `Decimal` directly from validated source text. There is
@@ -540,20 +572,35 @@ when ingesting CSV). No malformed amount is converted to zero.
 
 ## Known limitations
 
-- CSV only, UTF-8 input, two files at a time, one amount field per file, and
-  U.S.-style monetary syntax. No Excel ingestion or export, locale inference,
-  currency conversion, or automatic sign correction.
-- Exact keys after surrounding-whitespace trimming and one global absolute amount
-  tolerance. No percentage or per-row tolerance, fuzzy matching, automatic
-  mappings, or decisions about the authoritative source.
-- Configuration reuse is limited to explicit JSON profile downloads and uploads.
-  No managed profile library, database, reconciliation history, accounting-system
-  integrations, authentication, or cloud service. The app is intended to run
-  locally from the repository root, not as a shared hosted service.
-- Inputs, evidence, and report bytes are held in memory. There is no streaming
-  ingestion or large-file performance guarantee.
-- CSV does not carry spreadsheet cell types. Reports retain raw key text and
-  exact numeric strings; follow the spreadsheet-safety guidance above.
+- Each run compares two CSV/XLSX inputs with one amount column per side. CSV must
+  be comma-delimited UTF-8 (optional BOM); monetary text uses U.S.-style syntax.
+  `.xlsx` is supported; `.xls`, `.xlsm`, templates, and encrypted workbooks are not.
+  There is no Excel export, locale inference, currency conversion, or automatic
+  sign correction.
+- XLSX uses one ordinary worksheet with text headers in row 1. Selected key/amount
+  formulas are rejected; formulas are never recalculated and cached results are
+  never used. Arbitrary layouts, merged headers, table/pivot interpretation, named
+  ranges, and reconciling several worksheets at once are unsupported.
+- XLSX evidence represents underlying cell values, not Excel display formatting,
+  styles, comments, or calculated formula values. Numeric identifiers do not
+  reconstruct leading zeroes; store meaningful leading zeroes as text. Date/time
+  keys use openpyxl's ISO representation and may differ from a text date export.
+- Column mappings require exact names on the configured side. Key matching trims
+  surrounding whitespace only. There is no automatic mapping, fuzzy matching,
+  many-to-one pairing, or authority determination. Tolerance is one global
+  absolute amount, with no percentage or per-row tolerance.
+- Configuration reuse uses explicit version-1 JSON profile uploads/downloads.
+  Profiles require compatible columns and contain no financial records, results,
+  source filenames, or hashes. There is no managed profile library, database,
+  reconciliation history, accounting-system integration, authentication, or cloud
+  service. Run locally from the repository root, not as a shared hosted service.
+- Inputs, evidence, and reports are held in memory. There is no streaming
+  reconciliation or large-file capacity guarantee. Developer benchmarks measure
+  the documented synthetic CSV workload, not XLSX parsing or whole-browser memory.
+- CSV reports retain key text and exact numeric strings. Import untrusted reports
+  as text with formula evaluation disabled; CSV quoting does not prevent spreadsheet
+  formula execution. Composite-key labels joined with ` / ` are display text, not
+  a reversible key serialization; use the original inputs and source references.
 
 No real or confidential financial data should be committed to this repository.
-No software license has been selected; a LICENSE decision remains with the owner.
+The repository intentionally has no software license; that decision remains with the owner.
