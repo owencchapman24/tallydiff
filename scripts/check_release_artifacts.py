@@ -21,6 +21,7 @@ PACKAGE_MODULES = frozenset(
         "export",
         "ingest",
         "models",
+        "normalization",
         "presentation",
         "profiles",
         "xlsx",
