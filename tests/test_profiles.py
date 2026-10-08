@@ -69,7 +69,7 @@ def test_serialized_profile_has_only_versioned_configuration_fields(
     )
     assert document == {
         "format": "tallydiff-mapping-profile",
-        "version": 2,
+        "version": 3,
         "key_pairs": [
             {"file_a": "Vendor ID", "file_b": "Supplier"},
             {"file_a": "Invoice Number", "file_b": "Invoice Ref"},
@@ -77,6 +77,15 @@ def test_serialized_profile_has_only_versioned_configuration_fields(
         "amount_columns": {"file_a": "Invoice Amount", "file_b": "Gross Amount"},
         "amount_tolerance": "0.0100",
         "reconciliation_mode": mode.value,
+        "key_normalization": [
+            {
+                "casefold": False,
+                "collapse_whitespace": False,
+                "remove_punctuation": False,
+                "strip_leading_zeros": False,
+            }
+            for _ in MAPPING.key_pairs
+        ],
     }
     assert export_mapping_profile(MAPPING).endswith(b"\n")
     assert PresentationColumnMapping is ColumnMapping
@@ -125,7 +134,7 @@ def test_invalid_json_is_a_concise_profile_error(data: bytes) -> None:
     ("field", "value", "message"),
     [
         ("format", "other", "Unsupported profile format"),
-        ("version", 3, "Unsupported profile version"),
+        ("version", 4, "Unsupported profile version"),
         ("version", True, "Unsupported profile version"),
         ("key_pairs", {}, "key_pairs must be an array"),
         ("key_pairs", [], "at least one key mapping"),
@@ -273,7 +282,7 @@ def test_default_mode_preserves_existing_profile_and_export_callers() -> None:
     assert default.reconciliation_mode is ReconciliationMode.UNIQUE
     assert with_tolerance.reconciliation_mode is ReconciliationMode.UNIQUE
     assert with_tolerance.amount_tolerance.as_tuple() == Decimal("0.0100").as_tuple()
-    assert exported["version"] == 2
+    assert exported["version"] == 3
     assert exported["reconciliation_mode"] == "unique"
     assert exported["amount_tolerance"] == "0"
     assert load_mapping_profile(export_mapping_profile(MAPPING)) == default
@@ -304,6 +313,7 @@ def test_real_v1_profile_loads_as_unique_and_round_trips_logically(data: bytes |
 
     assert profile == MappingProfile(MAPPING, Decimal("0.0100"))
     assert profile.reconciliation_mode is ReconciliationMode.UNIQUE
+    assert profile.key_normalization is None
     assert profile.mapping.key_pairs == MAPPING.key_pairs
     assert profile.amount_tolerance.as_tuple() == Decimal("0.0100").as_tuple()
     profile.validate_columns(COLUMNS_A, COLUMNS_B)
@@ -312,7 +322,7 @@ def test_real_v1_profile_loads_as_unique_and_round_trips_logically(data: bytes |
         amount_tolerance=profile.amount_tolerance,
         reconciliation_mode=profile.reconciliation_mode,
     )
-    assert json.loads(upgraded)["version"] == 2
+    assert json.loads(upgraded)["version"] == 3
     assert json.loads(upgraded)["reconciliation_mode"] == "unique"
     assert load_mapping_profile(upgraded) == profile
 
@@ -324,6 +334,7 @@ def test_v2_loads_each_exact_supported_mode(v2_document: dict, mode: Reconciliat
     profile = load_mapping_profile(json.dumps(v2_document))
 
     assert profile.reconciliation_mode is mode
+    assert profile.key_normalization is None
     assert profile.mapping == MAPPING
     assert profile.amount_tolerance.as_tuple() == Decimal("0.0100").as_tuple()
 
@@ -378,13 +389,17 @@ def test_v1_rejects_the_v2_mode_field(mode: str) -> None:
         load_mapping_profile(json.dumps(document))
 
 
-@pytest.mark.parametrize("version", [-1, 0, 3, 99, True, False, "1", "2", None, 1.0, 2.0, [], {}])
+@pytest.mark.parametrize(
+    "version", [-1, 0, 4, 99, True, False, "1", "2", "3", None, 1.0, 2.0, 3.0, [], {}]
+)
 def test_unsupported_and_wrong_type_versions_raise_clear_errors(
     document: dict, version: object
 ) -> None:
     document["version"] = version
 
-    with pytest.raises(ProfileError, match="Unsupported profile version; expected version 1 or 2"):
+    with pytest.raises(
+        ProfileError, match="Unsupported profile version; expected version 1, 2, or 3"
+    ):
         load_mapping_profile(json.dumps(document))
 
 
@@ -413,12 +428,28 @@ def test_duplicate_mode_fields_are_rejected_even_if_values_agree(
 
 
 @pytest.mark.parametrize("mode", list(ReconciliationMode))
-def test_export_formatting_matches_v1_except_for_v2_schema_additions(
+def test_export_formatting_preserves_v1_fields_with_v3_schema_additions(
     mode: ReconciliationMode,
 ) -> None:
-    expected = V1_PROFILE.replace(b'"version": 1', b'"version": 2').replace(
+    expected = V1_PROFILE.replace(b'"version": 1', b'"version": 3').replace(
         b'  "amount_tolerance": "0.0100"\n',
-        (f'  "amount_tolerance": "0.0100",\n  "reconciliation_mode": "{mode.value}"\n').encode(),
+        (
+            f'  "amount_tolerance": "0.0100",\n  "reconciliation_mode": "{mode.value}",\n'
+            '  "key_normalization": [\n'
+            "    {\n"
+            '      "casefold": false,\n'
+            '      "collapse_whitespace": false,\n'
+            '      "remove_punctuation": false,\n'
+            '      "strip_leading_zeros": false\n'
+            "    },\n"
+            "    {\n"
+            '      "casefold": false,\n'
+            '      "collapse_whitespace": false,\n'
+            '      "remove_punctuation": false,\n'
+            '      "strip_leading_zeros": false\n'
+            "    }\n"
+            "  ]\n"
+        ).encode(),
     )
 
     data = export_mapping_profile(
