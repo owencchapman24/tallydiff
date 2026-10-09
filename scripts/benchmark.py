@@ -17,17 +17,24 @@ from io import StringIO
 from scripts.synthetic_data import (
     AMOUNT_A,
     AMOUNT_B,
+    COMPARISON_AMOUNT_A,
+    COMPARISON_AMOUNT_B,
+    COMPARISON_KEYS_A,
+    COMPARISON_KEYS_B,
+    COMPARISON_MAPPINGS,
     KEYS_A,
     KEYS_B,
     MODES,
     NORMALIZATION_RULES,
     WORKLOADS,
+    ComparisonGroundTruth,
     GroundTruth,
     decimal_units,
     generate_pair,
 )
 from tallydiff import (
     ColumnMapping,
+    ComparisonFieldMapping,
     KeyNormalizationConfig,
     KeyNormalizationRules,
     ReconciliationMode,
@@ -80,24 +87,44 @@ def measure(
     generated = time.perf_counter()
     columns_a = inspect_csv_columns(pair.csv_a, source=Source.A)
     columns_b = inspect_csv_columns(pair.csv_b, source=Source.B)
-    mapping = ColumnMapping(tuple(zip(KEYS_A, KEYS_B, strict=True)), AMOUNT_A, AMOUNT_B)
+    mapping = (
+        comparison_mapping()
+        if workload == "comparison"
+        else ColumnMapping(tuple(zip(KEYS_A, KEYS_B, strict=True)), AMOUNT_A, AMOUNT_B)
+    )
     if mapping.problem(columns_a, columns_b):
         raise AssertionError("Synthetic schema is not compatible with its explicit mapping")
     a = ingest_csv(
-        pair.csv_a, source=Source.A, key_columns=mapping.keys_a, amount_column=mapping.amount_a
+        pair.csv_a,
+        source=Source.A,
+        key_columns=mapping.keys_a,
+        amount_column=mapping.amount_a,
+        comparison_columns=mapping.comparisons_a,
     )
     b = ingest_csv(
-        pair.csv_b, source=Source.B, key_columns=mapping.keys_b, amount_column=mapping.amount_b
+        pair.csv_b,
+        source=Source.B,
+        key_columns=mapping.keys_b,
+        amount_column=mapping.amount_b,
+        comparison_columns=mapping.comparisons_b,
     )
     ingested = time.perf_counter()
     configuration = normalization_config(workload)
-    result = reconcile(a, b, amount_tolerance=tolerance, mode=mode, key_normalization=configuration)
+    result = reconcile(
+        a,
+        b,
+        amount_tolerance=tolerance,
+        mode=mode,
+        key_normalization=configuration,
+        comparison_fields=mapping.comparison_fields,
+    )
     reconciled = time.perf_counter()
     report = export_exceptions_csv(result)
     exported = time.perf_counter()
 
     truth = pair.expected(tolerance, mode=mode.value)
-    verify_result(a, b, result, report, truth, key_normalization=configuration)
+    verifier = verify_comparison_result if workload == "comparison" else verify_result
+    verifier(a, b, result, report, truth, key_normalization=configuration)
     summary = truth.summary()
     finished = time.perf_counter()
     return Measurement(
@@ -112,6 +139,287 @@ def measure(
         finished - started,
         summary,
     )
+
+
+def comparison_mapping() -> ColumnMapping:
+    """Build the workload's three ordered asymmetric mappings on the actual side."""
+
+    return ColumnMapping(
+        tuple(zip(COMPARISON_KEYS_A, COMPARISON_KEYS_B, strict=True)),
+        COMPARISON_AMOUNT_A,
+        COMPARISON_AMOUNT_B,
+        comparison_fields=tuple(ComparisonFieldMapping(*names) for names in COMPARISON_MAPPINGS),
+    )
+
+
+# Independent expectations for the public CSV protocol, deliberately not imported
+# from product presentation/export helpers.
+_COMPARISON_CATEGORY_LABELS = {
+    "exact_match": "Exact match",
+    "within_tolerance": "Within tolerance",
+    "amount_mismatch": "Amount mismatch",
+    "a_only": "File A only",
+    "b_only": "File B only",
+    "duplicate_ambiguous": "Duplicate / ambiguous",
+}
+_COMPARISON_BASE_COLUMNS = (
+    "Category",
+    "Matching key",
+    "File A amount",
+    "File B amount",
+    "Delta (A - B)",
+    "File A records",
+    "File B records",
+    "Secondary differences",
+)
+
+
+def _constructed_money_places(records: tuple, column: str) -> int:
+    """Read only display precision from independently constructed financial strings."""
+
+    return max(
+        (
+            len(
+                "".join(
+                    character
+                    for character in record.raw_fields[column].split(".")[1]
+                    if character.isdigit()
+                )
+            )
+            for record in records
+        ),
+        default=0,
+    )
+
+
+def _integer_money_text(units: int, places: int, *, signed: bool = False) -> str:
+    """Render integer ten-thousandths exactly at construction-specified precision."""
+
+    if not 0 <= places <= 4 or units % (10 ** (4 - places)):
+        raise AssertionError("Construction money cannot be represented at its stated precision")
+    whole, fraction = divmod(abs(units), 10_000)
+    sign = "-" if units < 0 else "+" if signed and units > 0 else ""
+    text = f"{sign}{whole}"
+    return text + "." + f"{fraction:04d}"[:places] if places else text
+
+
+def _expected_comparison_export(truth: ComparisonGroundTruth) -> bytes:
+    """Serialize construction truth, never observed findings or product helpers."""
+
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    columns = list(_COMPARISON_BASE_COLUMNS)
+    for index, (column_a, column_b) in enumerate(truth.comparison_fields, start=1):
+        columns.extend(
+            (
+                f"Comparison {index} File A values — {column_a}",
+                f"Comparison {index} File B values — {column_b}",
+                f"Comparison {index} status",
+            )
+        )
+    writer.writerow(columns)
+    for group in truth.groups:
+        if not group.is_exception:
+            continue
+        places_a = _constructed_money_places(group.records_a, COMPARISON_AMOUNT_A)
+        places_b = _constructed_money_places(group.records_b, COMPARISON_AMOUNT_B)
+        row = [
+            _COMPARISON_CATEGORY_LABELS[group.category],
+            " / ".join(group.key),
+            _integer_money_text(group.units_a, places_a) if group.records_a else "",
+            _integer_money_text(group.units_b, places_b) if group.records_b else "",
+            _integer_money_text(group.delta_units, max(places_a, places_b), signed=True),
+            "; ".join(str(record.source_row) for record in group.records_a),
+            "; ".join(str(record.source_row) for record in group.records_b),
+            "; ".join(
+                f"Comparison {index}: {comparison.mapping[0]} ↔ {comparison.mapping[1]}"
+                for index, comparison in enumerate(group.field_comparisons, start=1)
+                if comparison.status == "mismatch"
+            ),
+        ]
+        for comparison in group.field_comparisons:
+            row.extend(
+                (
+                    json.dumps(comparison.values_a, ensure_ascii=False),
+                    json.dumps(comparison.values_b, ensure_ascii=False),
+                    comparison.status,
+                )
+            )
+        writer.writerow(row)
+    return output.getvalue().encode("utf-8")
+
+
+def verify_comparison_result(
+    a: tuple[SourceRecord, ...],
+    b: tuple[SourceRecord, ...],
+    result: ReconciliationResult,
+    report: bytes,
+    truth: ComparisonGroundTruth,
+    *,
+    key_normalization: KeyNormalizationConfig | None = None,
+) -> None:
+    """Check every comparison and source row against independent construction truth."""
+
+    if result.key_normalization is not key_normalization:
+        raise AssertionError("Result does not retain the exact normalization configuration used")
+    if result.mode.value != truth.mode:
+        raise AssertionError("Reconciliation mode differs from independent construction")
+    if tuple((mapping.file_a, mapping.file_b) for mapping in result.comparison_fields) != (
+        truth.comparison_fields
+    ):
+        raise AssertionError("Comparison mapping count/order differs from independent construction")
+    if (len(a), len(b)) != (truth.record_count_a, truth.record_count_b):
+        raise AssertionError("Record counts differ from independent construction")
+    if len(result.findings) != len(truth.groups):
+        raise AssertionError("Key-group count differs from independent construction")
+    if Counter(f.category.value for f in result.findings) != Counter(truth.category_counts):
+        raise AssertionError("Category counts differ from independent construction")
+    if (
+        result.total_a,
+        result.total_b,
+        result.control_difference,
+        result.tolerated_delta_total,
+    ) != (truth.total_a, truth.total_b, truth.control_difference, truth.tolerated_delta_total):
+        raise AssertionError("Totals differ from independent integer-based construction")
+    if tuple(f.key for f in result.exceptions) != truth.exception_keys:
+        raise AssertionError("Exception key order differs from independent construction")
+    if tuple(f.key for f in result.tolerated_findings) != truth.tolerated_keys:
+        raise AssertionError("Accepted-tolerance key order differs from independent construction")
+    if tuple(f.key for f in result.secondary_mismatch_findings) != tuple(
+        group.key for group in truth.groups if group.has_secondary_mismatch
+    ):
+        raise AssertionError("Secondary mismatch key order differs from independent construction")
+
+    original_records = {}
+    expected_identities = Counter()
+    for observed, attribute in ((a, "records_a"), (b, "records_b")):
+        expected_records = sorted(
+            (record for group in truth.groups for record in getattr(group, attribute)),
+            key=lambda record: record.source_row,
+        )
+        for row, expected in zip(observed, expected_records, strict=True):
+            identity = (row.source.value, row.source_row)
+            expected_identity = (expected.source, expected.source_row)
+            if (
+                identity != expected_identity
+                or row.key != expected.key
+                or row.amount != expected.amount
+                or dict(row.raw_fields) != expected.raw_fields
+            ):
+                raise AssertionError(
+                    f"Ingested source evidence differs from independent construction: "
+                    f"{expected_identity}"
+                )
+            if identity in original_records:
+                raise AssertionError(f"Source identity occurs more than once: {identity}")
+            original_records[identity] = row
+            expected_identities[expected_identity] += 1
+
+    accounted = Counter()
+    for finding, expected in zip(result.findings, truth.groups, strict=True):
+        if (
+            finding.key,
+            finding.category.value,
+            len(finding.rows_a),
+            len(finding.rows_b),
+            finding.amount_a,
+            finding.amount_b,
+            finding.delta,
+            finding.has_secondary_mismatch,
+            finding.is_exception,
+        ) != (
+            expected.key,
+            expected.category,
+            expected.rows_a,
+            expected.rows_b,
+            decimal_units(expected.units_a),
+            decimal_units(expected.units_b),
+            expected.delta,
+            expected.has_secondary_mismatch,
+            expected.is_exception,
+        ):
+            raise AssertionError(f"Group differs from independent construction: {expected.key}")
+        if len(finding.field_comparisons) != len(expected.field_comparisons):
+            raise AssertionError(f"Comparison count differs: {expected.key}")
+        for actual_comparison, expected_comparison in zip(
+            finding.field_comparisons, expected.field_comparisons, strict=True
+        ):
+            if (
+                (actual_comparison.mapping.file_a, actual_comparison.mapping.file_b),
+                actual_comparison.values_a,
+                actual_comparison.values_b,
+                actual_comparison.status.value,
+            ) != (
+                expected_comparison.mapping,
+                expected_comparison.values_a,
+                expected_comparison.values_b,
+                expected_comparison.status,
+            ):
+                raise AssertionError(f"Field comparison differs: {expected.key}")
+        for records, expected_records in (
+            (finding.rows_a, expected.records_a),
+            (finding.rows_b, expected.records_b),
+        ):
+            if [row.source_row for row in records] != sorted(row.source_row for row in records):
+                raise AssertionError(f"Evidence source rows are not sorted: {expected.key}")
+            for row, expected_record in zip(records, expected_records, strict=True):
+                identity = (row.source.value, row.source_row)
+                if (
+                    identity != (expected_record.source, expected_record.source_row)
+                    or row.key != expected_record.key
+                    or row.amount != expected_record.amount
+                    or dict(row.raw_fields) != expected_record.raw_fields
+                ):
+                    raise AssertionError(f"Finding source evidence differs: {expected.key}")
+                if row is not original_records.get(identity):
+                    raise AssertionError(f"Original source object was replaced: {expected.key}")
+                accounted[identity] += 1
+    if accounted != expected_identities or any(count != 1 for count in accounted.values()):
+        raise AssertionError("Source rows were not accounted for exactly once")
+
+    # Precision is derived from independent integer construction, not product summation.
+    with localcontext() as context:
+        context.prec = (
+            max(
+                len(str(abs(group.units_a))) + len(str(abs(group.units_b)))
+                for group in truth.groups
+            )
+            + len(str(len(truth.groups)))
+            + 2
+        )
+        if (
+            result.total_a - result.total_b
+            != sum((finding.delta for finding in result.findings), Decimal(0))
+            or result.control_difference != result.finding_delta_sum
+            or result.control_difference
+            != sum((finding.delta for finding in result.exceptions), Decimal(0))
+            + result.tolerated_delta_total
+        ):
+            raise AssertionError("Finding/review deltas do not explain the control difference")
+
+    expected_report = _expected_comparison_export(truth)
+    if report != expected_report:
+        raise AssertionError("Complete structured export differs from independent construction")
+    reader = csv.DictReader(StringIO(report.decode("utf-8"), newline=""))
+    rows = list(reader)
+    expected_reader = csv.DictReader(StringIO(expected_report.decode("utf-8"), newline=""))
+    if reader.fieldnames != expected_reader.fieldnames:
+        raise AssertionError("Export column order differs from independent construction")
+    for row, group in zip(
+        rows, (group for group in truth.groups if group.is_exception), strict=True
+    ):
+        for index, comparison in enumerate(group.field_comparisons, start=1):
+            name_a, name_b = comparison.mapping
+            if (
+                tuple(json.loads(row[f"Comparison {index} File A values — {name_a}"]))
+                != comparison.values_a
+                or tuple(json.loads(row[f"Comparison {index} File B values — {name_b}"]))
+                != comparison.values_b
+                or row[f"Comparison {index} status"] != comparison.status
+            ):
+                raise AssertionError(f"Exported comparison evidence differs: {group.key}")
+    if export_exceptions_csv(result) != report:
+        raise AssertionError("Repeated complete exports are not byte-identical")
 
 
 def verify_result(
@@ -237,6 +545,10 @@ def main() -> None:
     print(
         "Normalization config: "
         + json.dumps(NORMALIZATION_RULES if args.workload == "normalization" else None)
+    )
+    print(
+        "Comparison config: "
+        + json.dumps(COMPARISON_MAPPINGS if args.workload == "comparison" else ())
     )
     print("Times: seconds, untraced single passes; total includes independent verification.")
     if args.workload == "normalization":

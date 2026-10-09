@@ -16,7 +16,7 @@ from openpyxl.workbook.workbook import Workbook
 from openpyxl.worksheet._read_only import ReadOnlyWorksheet
 
 from tallydiff.amounts import parse_amount
-from tallydiff.ingest import IngestionError
+from tallydiff.ingest import IngestionError, _validate_comparison_columns
 from tallydiff.models import Source, SourceRecord
 
 type Cell = ReadOnlyCell | EmptyCell
@@ -226,12 +226,14 @@ def ingest_xlsx(
     worksheet: str,
     key_columns: Sequence[str],
     amount_column: str,
+    comparison_columns: Sequence[str] = (),
 ) -> tuple[SourceRecord, ...]:
     """Validate one sheet atomically; source_row is the actual worksheet row.
 
     Trailing wholly empty rows are ignored. A wholly empty interior row is an
-    error. Selected formulas/errors/blanks are rejected. Evidence is cell-value
-    text, not Excel's displayed formatting; unselected formulas remain text.
+    error. Selected formulas/errors are rejected; comparison blanks are valid.
+    Evidence is cell-value text, not Excel's displayed formatting; unselected
+    formulas and errors remain text.
     """
     if not isinstance(key_columns, Sequence) or isinstance(key_columns, str):
         raise IngestionError(
@@ -246,12 +248,16 @@ def ingest_xlsx(
         raise IngestionError(source, "selected key columns must be distinct", worksheet=worksheet)
     if not isinstance(amount_column, str) or not amount_column.strip():
         raise IngestionError(source, "select a nonblank amount column name", worksheet=worksheet)
+    comparisons = _validate_comparison_columns(
+        comparison_columns, source=source, amount_column=amount_column, worksheet=worksheet
+    )
+    selected_columns = (*keys, amount_column, *comparisons)
     records = []
     with _open(data, source, worksheet) as workbook:
         rows = _iter_rows(_sheet(workbook, worksheet, source), source, worksheet)
         try:
             header = _header(rows, source, worksheet)
-            for column in (*keys, amount_column):
+            for column in selected_columns:
                 if column not in header:
                     raise IngestionError(
                         source,
@@ -282,7 +288,7 @@ def ingest_xlsx(
                     )
                 fields = dict(zip(header, cells, strict=False))
                 converted_keys = []
-                for index, column in enumerate((*keys, amount_column)):
+                for index, column in enumerate(selected_columns):
                     cell = fields.get(column)
                     value = cell.value if cell is not None else None
                     try:
@@ -294,8 +300,9 @@ def ingest_xlsx(
                             raise ValueError("Excel error in selected field")
                         if index < len(keys):
                             converted_keys.append(_key(value))
-                        else:
+                        elif index == len(keys):
                             amount = _amount(value)
+                        # Secondary fields use the unchanged evidence conversion below.
                     except ValueError as exc:
                         raise IngestionError(
                             source,

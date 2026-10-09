@@ -11,6 +11,7 @@ import streamlit as st
 from tallydiff import (
     AmountParseError,
     ColumnMapping,
+    ComparisonFieldMapping,
     FindingCategory,
     IngestionError,
     KeyNormalizationConfig,
@@ -64,6 +65,7 @@ def _reset_mapping() -> None:
         if key.startswith(("map_", "norm_")) or key == "completed":
             del st.session_state[key]
     st.session_state.key_count = 1
+    st.session_state.comparison_count = 0
 
 
 def _change_key_count(change: int) -> None:
@@ -74,6 +76,17 @@ def _change_key_count(change: int) -> None:
     index = st.session_state.key_count if change < 0 else st.session_state.key_count - 1
     for name in NORMALIZATION_LABELS:
         st.session_state.pop(f"norm_{name}_{index}", None)
+    st.session_state.pop("completed", None)
+
+
+def _change_comparison_count(change: int) -> None:
+    previous = st.session_state.comparison_count
+    count = max(0, previous + change)
+    st.session_state.comparison_count = count
+    # Clear both removed and newly added slots so selections cannot resurrect.
+    for index in range(min(previous, count), max(previous, count)):
+        for side in ("a", "b"):
+            st.session_state.pop(f"map_comparison_{side}_{index}", None)
     st.session_state.pop("completed", None)
 
 
@@ -144,7 +157,8 @@ def _choose_file(source: Source) -> _Input | None:
 def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
     st.subheader("Mapping profile")
     st.caption(
-        "Reuse column mappings, amount tolerance, reconciliation mode, and key normalization "
+        "Reuse column mappings, secondary comparisons, amount tolerance, reconciliation mode, "
+        "and key normalization "
         "with a local JSON profile. "
         "Profiles contain no uploaded records or reconciliation results."
     )
@@ -170,6 +184,10 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
                 )
                 for name in NORMALIZATION_LABELS:
                     st.session_state[f"norm_{name}_{index}"] = getattr(rules, name)
+            st.session_state.comparison_count = len(profile.mapping.comparison_fields)
+            for index, comparison in enumerate(profile.mapping.comparison_fields):
+                st.session_state[f"map_comparison_a_{index}"] = comparison.file_a
+                st.session_state[f"map_comparison_b_{index}"] = comparison.file_b
             st.session_state.map_amount_a = profile.mapping.amount_a
             st.session_state.map_amount_b = profile.mapping.amount_b
             st.session_state.amount_tolerance = format(profile.amount_tolerance, "f")
@@ -252,7 +270,64 @@ def _map_columns(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> Colu
             key="map_amount_b",
             placeholder="Choose an amount column",
         )
-    return ColumnMapping(tuple(pairs), amount_a, amount_b)
+    st.subheader("Secondary comparison fields — optional")
+    st.caption(
+        "Compare additional fields after records are matched. "
+        "Each numbered pair maps a File A column ↔ a File B column. "
+        "Differences require review but do not change the financial delta."
+    )
+    count = st.session_state.comparison_count
+    if count == 0:
+        st.caption("No secondary comparison fields configured.")
+    # Snapshot every selection before rendering: earlier pairs must also exclude
+    # selections in later pairs, while preserving their own value on conflicts.
+    selections = {
+        side: [st.session_state.get(f"map_comparison_{side}_{index}") for index in range(count)]
+        for side in ("a", "b")
+    }
+    comparisons = []
+    for index in range(count):
+        values = []
+        for column, side, columns, amount in zip(
+            st.columns(2), ("a", "b"), (columns_a, columns_b), (amount_a, amount_b), strict=True
+        ):
+            current = selections[side][index]
+            others = {value for other, value in enumerate(selections[side]) if other != index}
+            options = [
+                name
+                for name in columns
+                if name == current or (name != amount and name not in others)
+            ]
+            if current is not None and current not in options:
+                options.append(current)
+            with column:
+                values.append(
+                    st.selectbox(
+                        f"File {side.upper()} comparison field {index + 1}",
+                        options,
+                        index=None,
+                        key=f"map_comparison_{side}_{index}",
+                        placeholder="Choose a comparison column",
+                        on_change=_clear_result,
+                    )
+                )
+        comparisons.append(ComparisonFieldMapping(*values))
+    add, remove = st.columns(2)
+    add.button(
+        "+ Add comparison field",
+        key="add_comparison",
+        on_click=_change_comparison_count,
+        args=(1,),
+        disabled=count >= max(0, min(len(columns_a), len(columns_b)) - 1),
+    )
+    remove.button(
+        "Remove last comparison field",
+        key="remove_comparison",
+        on_click=_change_comparison_count,
+        args=(-1,),
+        disabled=count == 0,
+    )
+    return ColumnMapping(tuple(pairs), amount_a, amount_b, comparison_fields=tuple(comparisons))
 
 
 def _normalization_config() -> KeyNormalizationConfig | None:
@@ -326,6 +401,27 @@ def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_ke
     if event.selection.rows:
         finding = findings[event.selection.rows[0]]
         st.text(f"Selected key: {' / '.join(finding.key)}")
+        if finding.field_comparisons:
+            st.subheader("Secondary comparison details")
+            st.dataframe(
+                [
+                    {
+                        "Comparison": index,
+                        "File A field": comparison.mapping.file_a,
+                        "File B field": comparison.mapping.file_b,
+                        "File A distinct values": json.dumps(
+                            comparison.values_a, ensure_ascii=False
+                        ),
+                        "File B distinct values": json.dumps(
+                            comparison.values_b, ensure_ascii=False
+                        ),
+                        "Status": comparison.status.value,
+                    }
+                    for index, comparison in enumerate(finding.field_comparisons, start=1)
+                ],
+                hide_index=True,
+                width="stretch",
+            )
         st.caption(
             "CSV evidence preserves parsed text; source numbers count logical records. "
             "XLSX evidence shows underlying cell values, not display formatting; "
@@ -344,12 +440,23 @@ def _show_exception_review(findings: tuple[ReconciliationFinding, ...], *, ident
         key=f"review_search_{identity}",
         help="Case-insensitive substring search within each matching-key component.",
     )
+    category_options = EXCEPTION_CATEGORIES + tuple(
+        category
+        for category in (FindingCategory.EXACT_MATCH, FindingCategory.WITHIN_TOLERANCE)
+        if any(finding.category is category for finding in findings)
+    )
     categories = st.multiselect(
         "Exception categories",
-        EXCEPTION_CATEGORIES,
-        default=EXCEPTION_CATEGORIES,
+        category_options,
+        default=category_options,
         format_func=CATEGORY_LABELS.__getitem__,
         key=f"review_categories_{identity}",
+    )
+    has_comparisons = any(finding.field_comparisons for finding in findings)
+    secondary_only = (
+        st.checkbox("Has secondary field mismatch", value=False, key=f"review_secondary_{identity}")
+        if has_comparisons
+        else False
     )
     left, right = st.columns(2)
     with left:
@@ -382,17 +489,17 @@ def _show_exception_review(findings: tuple[ReconciliationFinding, ...], *, ident
         categories=categories,
         minimum_abs_delta=minimum,
         sort_order=sort_order,
+        secondary_mismatches_only=secondary_only,
     )
     st.caption(f"Showing {len(visible):,} of {len(findings):,} exception groups.")
     if not visible:
         st.info("No exception groups match the current review filters.")
         return
     # A different view must not reuse a selection index from another row order.
-    view_id = sha256(
-        json.dumps(
-            [query, [category.value for category in categories], minimum_text, sort_order]
-        ).encode("utf-8")
-    ).hexdigest()
+    view_state = [query, [category.value for category in categories], minimum_text, sort_order]
+    if has_comparisons:
+        view_state.append(secondary_only)
+    view_id = sha256(json.dumps(view_state).encode("utf-8")).hexdigest()
     _show_finding_table(visible, table_key=f"exceptions_{identity}_{view_id}")
 
 
@@ -430,6 +537,19 @@ def _show_results(
             "they do not claim that individual rows correspond."
         )
 
+    if result.comparison_fields:
+        st.text("Secondary comparisons: exact original evidence")
+        for index, comparison in enumerate(result.comparison_fields, start=1):
+            st.text(f"Comparison {index}: {comparison.file_a} ↔ {comparison.file_b}")
+        st.caption("Secondary differences require review but do not alter financial deltas.")
+        st.caption(
+            "Each secondary field compares independent sets of distinct values on each side. "
+            "This does not compare row correspondence, occurrence counts, cross-field "
+            "combinations, or amount allocation."
+            if result.mode is ReconciliationMode.GROUPED_BY_KEY
+            else "Secondary equality is evaluated only for deterministic one-row-per-side matches."
+        )
+
     a, b, difference = st.columns(3)
     a.metric("File A control total", display_amount(result.total_a))
     b.metric("File B control total", display_amount(result.total_b))
@@ -440,6 +560,12 @@ def _show_results(
     for column, category in zip(st.columns(len(FindingCategory)), FindingCategory, strict=True):
         column.metric(CATEGORY_LABELS[category], str(counts[category]))
     st.caption("Counts are matching key groups. Each group can contain multiple source rows.")
+    if result.comparison_fields:
+        st.metric("Secondary field differences", str(len(result.secondary_mismatch_findings)))
+        st.caption(
+            "Primary category counts describe amount/presence. "
+            "An Exact match or Within tolerance group may still require secondary review."
+        )
 
     exceptions = result.exceptions
     tolerated = result.tolerated_findings
@@ -447,7 +573,15 @@ def _show_results(
         st.info("Both files contain headers only; there are no data records to reconcile.")
         return
     if not exceptions:
-        if tolerated:
+        if result.comparison_fields:
+            st.success(
+                "Reconciled within configured amount tolerance. "
+                "Configured secondary fields passed where comparable. No exceptions to review."
+                if tolerated
+                else "All matching key totals agree exactly. "
+                "Configured secondary fields passed where comparable. No exceptions to review."
+            )
+        elif tolerated:
             st.success("Reconciled within configured tolerance. No exceptions to review.")
         else:
             st.success(
@@ -480,8 +614,12 @@ def _show_results(
             display_amount(result.tolerated_delta_total, signed=True),
         )
         st.caption(
-            "Accepted nonzero differences are included in control totals and excluded from the "
-            "exception report. Opposing accepted deltas can cancel in this net amount."
+            "Accepted amount differences did not produce a configured secondary mismatch. "
+            "They are included in control totals and excluded from the exception report. "
+            "Opposing accepted deltas can cancel in this net amount."
+            if result.comparison_fields
+            else "Accepted nonzero differences are included in control totals and excluded "
+            "from the exception report. Opposing accepted deltas can cancel in this net amount."
         )
         _show_finding_table(tolerated, table_key=f"tolerated_{identity}")
     if result.mode is ReconciliationMode.GROUPED_BY_KEY:
@@ -490,6 +628,7 @@ def _show_results(
             for finding in result.findings
             if finding.category is FindingCategory.EXACT_MATCH
             and (len(finding.rows_a) > 1 or len(finding.rows_b) > 1)
+            and not finding.is_exception
         )
         if exact:
             st.subheader("Grouped exact key totals")
@@ -510,6 +649,7 @@ def main() -> None:
         "Choose one worksheet per workbook. Selected formulas are blocked; paste/export as values."
     )
     st.session_state.setdefault("key_count", 1)
+    st.session_state.setdefault("comparison_count", 0)
     left, right = st.columns(2)
     with left:
         file_a = _choose_file(Source.A)
@@ -602,14 +742,18 @@ def main() -> None:
     ):
         st.session_state.pop("completed", None)
         records = []
-        for source, input_file, keys, amount in (
-            (Source.A, file_a, mapping.keys_a, mapping.amount_a),
-            (Source.B, file_b, mapping.keys_b, mapping.amount_b),
+        for source, input_file, keys, amount, comparisons in (
+            (Source.A, file_a, mapping.keys_a, mapping.amount_a, mapping.comparisons_a),
+            (Source.B, file_b, mapping.keys_b, mapping.amount_b, mapping.comparisons_b),
         ):
             try:
                 if input_file.worksheet is None:
                     parsed = ingest_csv(
-                        input_file.text, source=source, key_columns=keys, amount_column=amount
+                        input_file.text,
+                        source=source,
+                        key_columns=keys,
+                        amount_column=amount,
+                        comparison_columns=comparisons,
                     )
                 else:
                     parsed = ingest_xlsx(
@@ -618,6 +762,7 @@ def main() -> None:
                         worksheet=input_file.worksheet,
                         key_columns=keys,
                         amount_column=amount,
+                        comparison_columns=comparisons,
                     )
                 records.append(parsed)
             except IngestionError as exc:
@@ -630,6 +775,7 @@ def main() -> None:
                     amount_tolerance=amount_tolerance,
                     mode=mode,
                     key_normalization=key_normalization,
+                    comparison_fields=mapping.comparison_fields,
                 )
             except NormalizationCollisionError as exc:
                 _show_normalization_collisions(exc)

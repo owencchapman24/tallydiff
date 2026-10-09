@@ -472,11 +472,9 @@ def test_exception_review_rejects_unknown_sort_order(review_findings, sort_order
         review_exceptions(review_findings, sort_order=sort_order)
 
 
-@pytest.mark.parametrize(
-    "category", [FindingCategory.EXACT_MATCH, FindingCategory.WITHIN_TOLERANCE, "a_only"]
-)
-def test_exception_review_cannot_include_accepted_categories(review_findings, category) -> None:
-    with pytest.raises(ValueError, match="only exception category enum members"):
+@pytest.mark.parametrize("category", ["a_only", "exact_match", None, True, 1])
+def test_exception_review_requires_category_enum_members(review_findings, category) -> None:
+    with pytest.raises(ValueError, match="only FindingCategory enum members"):
         review_exceptions(review_findings, categories=(category,))
 
 

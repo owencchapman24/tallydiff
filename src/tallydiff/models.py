@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
+from itertools import pairwise
 from types import MappingProxyType
 
 from tallydiff._decimal import sum_decimals
+from tallydiff.configuration import ComparisonFieldMapping
 from tallydiff.normalization_config import KeyNormalizationConfig
 
 type CompositeKey = tuple[str, ...]
@@ -37,6 +39,46 @@ class FindingCategory(StrEnum):
     A_ONLY = "a_only"
     B_ONLY = "b_only"
     DUPLICATE_AMBIGUOUS = "duplicate_ambiguous"
+
+
+class FieldComparisonStatus(StrEnum):
+    """Secondary field agreement, independent of the primary finding category."""
+
+    MATCH = "match"
+    MISMATCH = "mismatch"
+    NOT_COMPARABLE = "not_comparable"
+
+
+@dataclass(frozen=True, slots=True)
+class FieldComparison:
+    """Sorted distinct ingested strings; a present blank is ("",), not ().
+
+    Source records remain on the finding. NOT_COMPARABLE permits either equal
+    or unequal summaries; the primary category explains why comparison is unavailable.
+    """
+
+    mapping: ComparisonFieldMapping
+    values_a: tuple[str, ...]
+    values_b: tuple[str, ...]
+    status: FieldComparisonStatus
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mapping, ComparisonFieldMapping):
+            raise TypeError("mapping must be a ComparisonFieldMapping")
+        if not self.mapping.is_complete:
+            raise ValueError("mapping must select nonblank columns for both files")
+        for name in ("values_a", "values_b"):
+            values = getattr(self, name)
+            if not isinstance(values, tuple) or any(not isinstance(value, str) for value in values):
+                raise TypeError(f"{name} must be a tuple of strings")
+            if any(left >= right for left, right in pairwise(values)):
+                raise ValueError(f"{name} must be sorted and duplicate-free")
+        if not isinstance(self.status, FieldComparisonStatus):
+            raise TypeError("status must be a FieldComparisonStatus enum member")
+        if self.status is FieldComparisonStatus.MATCH and self.values_a != self.values_b:
+            raise ValueError("MATCH requires equal value tuples")
+        if self.status is FieldComparisonStatus.MISMATCH and self.values_a == self.values_b:
+            raise ValueError("MISMATCH requires unequal value tuples")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +132,32 @@ class ReconciliationFinding:
     rows_b: tuple[SourceRecord, ...]
     amount_a: Decimal
     amount_b: Decimal
+    field_comparisons: tuple[FieldComparison, ...] = field(default=(), kw_only=True)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.field_comparisons, tuple) or any(
+            not isinstance(comparison, FieldComparison) for comparison in self.field_comparisons
+        ):
+            raise TypeError("field_comparisons must be a tuple of FieldComparison objects")
+
+    @property
+    def has_secondary_mismatch(self) -> bool:
+        """Whether any configured secondary field reports a mismatch."""
+
+        return any(
+            comparison.status is FieldComparisonStatus.MISMATCH
+            for comparison in self.field_comparisons
+        )
+
+    @property
+    def secondary_mismatches(self) -> tuple[FieldComparison, ...]:
+        """The ordered subset of secondary comparisons reporting a mismatch."""
+
+        return tuple(
+            comparison
+            for comparison in self.field_comparisons
+            if comparison.status is FieldComparisonStatus.MISMATCH
+        )
 
     @property
     def delta(self) -> Decimal:
@@ -99,12 +167,13 @@ class ReconciliationFinding:
 
     @property
     def is_exception(self) -> bool:
-        """Whether this group requires review rather than representing accepted variance."""
+        """Whether a primary exception or any secondary mismatch requires review."""
 
-        return self.category not in (
+        primary_exception = self.category not in (
             FindingCategory.EXACT_MATCH,
             FindingCategory.WITHIN_TOLERANCE,
         )
+        return primary_exception or self.has_secondary_mismatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +186,7 @@ class ReconciliationResult:
     amount_tolerance: Decimal = Decimal("0")
     mode: ReconciliationMode = ReconciliationMode.UNIQUE
     key_normalization: KeyNormalizationConfig | None = None
+    comparison_fields: tuple[ComparisonFieldMapping, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, ReconciliationMode):
@@ -125,6 +195,26 @@ class ReconciliationResult:
             self.key_normalization, KeyNormalizationConfig
         ):
             raise TypeError("key_normalization must be a KeyNormalizationConfig or None")
+        if not isinstance(self.comparison_fields, tuple) or any(
+            not isinstance(mapping, ComparisonFieldMapping) for mapping in self.comparison_fields
+        ):
+            raise TypeError("comparison_fields must be a tuple of ComparisonFieldMapping objects")
+        if any(not mapping.is_complete for mapping in self.comparison_fields):
+            raise ValueError("comparison_fields must select nonblank columns for both files")
+        for side, names in (
+            ("A", tuple(mapping.file_a for mapping in self.comparison_fields)),
+            ("B", tuple(mapping.file_b for mapping in self.comparison_fields)),
+        ):
+            if len(set(names)) != len(names):
+                raise ValueError(f"each File {side} comparison column must be selected only once")
+        for finding in self.findings:
+            if (
+                tuple(comparison.mapping for comparison in finding.field_comparisons)
+                != self.comparison_fields
+            ):
+                raise ValueError(
+                    "finding field_comparisons must match comparison_fields in count and order"
+                )
 
     @property
     def control_difference(self) -> Decimal:
@@ -139,6 +229,12 @@ class ReconciliationResult:
         return tuple(finding for finding in self.findings if finding.is_exception)
 
     @property
+    def secondary_mismatch_findings(self) -> tuple[ReconciliationFinding, ...]:
+        """Findings with secondary differences, retaining result order."""
+
+        return tuple(finding for finding in self.findings if finding.has_secondary_mismatch)
+
+    @property
     def tolerated_findings(self) -> tuple[ReconciliationFinding, ...]:
         """Accepted nonzero differences, retained separately from review exceptions."""
 
@@ -146,6 +242,7 @@ class ReconciliationResult:
             finding
             for finding in self.findings
             if finding.category is FindingCategory.WITHIN_TOLERANCE
+            and not finding.has_secondary_mismatch
         )
 
     @property

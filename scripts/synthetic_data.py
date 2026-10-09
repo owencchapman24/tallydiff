@@ -5,6 +5,8 @@ The legacy workload is retained; the grouped workload adds 30 multi-row keys
 per hundred groups, with split detail, credits, offsets, and zero-net groups.
 The separate normalization workload reuses those amounts with side-specific raw
 composite keys and canonical matching keys known directly from construction.
+The comparison workload has its own asymmetric schema, primitive exact-evidence
+truth, and source identities constructed before CSV serialization.
 """
 
 import argparse
@@ -32,7 +34,7 @@ KEYS_B = HEADERS_B[:2]
 AMOUNT_A = HEADERS_A[-1]
 AMOUNT_B = HEADERS_B[-1]
 MODES = ("unique", "grouped_by_key")
-WORKLOADS = ("legacy", "grouped", "normalization")
+WORKLOADS = ("legacy", "grouped", "normalization", "comparison")
 NORMALIZATION_RULES = (
     {
         "casefold": True,
@@ -448,19 +450,452 @@ def _csv(scenarios: tuple[Scenario, ...], side: str, shuffle_seed: int) -> str:
     return output.getvalue()
 
 
+# This dedicated workload does not reuse or alter any historical generation recipe.
+COMPARISON_HEADERS_A = (
+    "Vendor ID",
+    "Invoice Number",
+    "Department",
+    "Currency",
+    "Posting Date",
+    "Amount",
+)
+COMPARISON_HEADERS_B = (
+    "Supplier",
+    "Invoice Ref",
+    "Cost Center",
+    "Currency Code",
+    "Document Date",
+    "Gross Amount",
+)
+COMPARISON_KEYS_A = COMPARISON_HEADERS_A[:2]
+COMPARISON_KEYS_B = COMPARISON_HEADERS_B[:2]
+COMPARISON_AMOUNT_A = COMPARISON_HEADERS_A[-1]
+COMPARISON_AMOUNT_B = COMPARISON_HEADERS_B[-1]
+COMPARISON_MAPPINGS = (
+    ("Department", "Cost Center"),
+    ("Currency", "Currency Code"),
+    ("Posting Date", "Document Date"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonScenario:
+    key: tuple[str, str]
+    kind: str
+    amounts_a: tuple[int, ...]
+    amounts_b: tuple[int, ...]
+    values_a: tuple[tuple[str, str, str], ...]
+    values_b: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedComparison:
+    mapping: tuple[str, str]
+    values_a: tuple[str, ...]
+    values_b: tuple[str, ...]
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedRecord:
+    source: str
+    source_row: int
+    key: tuple[str, str]
+    units: int
+    raw_fields: dict[str, str]
+
+    @property
+    def amount(self) -> Decimal:
+        return decimal_units(self.units)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedComparisonGroup:
+    key: tuple[str, str]
+    category: str
+    rows_a: int
+    rows_b: int
+    units_a: int
+    units_b: int
+    records_a: tuple[ExpectedRecord, ...]
+    records_b: tuple[ExpectedRecord, ...]
+    field_comparisons: tuple[ExpectedComparison, ...]
+
+    @property
+    def has_secondary_mismatch(self) -> bool:
+        return any(field.status == "mismatch" for field in self.field_comparisons)
+
+    @property
+    def is_exception(self) -> bool:
+        return (
+            self.category not in ("exact_match", "within_tolerance") or self.has_secondary_mismatch
+        )
+
+    @property
+    def delta_units(self) -> int:
+        return self.units_a - self.units_b
+
+    @property
+    def delta(self) -> Decimal:
+        return decimal_units(self.delta_units)
+
+    @property
+    def amount_a(self) -> Decimal:
+        return decimal_units(self.units_a)
+
+    @property
+    def amount_b(self) -> Decimal:
+        return decimal_units(self.units_b)
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonGroundTruth:
+    groups: tuple[ExpectedComparisonGroup, ...]
+    record_count_a: int
+    record_count_b: int
+    category_counts: dict[str, int]
+    total_a: Decimal
+    total_b: Decimal
+    control_difference: Decimal
+    tolerated_delta_total: Decimal
+    mode: str
+    comparison_fields: tuple[tuple[str, str], ...] = COMPARISON_MAPPINGS
+
+    @property
+    def exception_keys(self) -> tuple[tuple[str, str], ...]:
+        return tuple(group.key for group in self.groups if group.is_exception)
+
+    @property
+    def tolerated_keys(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            group.key
+            for group in self.groups
+            if group.category == "within_tolerance" and not group.is_exception
+        )
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "records_a": self.record_count_a,
+            "records_b": self.record_count_b,
+            "key_groups": len(self.groups),
+            "categories": self.category_counts,
+            "total_a": str(self.total_a),
+            "total_b": str(self.total_b),
+            "control_difference": str(self.control_difference),
+            "tolerated_delta_total": str(self.tolerated_delta_total),
+            "exceptions": len(self.exception_keys),
+            "tolerated": len(self.tolerated_keys),
+            "secondary_mismatches": sum(group.has_secondary_mismatch for group in self.groups),
+            "comparison_fields": self.comparison_fields,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonPair:
+    csv_a: str
+    csv_b: str
+    scenarios: tuple[ComparisonScenario, ...]
+    records_a: tuple[ExpectedRecord, ...]
+    records_b: tuple[ExpectedRecord, ...]
+
+    def expected(
+        self, amount_tolerance: Decimal = Decimal("0"), *, mode: str = "unique"
+    ) -> ComparisonGroundTruth:
+        """Compute primitive truth from construction, not CSV parsing or product helpers.
+
+        The grouped oracle compares each field independently. Matching Department
+        and Currency sets do not validate associations between those fields, row
+        correspondence, occurrence counts, or monetary allocation.
+        """
+        if not isinstance(amount_tolerance, Decimal):
+            raise TypeError("amount_tolerance must be a Decimal")
+        if not amount_tolerance.is_finite() or amount_tolerance < 0:
+            raise ValueError("amount_tolerance must be finite and nonnegative")
+        if mode not in MODES:
+            raise ValueError("mode must be unique or grouped_by_key")
+        records_a: dict[tuple[str, str], list[ExpectedRecord]] = {}
+        records_b: dict[tuple[str, str], list[ExpectedRecord]] = {}
+        for records, grouped in ((self.records_a, records_a), (self.records_b, records_b)):
+            for record in records:
+                grouped.setdefault(record.key, []).append(record)
+        groups = []
+        total_a = total_b = tolerated = 0
+        counts = Counter(dict.fromkeys(CATEGORIES, 0))
+        for scenario in sorted(self.scenarios, key=lambda item: item.key):
+            amounts_a, amounts_b = scenario.amounts_a, scenario.amounts_b
+            units_a, units_b = sum(amounts_a), sum(amounts_b)
+            delta = units_a - units_b
+            ambiguous = mode == "unique" and (len(amounts_a) > 1 or len(amounts_b) > 1)
+            if ambiguous:
+                category = "duplicate_ambiguous"
+            elif not amounts_b:
+                category = "a_only"
+            elif not amounts_a:
+                category = "b_only"
+            elif delta == 0:
+                category = "exact_match"
+            elif decimal_units(delta).copy_abs() <= amount_tolerance:
+                category = "within_tolerance"
+            else:
+                category = "amount_mismatch"
+            comparable = bool(amounts_a and amounts_b) and not ambiguous
+            comparisons = []
+            for index, mapping in enumerate(COMPARISON_MAPPINGS):
+                values_a = tuple(sorted({values[index] for values in scenario.values_a}))
+                values_b = tuple(sorted({values[index] for values in scenario.values_b}))
+                status = (
+                    "not_comparable"
+                    if not comparable
+                    else "match"
+                    if values_a == values_b
+                    else "mismatch"
+                )
+                comparisons.append(ExpectedComparison(mapping, values_a, values_b, status))
+            group = ExpectedComparisonGroup(
+                scenario.key,
+                category,
+                len(amounts_a),
+                len(amounts_b),
+                units_a,
+                units_b,
+                tuple(records_a.get(scenario.key, ())),
+                tuple(records_b.get(scenario.key, ())),
+                tuple(comparisons),
+            )
+            if category == "within_tolerance" and not group.is_exception:
+                tolerated += delta
+            counts[category] += 1
+            total_a += units_a
+            total_b += units_b
+            groups.append(group)
+        # Integer invariants remain exact even under a tiny Decimal arithmetic context.
+        if sum(group.delta_units for group in groups) != total_a - total_b:
+            raise AssertionError("Construction financial deltas do not balance")
+        if (
+            sum(group.delta_units for group in groups if group.is_exception) + tolerated
+            != total_a - total_b
+        ):
+            raise AssertionError(
+                "Review and accepted tolerance do not partition control difference"
+            )
+        if sum(group.rows_a for group in groups) != len(self.records_a) or sum(
+            group.rows_b for group in groups
+        ) != len(self.records_b):
+            raise AssertionError("Construction lost a source row")
+        return ComparisonGroundTruth(
+            tuple(groups),
+            len(self.records_a),
+            len(self.records_b),
+            dict(counts),
+            decimal_units(total_a),
+            decimal_units(total_b),
+            decimal_units(total_a - total_b),
+            decimal_units(tolerated),
+            mode,
+        )
+
+
+def _comparison_detail(total: int, *, longer: bool = False) -> tuple[int, ...]:
+    parts = (total - 90_000, 100_000, -10_000, 0)
+    return parts + (17, -17) if longer else parts
+
+
+def _comparison_scenario(index: int, rng: Random) -> ComparisonScenario:
+    key = (f"V{index % 137:06d}", f"INV-{index // 137:09d}")
+    base = rng.randint(2_500, 25_000_000) * 100
+    if index % 17 == 0:
+        base = 0
+    elif index % 11 == 0:
+        base = -base
+    if index % 9 == 0 and base:
+        base += 17
+    day = (date(2026, 1, 1) + timedelta(days=index % 365)).isoformat()
+    slot = index % 100
+    default = ("Sales", "USD", day)
+    special_matches = (
+        ("", "", ""),
+        (" Sales ", "USD", day),
+        ("Café", "EUR", day),
+        ("東京", "JPY", day),
+        ("Sales\nNorth", "USD", day),
+        ("=SUM(1,2)", "USD", day),
+        ("100.00", "USD", "01/02/2026"),
+    )
+    a, b = (base,), (base,)
+    values_a = values_b = (default,)
+    kind = "one_exact_match"
+    if slot < 20:
+        values_a = values_b = (special_matches[slot % len(special_matches)],)
+    elif slot < 30:
+        edge_a, edge_b = (
+            ("", "Sales"),
+            (" Sales ", "Sales"),
+            ("SALES", "sales"),
+            ("ACME-01", "ACME01"),
+            ("Café", "Cafe\u0301"),
+            ("東京", "大阪"),
+            ("Sales\nNorth", "Sales North"),
+            ("=1+1", "2"),
+            ("100", "100.00"),
+            ("2026-01-01", "01/01/2026"),
+        )[slot - 20]
+        count = 1 + (slot - 20) % 3
+        values_a = ((edge_a, "USD", day),)
+        values_b = ((edge_b, "usd" if count >= 2 else "USD", "01/01/2026" if count == 3 else day),)
+        kind = f"one_exact_{count}_secondary_mismatches"
+    elif slot < 40:
+        delta = (100, -100, 1, -1, 50)[slot % 5]
+        b = (base - delta,)
+        if slot >= 35:
+            values_b = (("Marketing", "USD", day),)
+        kind = "one_tolerance_mismatch" if slot >= 35 else "one_tolerance_match"
+    elif slot < 50:
+        delta = (101, -101, 2501, -5000, 301)[slot % 5]
+        b = (base - delta,)
+        if slot >= 45:
+            values_b = (("Marketing", "EUR", "01/01/2026"),)
+        kind = (
+            "one_amount_mismatch_secondary_mismatch"
+            if slot >= 45
+            else "one_amount_mismatch_secondary_match"
+        )
+    elif slot < 55:
+        a, b = (0 if slot == 50 else base,), ()
+        values_b = ()
+        kind = "a_only"
+    elif slot < 60:
+        a, b = (), (0 if slot == 55 else base,)
+        values_a = ()
+        kind = "b_only"
+    elif slot < 64:
+        a, b = (base,), (base // 2, base - base // 2)
+        values_b = (default, default)
+        kind = "grouped_same_set_different_counts"
+    elif slot < 68:
+        a = b = (base // 2, base - base // 2)
+        values_a = (default, default)
+        values_b = (default, ("Marketing", "USD", day))
+        kind = "grouped_repeated_changed_set"
+    elif slot < 72:
+        a = b = (base // 2, base - base // 2)
+        values_a = (default, ("Marketing", "EUR", day))
+        values_b = tuple(reversed(values_a))
+        kind = "grouped_reordered_sets"
+    elif slot < 76:
+        a = b = (base // 2, base - base // 2)
+        values_a = (default, ("Marketing", "EUR", day))
+        values_b = (("Sales", "EUR", day), ("Marketing", "USD", day))
+        kind = "grouped_cross_field_associations_not_validated"
+    elif slot < 96:
+        delta = (
+            0
+            if slot < 80
+            else (100, -100, 1, -1)[slot % 4]
+            if slot < 88
+            else (101, -101, 2501, -5000)[slot % 4]
+        )
+        a, b = _comparison_detail(base), _comparison_detail(base - delta, longer=True)
+        pattern = (default, ("Marketing", "EUR", day), ("", "", ""))
+        values_a = tuple(pattern[row % 3] for row in range(len(a)))
+        values_b = tuple(pattern[row % 3] for row in range(len(b)))
+        secondary_mismatch = 84 <= slot < 88 or slot >= 92
+        if secondary_mismatch:
+            values_b = (*values_b[:-1], ("Zero or offset difference", "JPY", "01/01/2026"))
+        kind = (
+            "grouped_exact_all_row_evidence"
+            if slot < 80
+            else "grouped_tolerance_secondary_mismatch"
+            if 84 <= slot < 88
+            else "grouped_tolerance_secondary_match"
+            if slot < 88
+            else "grouped_amount_mismatch_secondary_mismatch"
+            if secondary_mismatch
+            else "grouped_amount_mismatch_secondary_match"
+        )
+    elif slot == 96:
+        positive = abs(base) or 1_000_000
+        a = b = (positive, -positive, 0, 17, -17)
+        values_a = (
+            ("Debit", "USD", day),
+            ("Credit", "EUR", day),
+            ("Zero", "", ""),
+            ("Offset A", "JPY", day),
+            ("", "USD", day),
+        )
+        values_b = (*values_a[:2], ("Only B zero", "", ""), ("Offset B", "JPY", day), values_a[-1])
+        kind = "grouped_zero_credit_offset_evidence"
+    elif slot == 97:
+        a, b = (0, 0), (0, 0, 0)
+        values_a, values_b = (("", "", ""),) * 2, (("", "", ""),) * 3
+        kind = "grouped_zero_lines_blank_match"
+    else:
+        positive = abs(base) or 1_000_000
+        parts = (positive, -positive, 0)
+        evidence = (default, ("Credit", "EUR", day), ("", "", ""))
+        a, b = (parts, ()) if slot == 98 else ((), parts)
+        values_a, values_b = (evidence, ()) if slot == 98 else ((), evidence)
+        kind = "a_only_multirow_zero_net" if slot == 98 else "b_only_multirow_zero_net"
+    return ComparisonScenario(key, kind, a, b, values_a, values_b)
+
+
+def _comparison_csv(
+    scenarios: tuple[ComparisonScenario, ...], side: str, shuffle_seed: int
+) -> tuple[str, tuple[ExpectedRecord, ...]]:
+    rows = [
+        (index, scenario, amount, values, variant)
+        for index, scenario in enumerate(scenarios)
+        for variant, (amount, values) in enumerate(
+            zip(
+                scenario.amounts_a if side == "A" else scenario.amounts_b,
+                scenario.values_a if side == "A" else scenario.values_b,
+                strict=True,
+            )
+        )
+    ]
+    Random(shuffle_seed).shuffle(rows)
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    headers = COMPARISON_HEADERS_A if side == "A" else COMPARISON_HEADERS_B
+    writer.writerow(headers)
+    records = []
+    for source_row, (index, scenario, amount, values, variant) in enumerate(rows, start=2):
+        raw_values = (*scenario.key, *values, _money_text(amount, index + variant))
+        # Evidence and row identity are constructed before the CSV writer or any parser.
+        records.append(
+            ExpectedRecord(
+                side, source_row, scenario.key, amount, dict(zip(headers, raw_values, strict=True))
+            )
+        )
+        writer.writerow(raw_values)
+    return output.getvalue(), tuple(records)
+
+
+def _generate_comparison_pair(groups: int, seed: int, shuffle_seed: int) -> ComparisonPair:
+    rng = Random(seed)
+    scenarios = tuple(_comparison_scenario(index, rng) for index in range(groups))
+    csv_a, records_a = _comparison_csv(scenarios, "A", shuffle_seed)
+    csv_b, records_b = _comparison_csv(scenarios, "B", shuffle_seed + 1)
+    return ComparisonPair(csv_a, csv_b, scenarios, records_a, records_b)
+
+
 def generate_pair(
     groups: int = 1_000,
     *,
     seed: int = 42,
     shuffle_seed: int | None = None,
     workload: str = "legacy",
-) -> SyntheticPair:
+) -> SyntheticPair | ComparisonPair:
     """Generate in memory from integer construction plans, shuffled separately per file."""
 
     if isinstance(groups, bool) or not isinstance(groups, int) or groups < 100:
         raise ValueError("groups must be an integer of at least 100 to include every scenario")
     if workload not in WORKLOADS:
         raise ValueError(f"workload must be one of {WORKLOADS}")
+    if workload == "comparison":
+        return _generate_comparison_pair(
+            groups, seed, seed if shuffle_seed is None else shuffle_seed
+        )
     rng = Random(seed)
     recipe = {
         "legacy": _scenario,
@@ -494,6 +929,17 @@ def main() -> None:
             "workload": args.workload,
             "amount_tolerance": args.tolerance,
             "key_normalization": NORMALIZATION_RULES if args.workload == "normalization" else None,
+            **(
+                {
+                    "key_columns": {"file_a": COMPARISON_KEYS_A, "file_b": COMPARISON_KEYS_B},
+                    "amount_columns": {
+                        "file_a": COMPARISON_AMOUNT_A,
+                        "file_b": COMPARISON_AMOUNT_B,
+                    },
+                }
+                if args.workload == "comparison"
+                else {}
+            ),
             **pair.expected(Decimal(args.tolerance), mode=args.mode).summary(),
         },
         indent=2,

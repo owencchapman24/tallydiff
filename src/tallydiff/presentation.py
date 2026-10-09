@@ -69,6 +69,8 @@ def configuration_id(
 
     Exact/all-false rules preserve the existing exact identity. Enabled rule values
     and component order are included as primitive data, independently of UI labels.
+    Nonempty secondary mappings append their exact directional editing values,
+    including incomplete selections. Empty comparisons preserve existing digests.
     """
 
     if not isinstance(reconciliation_mode, ReconciliationMode):
@@ -105,6 +107,14 @@ def configuration_id(
         ]
         if any(any(rules.values()) for rules in normalization):
             identity.append({"key_normalization": normalization})
+    if mapping.comparison_fields:
+        identity.append(
+            {
+                "comparison_fields": [
+                    [field.file_a, field.file_b] for field in mapping.comparison_fields
+                ]
+            }
+        )
     return hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
@@ -115,7 +125,9 @@ def display_amount(amount: Decimal, *, signed: bool = False) -> str:
 
 
 def finding_rows(findings: Sequence[ReconciliationFinding]) -> list[dict[str, str]]:
-    return [
+    """Summarize findings; secondary differences name fields without flattening evidence."""
+
+    rows = [
         {
             "Category": CATEGORY_LABELS[finding.category],
             "Matching key": " / ".join(finding.key),
@@ -127,6 +139,13 @@ def finding_rows(findings: Sequence[ReconciliationFinding]) -> list[dict[str, st
         }
         for finding in findings
     ]
+    if any(finding.field_comparisons for finding in findings):
+        for row, finding in zip(rows, findings, strict=True):
+            row["Secondary differences"] = "; ".join(
+                f"{comparison.mapping.file_a} ↔ {comparison.mapping.file_b}"
+                for comparison in finding.secondary_mismatches
+            )
+    return rows
 
 
 EXCEPTION_CATEGORIES = (
@@ -135,6 +154,8 @@ EXCEPTION_CATEGORIES = (
     FindingCategory.B_ONLY,
     FindingCategory.DUPLICATE_AMBIGUOUS,
 )
+
+REVIEW_CATEGORIES = tuple(FindingCategory)
 
 EXCEPTION_SORT_LABELS = {
     "matching_key": "Matching key (ascending)",
@@ -147,15 +168,19 @@ def review_exceptions(
     findings: Sequence[ReconciliationFinding],
     *,
     query: str = "",
-    categories: Sequence[FindingCategory] = EXCEPTION_CATEGORIES,
+    categories: Sequence[FindingCategory] = REVIEW_CATEGORIES,
     minimum_abs_delta: Decimal = Decimal("0"),
     sort_order: str = "matching_key",
+    secondary_mismatches_only: bool = False,
 ) -> tuple[ReconciliationFinding, ...]:
     """Return a display-only view, preserving finding objects and all source evidence.
 
+    Accepted findings are always excluded, even when their categories are selected.
     Search trims the query and compares casefolded substrings within each key
-    component. The minimum absolute delta is inclusive. Delta sorts break ties
-    by exact key, then retain input order for otherwise identical sort keys.
+    component. The minimum absolute delta is inclusive: a zero-delta secondary
+    exception is visible at zero and hidden by any positive minimum. The optional
+    secondary filter retains only findings with a secondary mismatch. Delta sorts
+    break ties by exact key, then retain input order for otherwise identical keys.
     """
 
     if not isinstance(minimum_abs_delta, Decimal):
@@ -164,15 +189,18 @@ def review_exceptions(
         raise ValueError("minimum_abs_delta must be finite and zero or greater")
     if sort_order not in EXCEPTION_SORT_LABELS:
         raise ValueError("Unsupported exception sort order")
-    if any(
-        not isinstance(category, FindingCategory) or category not in EXCEPTION_CATEGORIES
-        for category in categories
-    ):
-        raise ValueError("categories must contain only exception category enum members")
+    if any(not isinstance(category, FindingCategory) for category in categories):
+        raise ValueError("categories must contain only FindingCategory enum members")
+    if not isinstance(secondary_mismatches_only, bool):
+        raise TypeError("secondary_mismatches_only must be a bool")
     selected = frozenset(categories)
     search = query.strip().casefold()
     matches = []
     for finding in findings:
+        if not finding.is_exception:
+            continue
+        if secondary_mismatches_only and not finding.has_secondary_mismatch:
+            continue
         if finding.category not in selected:
             continue
         if search and not any(search in component.casefold() for component in finding.key):

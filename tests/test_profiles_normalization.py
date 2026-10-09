@@ -1,4 +1,4 @@
-"""Schema v3 configuration-only persistence and strict legacy compatibility."""
+"""Current normalization persistence and genuine v3 strict compatibility."""
 
 import json
 from dataclasses import FrozenInstanceError
@@ -63,14 +63,17 @@ def v3_document() -> dict:
 
 
 @pytest.mark.parametrize("mode", list(ReconciliationMode))
-def test_v3_export_exact_schema_order_boolean_rules_and_format(mode: ReconciliationMode) -> None:
+def test_v4_export_preserves_schema_order_boolean_rules_and_format(
+    mode: ReconciliationMode,
+) -> None:
     data = export_mapping_profile(
         MAPPING, amount_tolerance=Decimal("0.0100"), reconciliation_mode=mode
     )
     document = json.loads(data)
 
-    assert tuple(document) == TOP_FIELDS
-    assert document["version"] == 3
+    assert tuple(document) == (*TOP_FIELDS, "comparison_fields")
+    assert document["version"] == 4
+    assert document["comparison_fields"] == []
     assert document["reconciliation_mode"] == mode.value
     assert document["amount_tolerance"] == "0.0100"
     assert document["key_normalization"] == [ALL_FALSE, ALL_FALSE]
@@ -134,7 +137,7 @@ def test_v3_restores_each_enabled_rule_and_preserves_exact_component_positions(
         ),
     ],
 )
-def test_v3_round_trip_restores_exact_configuration_and_deterministic_bytes(
+def test_v4_round_trip_restores_exact_configuration_and_deterministic_bytes(
     mode: ReconciliationMode, configuration: KeyNormalizationConfig | None
 ) -> None:
     original = MappingProfile(MAPPING, Decimal("0.0100"), mode, configuration)
@@ -186,7 +189,7 @@ def test_mixed_rule_flags_are_serialized_exactly_without_dropping_components() -
     ]
 
 
-def test_v3_unicode_column_names_remain_ascii_escaped_without_text_changes() -> None:
+def test_v4_unicode_column_names_remain_ascii_escaped_without_text_changes() -> None:
     mapping = ColumnMapping(((" Vendor é ", "供应商"),), " Total ", "金額")
     configuration = KeyNormalizationConfig((KeyNormalizationRules(casefold=True),))
     data = export_mapping_profile(mapping, key_normalization=configuration)
@@ -321,7 +324,7 @@ def test_v3_requires_exact_supported_mode(v3_document: dict, mode: object) -> No
 @pytest.mark.parametrize("number", ["3.0", "3.00", "3e0", "1.0", "2e0"])
 def test_numeric_version_variants_are_not_coerced(v3_document: dict, number: str) -> None:
     data = json.dumps(v3_document).replace('"version": 3', f'"version": {number}')
-    with pytest.raises(ProfileError, match="expected version 1, 2, or 3"):
+    with pytest.raises(ProfileError, match="expected version 1, 2, 3, or 4"):
         load_mapping_profile(data)
 
 
@@ -419,7 +422,7 @@ def test_profile_round_trip_does_not_run_normalization_or_reconciliation(
 
     assert profile.mapping == mapping
     assert profile.key_normalization == configuration
-    assert set(json.loads(data)) == set(TOP_FIELDS)
+    assert set(json.loads(data)) == {*TOP_FIELDS, "comparison_fields"}
 
 
 @pytest.mark.parametrize(
