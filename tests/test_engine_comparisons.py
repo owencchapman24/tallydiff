@@ -1,4 +1,4 @@
-"""Exact secondary controls remain independent of primary reconciliation and review."""
+"""Exact secondary controls preserve primary reconciliation and drive review."""
 
 import csv
 from collections import Counter
@@ -71,7 +71,7 @@ class Once:
     ("value_b", "status"),
     [("Sales", FieldComparisonStatus.MATCH), ("Marketing", FieldComparisonStatus.MISMATCH)],
 )
-def test_unique_comparison_is_independent_of_amount_category_and_staged_review(
+def test_unique_comparison_is_independent_of_amount_category_and_secondary_review(
     amount_b, category, value_b, status
 ):
     a = (_record(Source.A, 2),)
@@ -82,14 +82,14 @@ def test_unique_comparison_is_independent_of_amount_category_and_staged_review(
     assert finding.category is category
     assert finding.field_comparisons[0].status is status
     assert finding.delta == Decimal("100") - Decimal(amount_b)
-    assert finding.is_exception is (category is FindingCategory.AMOUNT_MISMATCH)
-    assert result.exceptions == ((finding,) if category is FindingCategory.AMOUNT_MISMATCH else ())
-    assert result.tolerated_findings == (
-        (finding,) if category is FindingCategory.WITHIN_TOLERANCE else ()
+    requires_review = (
+        category is FindingCategory.AMOUNT_MISMATCH or status is FieldComparisonStatus.MISMATCH
     )
-    assert result.tolerated_delta_total == Decimal(
-        "-0.01" if category is FindingCategory.WITHIN_TOLERANCE else "0"
-    )
+    accepted_tolerance = category is FindingCategory.WITHIN_TOLERANCE and not requires_review
+    assert finding.is_exception is requires_review
+    assert result.exceptions == ((finding,) if requires_review else ())
+    assert result.tolerated_findings == ((finding,) if accepted_tolerance else ())
+    assert result.tolerated_delta_total == Decimal("-0.01" if accepted_tolerance else "0")
     assert result.comparison_fields is FIELDS
     assert finding.rows_a[0] is a[0] and finding.rows_b[0] is b[0]
     assert _primary_only(result) == reconcile(a, b, amount_tolerance=Decimal("0.01"))
@@ -271,7 +271,7 @@ def test_grouped_credits_zero_lines_and_offsets_all_participate():
     assert comparison.values_a == ("", "Credit", "Main", "Zero")
     assert comparison.values_b == ("Main",)
     assert comparison.status is FieldComparisonStatus.MISMATCH
-    assert finding.is_exception is False
+    assert finding.is_exception is True
     assert (
         result.total_a
         == result.total_b
@@ -628,7 +628,7 @@ def test_engine_requires_evidence_for_every_configured_mapping(source):
     ],
 )
 @pytest.mark.parametrize("mismatch", [False, True])
-def test_grouped_comparisons_preserve_amount_tolerance_and_staged_exception_membership(
+def test_grouped_comparisons_preserve_amount_tolerance_and_secondary_exception_membership(
     second_amount_b, category, delta, mismatch
 ):
     a = (_record(Source.A, 2, amount="60"), _record(Source.A, 3, amount="40"))
@@ -650,14 +650,12 @@ def test_grouped_comparisons_preserve_amount_tolerance_and_staged_exception_memb
         FieldComparisonStatus.MISMATCH if mismatch else FieldComparisonStatus.MATCH
     )
     assert finding.delta == result.control_difference == result.finding_delta_sum == Decimal(delta)
-    assert finding.is_exception is (category is FindingCategory.AMOUNT_MISMATCH)
-    assert result.exceptions == ((finding,) if category is FindingCategory.AMOUNT_MISMATCH else ())
-    assert result.tolerated_findings == (
-        (finding,) if category is FindingCategory.WITHIN_TOLERANCE else ()
-    )
-    assert result.tolerated_delta_total == Decimal(
-        "-0.01" if category is FindingCategory.WITHIN_TOLERANCE else "0"
-    )
+    requires_review = category is FindingCategory.AMOUNT_MISMATCH or mismatch
+    accepted_tolerance = category is FindingCategory.WITHIN_TOLERANCE and not mismatch
+    assert finding.is_exception is requires_review
+    assert result.exceptions == ((finding,) if requires_review else ())
+    assert result.tolerated_findings == ((finding,) if accepted_tolerance else ())
+    assert result.tolerated_delta_total == Decimal("-0.01" if accepted_tolerance else "0")
     assert _primary_only(result) == reconcile(
         a, b, mode=ReconciliationMode.GROUPED_BY_KEY, amount_tolerance=Decimal("0.01")
     )

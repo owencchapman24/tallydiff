@@ -142,7 +142,7 @@ class ReconciliationFinding:
 
     @property
     def has_secondary_mismatch(self) -> bool:
-        """Whether any secondary field differs, independently of exception membership."""
+        """Whether any configured secondary field reports a mismatch."""
 
         return any(
             comparison.status is FieldComparisonStatus.MISMATCH
@@ -167,12 +167,13 @@ class ReconciliationFinding:
 
     @property
     def is_exception(self) -> bool:
-        """Whether this group requires review rather than representing accepted variance."""
+        """Whether a primary exception or any secondary mismatch requires review."""
 
-        return self.category not in (
+        primary_exception = self.category not in (
             FindingCategory.EXACT_MATCH,
             FindingCategory.WITHIN_TOLERANCE,
         )
+        return primary_exception or self.has_secondary_mismatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +229,12 @@ class ReconciliationResult:
         return tuple(finding for finding in self.findings if finding.is_exception)
 
     @property
+    def secondary_mismatch_findings(self) -> tuple[ReconciliationFinding, ...]:
+        """Findings with secondary differences, retaining result order."""
+
+        return tuple(finding for finding in self.findings if finding.has_secondary_mismatch)
+
+    @property
     def tolerated_findings(self) -> tuple[ReconciliationFinding, ...]:
         """Accepted nonzero differences, retained separately from review exceptions."""
 
@@ -235,6 +242,7 @@ class ReconciliationResult:
             finding
             for finding in self.findings
             if finding.category is FindingCategory.WITHIN_TOLERANCE
+            and not finding.has_secondary_mismatch
         )
 
     @property

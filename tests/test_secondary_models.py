@@ -1,7 +1,7 @@
-"""Immutable secondary result contracts; execution and review remain primary-only."""
+"""Immutable secondary result contracts and derived review membership."""
 
 from dataclasses import FrozenInstanceError, replace
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -268,24 +268,12 @@ def test_finding_retains_comparison_order_and_ordered_mismatch_subset() -> None:
         finding.field_comparisons = ()
 
 
-@pytest.mark.parametrize(
-    ("category", "is_exception"),
-    [
-        (FindingCategory.EXACT_MATCH, False),
-        (FindingCategory.WITHIN_TOLERANCE, False),
-        (FindingCategory.AMOUNT_MISMATCH, True),
-        (FindingCategory.A_ONLY, True),
-        (FindingCategory.B_ONLY, True),
-        (FindingCategory.DUPLICATE_AMBIGUOUS, True),
-    ],
-)
-def test_secondary_mismatch_does_not_yet_change_primary_exception_membership(
-    category, is_exception
-) -> None:
+@pytest.mark.parametrize("category", list(FindingCategory))
+def test_secondary_mismatch_requires_review_in_every_primary_category(category) -> None:
     finding = _finding((MISMATCH,), category=category)
 
     assert finding.has_secondary_mismatch is True
-    assert finding.is_exception is is_exception
+    assert finding.is_exception is True
     assert finding.delta == Decimal("0")
 
 
@@ -424,7 +412,7 @@ def test_header_only_result_retains_nonempty_comparison_configuration() -> None:
     assert result.control_difference == result.finding_delta_sum == Decimal("0")
 
 
-def test_secondary_mismatch_does_not_yet_change_result_exceptions_or_accepted_tolerance() -> None:
+def test_secondary_mismatch_moves_exact_and_tolerated_findings_to_exceptions() -> None:
     exact = _finding((MISMATCH,))
     tolerated = _finding((MISMATCH,), FindingCategory.WITHIN_TOLERANCE, Decimal("100.01"))
     exact_result = ReconciliationResult(
@@ -438,11 +426,12 @@ def test_secondary_mismatch_does_not_yet_change_result_exceptions_or_accepted_to
         comparison_fields=(DEPARTMENT,),
     )
 
-    assert exact_result.exceptions == exact_result.tolerated_findings == ()
+    assert exact_result.exceptions == (exact,)
+    assert exact_result.tolerated_findings == ()
     assert exact_result.control_difference == exact_result.finding_delta_sum == Decimal("0")
-    assert tolerated_result.exceptions == ()
-    assert tolerated_result.tolerated_findings == (tolerated,)
-    assert tolerated_result.tolerated_delta_total == Decimal("-0.01")
+    assert tolerated_result.exceptions == (tolerated,)
+    assert tolerated_result.tolerated_findings == ()
+    assert tolerated_result.tolerated_delta_total == Decimal("0")
     assert (
         tolerated_result.control_difference
         == tolerated_result.finding_delta_sum
@@ -552,3 +541,134 @@ def test_current_reconcile_outputs_equal_primary_only_results_in_both_modes(
     assert result.tolerated_delta_total == Decimal("-0.01" if tolerance == "0.01" else "0")
     assert result.findings[4].rows_a[0] is a[0]
     assert result.findings[4].rows_b[0] is b[0]
+
+
+@pytest.mark.parametrize("category", list(FindingCategory))
+@pytest.mark.parametrize("status", list(FieldComparisonStatus))
+def test_review_membership_combines_primary_category_and_only_secondary_mismatch(
+    category, status
+) -> None:
+    comparison = FieldComparison(
+        DEPARTMENT,
+        ("Sales",),
+        ("Sales",) if status is FieldComparisonStatus.MATCH else ("Marketing",),
+        status,
+    )
+    finding = _finding((comparison,), category=category)
+    result = ReconciliationResult(
+        Decimal("100"), Decimal("100"), (finding,), comparison_fields=(DEPARTMENT,)
+    )
+    primary_exception = category not in (
+        FindingCategory.EXACT_MATCH,
+        FindingCategory.WITHIN_TOLERANCE,
+    )
+    requires_review = primary_exception or status is FieldComparisonStatus.MISMATCH
+
+    assert finding.category is category
+    assert finding.is_exception is requires_review
+    assert result.exceptions == ((finding,) if requires_review else ())
+    assert result.tolerated_findings == (
+        (finding,) if category is FindingCategory.WITHIN_TOLERANCE and not requires_review else ()
+    )
+    assert finding.delta == Decimal("0")
+
+
+def test_secondary_mismatch_summary_retains_result_order_and_original_objects() -> None:
+    date_match = FieldComparison(POSTING_DATE, ("2026",), ("2026",), FieldComparisonStatus.MATCH)
+    currency_unavailable = FieldComparison(CURRENCY, (), (), FieldComparisonStatus.NOT_COMPARABLE)
+    fields = (CURRENCY, DEPARTMENT, POSTING_DATE)
+    exact = _finding((currency_unavailable, MISMATCH, date_match))
+    tolerated = replace(
+        exact, category=FindingCategory.WITHIN_TOLERANCE, amount_b=Decimal("100.01")
+    )
+    accepted = replace(exact, field_comparisons=(currency_unavailable, MATCH, date_match))
+    primary_only = replace(accepted, category=FindingCategory.AMOUNT_MISMATCH)
+    unavailable = replace(
+        exact,
+        field_comparisons=(
+            currency_unavailable,
+            replace(MISMATCH, status=FieldComparisonStatus.NOT_COMPARABLE),
+            date_match,
+        ),
+    )
+    findings = (tolerated, accepted, unavailable, primary_only, exact)
+    result = ReconciliationResult(
+        Decimal("500"), Decimal("500.01"), findings, Decimal("0.01"), comparison_fields=fields
+    )
+
+    assert result.secondary_mismatch_findings == (tolerated, exact)
+    assert result.secondary_mismatch_findings[0] is tolerated
+    assert result.secondary_mismatch_findings[1] is exact
+    assert result.exceptions == (tolerated, primary_only, exact)
+    assert result.tolerated_findings == ()
+    assert result.tolerated_delta_total == Decimal("0")
+    assert result.findings is findings
+
+
+def test_empty_result_has_no_secondary_mismatch_summary() -> None:
+    result = ReconciliationResult(Decimal("0"), Decimal("0"), (), comparison_fields=(DEPARTMENT,))
+    assert result.secondary_mismatch_findings == ()
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+def test_review_and_accepted_tolerance_partition_preserves_exact_decimal_precision(mode) -> None:
+    entries = [
+        ("EXACT_ACCEPT", "1", "1", "Sales"),
+        ("EXACT_REVIEW", "1000000000000000000000000", "1000000000000000000000000", "Marketing"),
+        ("TOL_ACCEPT_POS", "1.0000000000000000000000003", "1.0000000000000000000000000", "Sales"),
+        ("TOL_ACCEPT_NEG", "2.0000000000000000000000000", "2.0000000000000000000000001", "Sales"),
+        ("TOL_REVIEW", "3.0000000000000000000000000", "3.0000000000000000000000004", "Marketing"),
+        ("AMOUNT_REVIEW", "4.0000000000000000000000000", "4.0000000000000000000000007", "Sales"),
+        ("A_ONLY", "5", None, "Sales"),
+        ("B_ONLY", None, "6", "Sales"),
+    ]
+    a = tuple(
+        SourceRecord(Source.A, row, (key,), Decimal(amount_a), {"Department": "Sales"})
+        for row, (key, amount_a, _, _) in enumerate(entries, start=2)
+        if amount_a is not None
+    )
+    b = tuple(
+        SourceRecord(Source.B, row, (key,), Decimal(amount_b), {"Cost Center": value})
+        for row, (key, _, amount_b, value) in enumerate(entries, start=2)
+        if amount_b is not None
+    )
+    with localcontext() as context:
+        context.prec = 100
+        expected_control = sum((r.amount for r in a), Decimal("0")) - sum(
+            (r.amount for r in b), Decimal("0")
+        )
+    with localcontext() as context:
+        context.prec = 1
+        context.Emax = 2
+        context.Emin = -2
+        for signal in context.traps:
+            context.traps[signal] = True
+        context.clear_flags()
+        result = reconcile(
+            a, b, mode=mode, amount_tolerance=Decimal("4E-25"), comparison_fields=(DEPARTMENT,)
+        )
+        assert result.control_difference == result.finding_delta_sum == expected_control
+        assert result.tolerated_delta_total == Decimal("2E-25")
+        assert [f.key[0] for f in result.tolerated_findings] == ["TOL_ACCEPT_NEG", "TOL_ACCEPT_POS"]
+        assert [f.key[0] for f in result.secondary_mismatch_findings] == [
+            "EXACT_REVIEW",
+            "TOL_REVIEW",
+        ]
+        assert not any(context.flags.values())
+    with localcontext() as context:
+        context.prec = 100
+        assert (
+            expected_control
+            == sum((f.delta for f in result.exceptions), Decimal("0"))
+            + result.tolerated_delta_total
+        )
+    by_key = {f.key[0]: f for f in result.findings}
+    assert by_key["EXACT_REVIEW"].category is FindingCategory.EXACT_MATCH
+    assert by_key["EXACT_REVIEW"].delta == Decimal("0")
+    assert by_key["TOL_REVIEW"].category is FindingCategory.WITHIN_TOLERANCE
+    assert by_key["TOL_REVIEW"].delta == Decimal("-4E-25")
+    assert by_key["TOL_REVIEW"] not in result.tolerated_findings
+    assert all(
+        sum(row is original for f in result.findings for row in (*f.rows_a, *f.rows_b)) == 1
+        for original in (*a, *b)
+    )
