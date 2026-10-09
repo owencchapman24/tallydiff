@@ -7,8 +7,11 @@ from collections.abc import Iterable, Sequence
 from decimal import Decimal
 
 from tallydiff._decimal import sum_decimals
+from tallydiff.configuration import ComparisonFieldMapping
 from tallydiff.models import (
     CompositeKey,
+    FieldComparison,
+    FieldComparisonStatus,
     FindingCategory,
     ReconciliationFinding,
     ReconciliationMode,
@@ -51,6 +54,7 @@ def reconcile(
     amount_tolerance: Decimal = Decimal("0"),
     mode: ReconciliationMode = ReconciliationMode.UNIQUE,
     key_normalization: KeyNormalizationConfig | None = None,
+    comparison_fields: tuple[ComparisonFieldMapping, ...] = (),
 ) -> ReconciliationResult:
     """Reconcile validated records by matching keys, ordered by key and source row.
 
@@ -72,6 +76,11 @@ def reconcile(
     presence taking precedence over amounts. Every source row is retained in
     both modes. Grouped results make no claim that individual rows correspond;
     rows are never paired heuristically.
+
+    Secondary fields compare distinct sets of original evidence strings, in
+    configuration order. One-sided and UNIQUE duplicate-ambiguous groups retain
+    their summaries as NOT_COMPARABLE. Secondary status does not change primary
+    categories, financial deltas, or exception membership.
     """
 
     if not isinstance(amount_tolerance, Decimal):
@@ -84,6 +93,7 @@ def reconcile(
         raise TypeError("mode must be a ReconciliationMode enum member")
     if key_normalization is not None and not isinstance(key_normalization, KeyNormalizationConfig):
         raise TypeError("key_normalization must be a KeyNormalizationConfig or None")
+    _validate_comparison_fields(comparison_fields)
 
     records_a = tuple(records_a)
     records_b = tuple(records_b)
@@ -102,6 +112,10 @@ def reconcile(
         collisions_b = find_normalization_collisions(records_b, key_normalization, source=Source.B)
         if collisions_a or collisions_b:
             raise NormalizationCollisionError(collisions_a, collisions_b)
+
+    if comparison_fields:
+        _validate_comparison_evidence(records_a, Source.A, comparison_fields)
+        _validate_comparison_evidence(records_b, Source.B, comparison_fields)
 
     grouped_a = _group_by_key(records_a, key_normalization=key_normalization)
     grouped_b = _group_by_key(records_b, key_normalization=key_normalization)
@@ -122,6 +136,7 @@ def reconcile(
                 rows_b=rows_b,
                 amount_a=amount_a,
                 amount_b=amount_b,
+                field_comparisons=_compare_fields(rows_a, rows_b, comparison_fields, category),
             )
         )
 
@@ -132,9 +147,69 @@ def reconcile(
         amount_tolerance=amount_tolerance,
         mode=mode,
         key_normalization=key_normalization,
+        comparison_fields=comparison_fields,
     )
     _assert_integrity(result, records_a, records_b)
     return result
+
+
+def _validate_comparison_fields(comparison_fields: tuple[ComparisonFieldMapping, ...]) -> None:
+    if not isinstance(comparison_fields, tuple) or any(
+        not isinstance(mapping, ComparisonFieldMapping) for mapping in comparison_fields
+    ):
+        raise TypeError("comparison_fields must be a tuple of ComparisonFieldMapping objects")
+    if any(not mapping.is_complete for mapping in comparison_fields):
+        raise ValueError("comparison_fields must select nonblank columns for both files")
+    for side, names in (
+        ("A", tuple(mapping.file_a for mapping in comparison_fields)),
+        ("B", tuple(mapping.file_b for mapping in comparison_fields)),
+    ):
+        if len(set(names)) != len(names):
+            raise ValueError(f"each File {side} comparison column must be selected only once")
+
+
+def _validate_comparison_evidence(
+    records: Sequence[SourceRecord],
+    source: Source,
+    comparison_fields: tuple[ComparisonFieldMapping, ...],
+) -> None:
+    columns = tuple(
+        mapping.file_a if source is Source.A else mapping.file_b for mapping in comparison_fields
+    )
+    for record in records:
+        for column in columns:
+            if column not in record.raw_fields:
+                raise ValueError(
+                    f"File {source.value} source row {record.source_row}: "
+                    f"comparison column {column!r} is missing from raw_fields"
+                )
+
+
+def _compare_fields(
+    rows_a: tuple[SourceRecord, ...],
+    rows_b: tuple[SourceRecord, ...],
+    comparison_fields: tuple[ComparisonFieldMapping, ...],
+    category: FindingCategory,
+) -> tuple[FieldComparison, ...]:
+    if not comparison_fields:
+        return ()
+    comparable = category not in (
+        FindingCategory.A_ONLY,
+        FindingCategory.B_ONLY,
+        FindingCategory.DUPLICATE_AMBIGUOUS,
+    )
+    comparisons = []
+    for mapping in comparison_fields:
+        values_a = tuple(sorted({record.raw_fields[mapping.file_a] for record in rows_a}))
+        values_b = tuple(sorted({record.raw_fields[mapping.file_b] for record in rows_b}))
+        if not comparable:
+            status = FieldComparisonStatus.NOT_COMPARABLE
+        elif values_a == values_b:
+            status = FieldComparisonStatus.MATCH
+        else:
+            status = FieldComparisonStatus.MISMATCH
+        comparisons.append(FieldComparison(mapping, values_a, values_b, status))
+    return tuple(comparisons)
 
 
 def _validate_source_records(records: Sequence[SourceRecord], expected_source: Source) -> None:

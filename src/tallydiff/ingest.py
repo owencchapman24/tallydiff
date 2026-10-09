@@ -59,6 +59,7 @@ def ingest_csv(
     source: Source,
     key_columns: Sequence[str],
     amount_column: str,
+    comparison_columns: Sequence[str] = (),
 ) -> tuple[SourceRecord, ...]:
     """Validate an entire comma-separated CSV before returning any records.
 
@@ -68,7 +69,8 @@ def ingest_csv(
 
     The header is CSV record 1 and the first data record is record 2. A quoted
     multiline field belongs to one record, irrespective of physical line count.
-    Blank records and rows with missing or extra fields are rejected.
+    Blank records and rows with missing or extra fields are rejected. Selected
+    comparison fields retain their exact evidence strings, including blanks.
     """
 
     if not isinstance(source, Source):
@@ -82,6 +84,10 @@ def ingest_csv(
         raise IngestionError(source, "selected key columns must be distinct", value=keys)
     if not isinstance(amount_column, str) or not amount_column.strip():
         raise IngestionError(source, "select a nonblank amount column name", value=amount_column)
+
+    comparisons = _validate_comparison_columns(
+        comparison_columns, source=source, amount_column=amount_column
+    )
 
     stream = StringIO(data, newline="") if isinstance(data, str) else data
     reader = csv.reader(stream, strict=True)
@@ -98,6 +104,11 @@ def ingest_csv(
             raise IngestionError(
                 source, "selected amount column is missing", source_row=1, column=amount_column
             )
+        for column in comparisons:
+            if column not in header:
+                raise IngestionError(
+                    source, "selected comparison column is missing", source_row=1, column=column
+                )
         source_row = 2
         for values in reader:
             if len(values) != len(header):
@@ -137,6 +148,44 @@ def ingest_csv(
             source, f"could not read CSV text: {exc}", source_row=source_row
         ) from None
     return tuple(records)
+
+
+def _validate_comparison_columns(
+    columns: Sequence[str],
+    *,
+    source: Source,
+    amount_column: str,
+    worksheet: str | None = None,
+) -> tuple[str, ...]:
+    """Validate secondary selections without changing names or other field roles."""
+
+    if not isinstance(columns, Sequence) or isinstance(columns, str | bytes | bytearray):
+        raise IngestionError(
+            source, "comparison_columns must be a sequence of column names", worksheet=worksheet
+        )
+    comparisons = tuple(columns)
+    if any(not isinstance(name, str) or not name.strip() for name in comparisons):
+        raise IngestionError(
+            source,
+            "select nonblank comparison column names",
+            value=comparisons,
+            worksheet=worksheet,
+        )
+    if len(set(comparisons)) != len(comparisons):
+        raise IngestionError(
+            source,
+            "selected comparison columns must be distinct",
+            value=comparisons,
+            worksheet=worksheet,
+        )
+    if amount_column in comparisons:
+        raise IngestionError(
+            source,
+            "comparison columns must not use the amount column",
+            column=amount_column,
+            worksheet=worksheet,
+        )
+    return comparisons
 
 
 def _read_header(reader: Iterator[list[str]], source: Source) -> list[str]:
