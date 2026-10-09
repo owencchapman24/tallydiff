@@ -51,6 +51,11 @@ jobs:
               "build/release-canary.txt",
               "dist/release-canary.txt",
               "src/tallydiff/review.patch",
+              "src/tallydiff/untracked-local-note.txt",
+              "src/tallydiff/untracked_helper.py",
+              ".codex/release-canary.txt",
+              ".agents/release-canary.txt",
+              "venv/release-canary.txt",
               "src/tallydiff/__pycache__/release-canary.pyc",
           )
           for name in canaries:

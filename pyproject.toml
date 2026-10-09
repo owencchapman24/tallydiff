@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tallydiff"
-version = "0.3.0"
+version = "0.4.0"
 description = "Traceable reconciliation for structured financial exports."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,11 +44,41 @@ exclude = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tallydiff"]
+# Keep runtime selection exact; unknown package-local files must not ship.
+only-include = [
+    "src/tallydiff/__init__.py",
+    "src/tallydiff/_decimal.py",
+    "src/tallydiff/amounts.py",
+    "src/tallydiff/app.py",
+    "src/tallydiff/configuration.py",
+    "src/tallydiff/engine.py",
+    "src/tallydiff/export.py",
+    "src/tallydiff/ingest.py",
+    "src/tallydiff/models.py",
+    "src/tallydiff/normalization.py",
+    "src/tallydiff/normalization_config.py",
+    "src/tallydiff/presentation.py",
+    "src/tallydiff/profiles.py",
+    "src/tallydiff/xlsx.py",
+]
+sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/src/tallydiff/**/*.py",
+    "/src/tallydiff/__init__.py",
+    "/src/tallydiff/_decimal.py",
+    "/src/tallydiff/amounts.py",
+    "/src/tallydiff/app.py",
+    "/src/tallydiff/configuration.py",
+    "/src/tallydiff/engine.py",
+    "/src/tallydiff/export.py",
+    "/src/tallydiff/ingest.py",
+    "/src/tallydiff/models.py",
+    "/src/tallydiff/normalization.py",
+    "/src/tallydiff/normalization_config.py",
+    "/src/tallydiff/presentation.py",
+    "/src/tallydiff/profiles.py",
+    "/src/tallydiff/xlsx.py",
     "/tests/*.py",
     "/scripts/*.py",
     "/sample_data/*.csv",
