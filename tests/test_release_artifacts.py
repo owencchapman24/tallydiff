@@ -13,7 +13,7 @@ from scripts.check_release_artifacts import (
     check_release_artifacts,
 )
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PACKAGE = f"tallydiff-{VERSION}"
 INFO = f"{PACKAGE}.dist-info"
 METADATA = (
@@ -93,7 +93,16 @@ def test_local_artifacts_are_rejected_on_either_side(release, artifact, name):
         check(release)
 
 
-@pytest.mark.parametrize("name", ["tests/test_local.py", "scripts/local.py", "local-note.txt"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tests/test_local.py",
+        "scripts/local.py",
+        "local-note.txt",
+        "tallydiff/untracked_helper.py",
+        "tallydiff/local-note.txt",
+    ],
+)
 def test_wheel_rejects_nonruntime_files(release, name):
     release[2][name] = b"unintended"
     with pytest.raises(ArtifactContentError, match="unexpected"):
@@ -107,10 +116,11 @@ def test_sdist_rejects_arbitrary_untracked_root_files(release):
 
 
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
-def test_required_runtime_module_cannot_be_omitted(release, artifact):
+@pytest.mark.parametrize("module", ["engine", "normalization", "normalization_config"])
+def test_required_runtime_module_cannot_be_omitted(release, artifact, module):
     _, _, wheel, source = release
     del (wheel if artifact == "wheel" else source)[
-        "tallydiff/engine.py" if artifact == "wheel" else f"{PACKAGE}/src/tallydiff/engine.py"
+        f"tallydiff/{module}.py" if artifact == "wheel" else f"{PACKAGE}/src/tallydiff/{module}.py"
     ]
     with pytest.raises(ArtifactContentError, match="missing"):
         check(release)
@@ -123,11 +133,18 @@ def test_required_project_content_cannot_be_omitted(release, name):
         check(release)
 
 
+@pytest.mark.parametrize("name", ["untracked_helper.py", "local-note.txt"])
+def test_sdist_rejects_arbitrary_package_local_files(release, name):
+    release[3][f"{PACKAGE}/src/tallydiff/{name}"] = b"unintended"
+    with pytest.raises(ArtifactContentError, match="unexpected"):
+        check(release)
+
+
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 @pytest.mark.parametrize(
     "old,new",
     [
-        (b"Version: 0.3.0", b"Version: 0.2.0"),
+        (b"Version: 0.4.0", b"Version: 0.3.0"),
         (b"Name: tallydiff", b"Name: another-project"),
         (b"Requires-Python: >=3.12", b"Requires-Python: >=3.10"),
     ],

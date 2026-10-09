@@ -8,9 +8,11 @@ from decimal import Decimal, InvalidOperation
 from tallydiff.amounts import AmountParseError, parse_amount
 from tallydiff.configuration import ColumnMapping
 from tallydiff.models import ReconciliationMode
+from tallydiff.normalization_config import KeyNormalizationConfig, KeyNormalizationRules
 
 _FORMAT = "tallydiff-mapping-profile"
-_VERSION = 2
+_VERSION = 3
+_RULE_FIELDS = ("casefold", "collapse_whitespace", "remove_punctuation", "strip_leading_zeros")
 
 
 class ProfileError(ValueError):
@@ -22,13 +24,35 @@ def _column_name(value: object, label: str) -> None:
         raise ProfileError(f"{label} must be a nonblank column name.")
 
 
+def _canonical_key_normalization(
+    configuration: KeyNormalizationConfig | None, component_count: int
+) -> KeyNormalizationConfig | None:
+    """Validate profile arity and retain a single exact-matching representation."""
+
+    if configuration is None:
+        return None
+    if not isinstance(configuration, KeyNormalizationConfig):
+        raise ProfileError("key_normalization must be a KeyNormalizationConfig or None.")
+    if len(configuration.component_rules) != component_count:
+        raise ProfileError("key_normalization length must equal key_pairs length.")
+    if not any(
+        getattr(rules, name) for rules in configuration.component_rules for name in _RULE_FIELDS
+    ):
+        return None
+    return configuration
+
+
 @dataclass(frozen=True, slots=True)
 class MappingProfile:
-    """Validated directional configuration, independent of any uploaded records."""
+    """Validated directional configuration, independent of any uploaded records.
+
+    All-false normalization canonicalizes to None during frozen initialization.
+    """
 
     mapping: ColumnMapping
     amount_tolerance: Decimal = Decimal("0")
     reconciliation_mode: ReconciliationMode = ReconciliationMode.UNIQUE
+    key_normalization: KeyNormalizationConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mapping, ColumnMapping):
@@ -52,6 +76,11 @@ class MappingProfile:
             raise ProfileError("amount_tolerance must be finite and zero or greater.")
         if not isinstance(self.reconciliation_mode, ReconciliationMode):
             raise ProfileError("reconciliation_mode must be a ReconciliationMode enum member.")
+        object.__setattr__(
+            self,
+            "key_normalization",
+            _canonical_key_normalization(self.key_normalization, len(pairs)),
+        )
 
     def validate_columns(self, columns_a: Sequence[str], columns_b: Sequence[str]) -> None:
         """Reject missing directional columns before any configuration is applied."""
@@ -73,10 +102,20 @@ def export_mapping_profile(
     *,
     amount_tolerance: Decimal = Decimal("0"),
     reconciliation_mode: ReconciliationMode = ReconciliationMode.UNIQUE,
+    key_normalization: KeyNormalizationConfig | None = None,
 ) -> bytes:
-    """Serialize a v2 profile to UTF-8 JSON; all tolerance digits are retained."""
+    """Serialize v3 configuration to UTF-8 JSON, retaining all tolerance digits.
 
-    profile = MappingProfile(mapping, amount_tolerance, reconciliation_mode)
+    Exact matching is always an array of all-false rule objects, one per key pair.
+    No source records, runtime metadata, or normalization results are serialized.
+    """
+
+    profile = MappingProfile(mapping, amount_tolerance, reconciliation_mode, key_normalization)
+    component_rules = (
+        profile.key_normalization.component_rules
+        if profile.key_normalization is not None
+        else (KeyNormalizationRules(),) * len(profile.mapping.key_pairs)
+    )
     document = {
         "format": _FORMAT,
         "version": _VERSION,
@@ -84,6 +123,9 @@ def export_mapping_profile(
         "amount_columns": {"file_a": profile.mapping.amount_a, "file_b": profile.mapping.amount_b},
         "amount_tolerance": format(profile.amount_tolerance, "f"),
         "reconciliation_mode": profile.reconciliation_mode.value,
+        "key_normalization": [
+            {name: getattr(rules, name) for name in _RULE_FIELDS} for rules in component_rules
+        ],
     }
     return (json.dumps(document, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
 
@@ -113,11 +155,29 @@ def _reject_json_number(value: str) -> None:
     )
 
 
+def _parse_key_normalization(value: object, component_count: int) -> KeyNormalizationConfig:
+    if not isinstance(value, list):
+        raise ProfileError("key_normalization must be an array of rule objects.")
+    if not value or len(value) != component_count:
+        raise ProfileError("key_normalization must contain one rule object per key mapping.")
+    component_rules = []
+    for index, raw_rules in enumerate(value, start=1):
+        label = f"Key normalization {index}"
+        rules = _object(raw_rules, set(_RULE_FIELDS), label)
+        for name in _RULE_FIELDS:
+            if not isinstance(rules[name], bool):
+                raise ProfileError(f"{label} {name} must be a boolean.")
+        component_rules.append(KeyNormalizationRules(**rules))
+    return KeyNormalizationConfig(tuple(component_rules))
+
+
 def load_mapping_profile(data: bytes | str) -> MappingProfile:
     """Parse and validate a profile atomically, returning structured configuration.
 
     Column compatibility is checked separately by MappingProfile.validate_columns.
-    Version 1 defaults to UNIQUE; version 2 requires an exact supported mode value.
+    Version 1 implies UNIQUE; versions 2 and 3 require an exact supported mode.
+    Versions 1 and 2 imply no normalization. Version 3 requires ordered rule objects;
+    all-false rules canonicalize to None through the MappingProfile model.
     No numeric tolerance is coerced, and no files or reconciliation data are read.
     """
 
@@ -138,16 +198,18 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
     if "version" not in document:
         raise ProfileError("Profile must contain the required fields: version.")
     version = document["version"]
-    if type(version) is not int or version not in (1, 2):
-        raise ProfileError("Unsupported profile version; expected version 1 or 2.")
+    if type(version) is not int or version not in (1, 2, 3):
+        raise ProfileError("Unsupported profile version; expected version 1, 2, or 3.")
     fields = {"format", "version", "key_pairs", "amount_columns", "amount_tolerance"}
-    if version == 2:
+    if version >= 2:
         fields.add("reconciliation_mode")
+    if version == 3:
+        fields.add("key_normalization")
     document = _object(document, fields, "Profile")
     if document["format"] != _FORMAT:
         raise ProfileError("Unsupported profile format.")
     mode = ReconciliationMode.UNIQUE
-    if version == 2:
+    if version >= 2:
         raw_mode = document["reconciliation_mode"]
         if not isinstance(raw_mode, str):
             raise ProfileError("reconciliation_mode must be a string.")
@@ -178,4 +240,9 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
         ColumnMapping(tuple(pairs), amounts["file_a"], amounts["file_b"]),
         tolerance,
         reconciliation_mode=mode,
+        key_normalization=(
+            _parse_key_normalization(document["key_normalization"], len(pairs))
+            if version == 3
+            else None
+        ),
     )

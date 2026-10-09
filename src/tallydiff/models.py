@@ -9,6 +9,7 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from tallydiff._decimal import sum_decimals
+from tallydiff.normalization_config import KeyNormalizationConfig
 
 type CompositeKey = tuple[str, ...]
 
@@ -21,14 +22,14 @@ class Source(StrEnum):
 
 
 class ReconciliationMode(StrEnum):
-    """Whether exact keys require unique rows or compare all source-row totals."""
+    """Whether matching keys require unique rows or compare all source-row totals."""
 
     UNIQUE = "unique"
     GROUPED_BY_KEY = "grouped_by_key"
 
 
 class FindingCategory(StrEnum):
-    """Mutually exclusive outcome for one exact reconciliation key."""
+    """Mutually exclusive outcome for one reconciliation key."""
 
     EXACT_MATCH = "exact_match"
     WITHIN_TOLERANCE = "within_tolerance"
@@ -81,7 +82,7 @@ class SourceRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationFinding:
-    """The reconciliation outcome for one exact composite key."""
+    """Outcome for the matching key; retained source rows keep their original keys."""
 
     category: FindingCategory
     key: CompositeKey
@@ -108,17 +109,22 @@ class ReconciliationFinding:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationResult:
-    """Complete deterministic result for one reconciliation run."""
+    """Complete result retaining explicit normalization, or None for exact matching."""
 
     total_a: Decimal
     total_b: Decimal
     findings: tuple[ReconciliationFinding, ...]
     amount_tolerance: Decimal = Decimal("0")
     mode: ReconciliationMode = ReconciliationMode.UNIQUE
+    key_normalization: KeyNormalizationConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, ReconciliationMode):
             raise TypeError("mode must be a ReconciliationMode enum member")
+        if self.key_normalization is not None and not isinstance(
+            self.key_normalization, KeyNormalizationConfig
+        ):
+            raise TypeError("key_normalization must be a KeyNormalizationConfig or None")
 
     @property
     def control_difference(self) -> Decimal:

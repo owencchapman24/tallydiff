@@ -14,6 +14,7 @@ from tallydiff.models import (
     Source,
     SourceRecord,
 )
+from tallydiff.normalization_config import KeyNormalizationConfig
 
 CATEGORY_LABELS = {
     FindingCategory.EXACT_MATCH: "Exact match",
@@ -28,6 +29,14 @@ CATEGORY_LABELS = {
 MODE_LABELS = {
     ReconciliationMode.UNIQUE: "Unique records",
     ReconciliationMode.GROUPED_BY_KEY: "Group by matching key",
+}
+
+
+NORMALIZATION_LABELS = {
+    "casefold": "Ignore letter case",
+    "collapse_whitespace": "Collapse whitespace",
+    "remove_punctuation": "Ignore punctuation",
+    "strip_leading_zeros": "Ignore leading zeros",
 }
 
 
@@ -54,11 +63,22 @@ def configuration_id(
     reconciliation_mode: ReconciliationMode = ReconciliationMode.UNIQUE,
     worksheet_a: str | None = None,
     worksheet_b: str | None = None,
+    key_normalization: KeyNormalizationConfig | None = None,
 ) -> str:
-    """Identify the files, ordered selections, tolerance, and mode behind a displayed result."""
+    """Identify files, ordered mappings, tolerance, mode, and canonical normalization.
+
+    Exact/all-false rules preserve the existing exact identity. Enabled rule values
+    and component order are included as primitive data, independently of UI labels.
+    """
 
     if not isinstance(reconciliation_mode, ReconciliationMode):
         raise TypeError("reconciliation_mode must be a ReconciliationMode enum member")
+    if key_normalization is not None and not isinstance(key_normalization, KeyNormalizationConfig):
+        raise TypeError("key_normalization must be a KeyNormalizationConfig or None")
+    if key_normalization is not None and len(key_normalization.component_rules) != len(
+        mapping.key_pairs
+    ):
+        raise ValueError("key_normalization length must equal key_pairs length")
     tolerance_identity = format(amount_tolerance, "f")
     if "." in tolerance_identity:
         tolerance_identity = tolerance_identity.rstrip("0").rstrip(".")
@@ -73,6 +93,18 @@ def configuration_id(
         tolerance_identity,
         reconciliation_mode.value,
     ]
+    if key_normalization is not None:
+        normalization = [
+            {
+                "casefold": rules.casefold,
+                "collapse_whitespace": rules.collapse_whitespace,
+                "remove_punctuation": rules.remove_punctuation,
+                "strip_leading_zeros": rules.strip_leading_zeros,
+            }
+            for rules in key_normalization.component_rules
+        ]
+        if any(any(rules.values()) for rules in normalization):
+            identity.append({"key_normalization": normalization})
     return hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 

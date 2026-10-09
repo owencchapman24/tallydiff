@@ -4,6 +4,7 @@ import argparse
 import cProfile
 import csv
 import gc
+import json
 import platform
 import pstats
 import time
@@ -19,6 +20,7 @@ from scripts.synthetic_data import (
     KEYS_A,
     KEYS_B,
     MODES,
+    NORMALIZATION_RULES,
     WORKLOADS,
     GroundTruth,
     decimal_units,
@@ -26,6 +28,8 @@ from scripts.synthetic_data import (
 )
 from tallydiff import (
     ColumnMapping,
+    KeyNormalizationConfig,
+    KeyNormalizationRules,
     ReconciliationMode,
     ReconciliationResult,
     Source,
@@ -48,6 +52,17 @@ class Measurement:
     export: float
     verification: float
     total: float
+    summary: dict[str, object]
+
+
+def normalization_config(workload: str) -> KeyNormalizationConfig | None:
+    """Build product configuration only in the runner, never in the fixture oracle."""
+
+    if workload == "normalization":
+        return KeyNormalizationConfig(
+            tuple(KeyNormalizationRules(**rules) for rules in NORMALIZATION_RULES)
+        )
+    return None
 
 
 def measure(
@@ -75,13 +90,15 @@ def measure(
         pair.csv_b, source=Source.B, key_columns=mapping.keys_b, amount_column=mapping.amount_b
     )
     ingested = time.perf_counter()
-    result = reconcile(a, b, amount_tolerance=tolerance, mode=mode)
+    configuration = normalization_config(workload)
+    result = reconcile(a, b, amount_tolerance=tolerance, mode=mode, key_normalization=configuration)
     reconciled = time.perf_counter()
     report = export_exceptions_csv(result)
     exported = time.perf_counter()
 
     truth = pair.expected(tolerance, mode=mode.value)
-    verify_result(a, b, result, report, truth)
+    verify_result(a, b, result, report, truth, key_normalization=configuration)
+    summary = truth.summary()
     finished = time.perf_counter()
     return Measurement(
         len(a),
@@ -93,6 +110,7 @@ def measure(
         exported - reconciled,
         finished - exported,
         finished - started,
+        summary,
     )
 
 
@@ -102,9 +120,13 @@ def verify_result(
     result: ReconciliationResult,
     report: bytes,
     truth: GroundTruth,
+    *,
+    key_normalization: KeyNormalizationConfig | None = None,
 ) -> None:
     """Check observed output against independent construction, including every key."""
 
+    if result.key_normalization is not key_normalization:
+        raise AssertionError("Result does not retain the exact normalization configuration used")
     if result.mode.value != truth.mode:
         raise AssertionError("Reconciliation mode differs from requested ground truth")
     if len(a) != truth.record_count_a or len(b) != truth.record_count_b:
@@ -120,6 +142,8 @@ def verify_result(
         result.tolerated_delta_total,
     ) != (truth.total_a, truth.total_b, truth.control_difference, truth.tolerated_delta_total):
         raise AssertionError("Totals differ from independent integer-based construction")
+    if len(result.tolerated_findings) != truth.category_counts["within_tolerance"]:
+        raise AssertionError("Tolerated finding count differs from independent construction")
     for finding, expected in zip(result.findings, truth.groups, strict=True):
         if (
             finding.key,
@@ -139,6 +163,20 @@ def verify_result(
             expected.delta,
         ):
             raise AssertionError(f"Group differs from independent construction: {expected.key}")
+        if finding.is_exception != expected.is_exception:
+            raise AssertionError(f"Exception status differs: {expected.key}")
+        for records, raw_key, columns in (
+            (finding.rows_a, expected.raw_key_a, KEYS_A),
+            (finding.rows_b, expected.raw_key_b, KEYS_B),
+        ):
+            if [row.source_row for row in records] != sorted(row.source_row for row in records):
+                raise AssertionError(f"Evidence source rows are not sorted: {expected.key}")
+            if raw_key is not None:
+                for row in records:
+                    if row.key != raw_key:
+                        raise AssertionError(f"Original raw key changed: {expected.key}")
+                    if tuple(row.raw_fields[column] for column in columns) != raw_key:
+                        raise AssertionError(f"Original raw key evidence changed: {expected.key}")
     # Exercise the arithmetic identity directly, without product summation helpers.
     with localcontext() as context:
         context.prec = (
@@ -193,10 +231,16 @@ def main() -> None:
     if any(groups < 100 for groups in args.groups):
         parser.error("groups must be at least 100")
     print(
-        f"Python {platform.python_version()} | {platform.system()} | "
+        f"Python {platform.python_version()} | {platform.platform()} | "
         f"seed={args.seed} | workload={args.workload}"
     )
+    print(
+        "Normalization config: "
+        + json.dumps(NORMALIZATION_RULES if args.workload == "normalization" else None)
+    )
     print("Times: seconds, untraced single passes; total includes independent verification.")
+    if args.workload == "normalization":
+        print("reconcile_s includes normalization and collision preflight; no artificial split.")
     print(
         "Peak: Python allocations in a separate tracemalloc pass, not process RSS or native memory."
     )
@@ -224,6 +268,10 @@ def main() -> None:
                     f"{result.rows_a} {result.rows_b} {result.exceptions} "
                     f"{result.generation:.3f} {result.ingestion:.3f} {result.reconciliation:.3f} "
                     f"{result.export:.3f} {result.verification:.3f} {result.total:.3f} {peak}",
+                    flush=True,
+                )
+                print(
+                    f"Verified {groups} {mode.value}: {json.dumps(result.summary, sort_keys=True)}",
                     flush=True,
                 )
     if args.profile:
