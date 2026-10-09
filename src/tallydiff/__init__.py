@@ -1,11 +1,13 @@
 """TallyDiff: traceable reconciliation for structured financial exports."""
 
 from tallydiff.amounts import AmountParseError, parse_amount
-from tallydiff.configuration import ColumnMapping
+from tallydiff.configuration import ColumnMapping, ComparisonFieldMapping
 from tallydiff.engine import NormalizationCollisionError, ReconciliationIntegrityError, reconcile
 from tallydiff.export import export_exceptions_csv
 from tallydiff.ingest import IngestionError, ingest_csv, inspect_csv_columns
 from tallydiff.models import (
+    FieldComparison,
+    FieldComparisonStatus,
     FindingCategory,
     ReconciliationFinding,
     ReconciliationMode,
@@ -30,6 +32,9 @@ from tallydiff.xlsx import ingest_xlsx, inspect_xlsx_columns, inspect_xlsx_sheet
 __all__ = [
     "AmountParseError",
     "ColumnMapping",
+    "ComparisonFieldMapping",
+    "FieldComparison",
+    "FieldComparisonStatus",
     "FindingCategory",
     "IngestionError",
     "KeyNormalizationConfig",
