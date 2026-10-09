@@ -69,6 +69,8 @@ def _assert_blocked(app):
         "Apply profile",
         "+ Add key field",
         "Remove last key field",
+        "+ Add comparison field",
+        "Remove last comparison field",
         "Run reconciliation",
     ]
 
