@@ -69,6 +69,8 @@ def configuration_id(
 
     Exact/all-false rules preserve the existing exact identity. Enabled rule values
     and component order are included as primitive data, independently of UI labels.
+    Nonempty secondary mappings append their exact directional editing values,
+    including incomplete selections. Empty comparisons preserve existing digests.
     """
 
     if not isinstance(reconciliation_mode, ReconciliationMode):
@@ -105,6 +107,14 @@ def configuration_id(
         ]
         if any(any(rules.values()) for rules in normalization):
             identity.append({"key_normalization": normalization})
+    if mapping.comparison_fields:
+        identity.append(
+            {
+                "comparison_fields": [
+                    [field.file_a, field.file_b] for field in mapping.comparison_fields
+                ]
+            }
+        )
     return hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 

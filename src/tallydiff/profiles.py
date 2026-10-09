@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from tallydiff.amounts import AmountParseError, parse_amount
-from tallydiff.configuration import ColumnMapping
+from tallydiff.configuration import ColumnMapping, ComparisonFieldMapping
 from tallydiff.models import ReconciliationMode
 from tallydiff.normalization_config import KeyNormalizationConfig, KeyNormalizationRules
 
 _FORMAT = "tallydiff-mapping-profile"
-_VERSION = 3
+_VERSION = 4
 _RULE_FIELDS = ("casefold", "collapse_whitespace", "remove_punctuation", "strip_leading_zeros")
 
 
@@ -70,6 +70,19 @@ class MappingProfile:
                 raise ProfileError(f"Each File {side} key column must be selected only once.")
         _column_name(self.mapping.amount_a, "File A amount column")
         _column_name(self.mapping.amount_b, "File B amount column")
+        selected_comparisons = {"A": set(), "B": set()}
+        for index, comparison in enumerate(self.mapping.comparison_fields, start=1):
+            for side, name, amount in (
+                ("A", comparison.file_a, self.mapping.amount_a),
+                ("B", comparison.file_b, self.mapping.amount_b),
+            ):
+                label = f"Comparison mapping {index} File {side}"
+                _column_name(name, label)
+                if name in selected_comparisons[side]:
+                    raise ProfileError(f"{label} column must be selected only once.")
+                if name == amount:
+                    raise ProfileError(f"{label} must not use the amount column.")
+                selected_comparisons[side].add(name)
         if not isinstance(self.amount_tolerance, Decimal):
             raise ProfileError("amount_tolerance must be a Decimal.")
         if not self.amount_tolerance.is_finite() or self.amount_tolerance < 0:
@@ -87,8 +100,16 @@ class MappingProfile:
 
         missing = []
         for side, required, available in (
-            ("A", (*self.mapping.keys_a, self.mapping.amount_a), columns_a),
-            ("B", (*self.mapping.keys_b, self.mapping.amount_b), columns_b),
+            (
+                "A",
+                (*self.mapping.keys_a, self.mapping.amount_a, *self.mapping.comparisons_a),
+                columns_a,
+            ),
+            (
+                "B",
+                (*self.mapping.keys_b, self.mapping.amount_b, *self.mapping.comparisons_b),
+                columns_b,
+            ),
         ):
             for name in dict.fromkeys(required):
                 if name not in available:
@@ -104,10 +125,11 @@ def export_mapping_profile(
     reconciliation_mode: ReconciliationMode = ReconciliationMode.UNIQUE,
     key_normalization: KeyNormalizationConfig | None = None,
 ) -> bytes:
-    """Serialize v3 configuration to UTF-8 JSON, retaining all tolerance digits.
+    """Serialize v4 configuration to UTF-8 JSON, retaining all tolerance digits.
 
     Exact matching is always an array of all-false rule objects, one per key pair.
-    No source records, runtime metadata, or normalization results are serialized.
+    Ordered secondary mappings contain only directional column names. No source
+    records, runtime metadata, or comparison/normalization results are serialized.
     """
 
     profile = MappingProfile(mapping, amount_tolerance, reconciliation_mode, key_normalization)
@@ -125,6 +147,10 @@ def export_mapping_profile(
         "reconciliation_mode": profile.reconciliation_mode.value,
         "key_normalization": [
             {name: getattr(rules, name) for name in _RULE_FIELDS} for rules in component_rules
+        ],
+        "comparison_fields": [
+            {"file_a": mapping.file_a, "file_b": mapping.file_b}
+            for mapping in profile.mapping.comparison_fields
         ],
     }
     return (json.dumps(document, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
@@ -171,13 +197,27 @@ def _parse_key_normalization(value: object, component_count: int) -> KeyNormaliz
     return KeyNormalizationConfig(tuple(component_rules))
 
 
+def _parse_comparison_fields(value: object) -> tuple[ComparisonFieldMapping, ...]:
+    if not isinstance(value, list):
+        raise ProfileError("comparison_fields must be an array of comparison mappings.")
+    comparisons = []
+    for index, raw_mapping in enumerate(value, start=1):
+        label = f"Comparison mapping {index}"
+        mapping = _object(raw_mapping, {"file_a", "file_b"}, label)
+        _column_name(mapping["file_a"], f"{label} File A")
+        _column_name(mapping["file_b"], f"{label} File B")
+        comparisons.append(ComparisonFieldMapping(mapping["file_a"], mapping["file_b"]))
+    return tuple(comparisons)
+
+
 def load_mapping_profile(data: bytes | str) -> MappingProfile:
     """Parse and validate a profile atomically, returning structured configuration.
 
     Column compatibility is checked separately by MappingProfile.validate_columns.
-    Version 1 implies UNIQUE; versions 2 and 3 require an exact supported mode.
-    Versions 1 and 2 imply no normalization. Version 3 requires ordered rule objects;
-    all-false rules canonicalize to None through the MappingProfile model.
+    Version 1 implies UNIQUE; versions 2–4 require an exact supported mode.
+    Versions 1 and 2 imply no normalization. Versions 3 and 4 require ordered rule
+    objects; all-false rules canonicalize to None through the MappingProfile model.
+    Versions 1–3 imply no comparisons. Version 4 requires ordered secondary mappings.
     No numeric tolerance is coerced, and no files or reconciliation data are read.
     """
 
@@ -198,13 +238,15 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
     if "version" not in document:
         raise ProfileError("Profile must contain the required fields: version.")
     version = document["version"]
-    if type(version) is not int or version not in (1, 2, 3):
-        raise ProfileError("Unsupported profile version; expected version 1, 2, or 3.")
+    if type(version) is not int or version not in (1, 2, 3, 4):
+        raise ProfileError("Unsupported profile version; expected version 1, 2, 3, or 4.")
     fields = {"format", "version", "key_pairs", "amount_columns", "amount_tolerance"}
     if version >= 2:
         fields.add("reconciliation_mode")
-    if version == 3:
+    if version >= 3:
         fields.add("key_normalization")
+    if version == 4:
+        fields.add("comparison_fields")
     document = _object(document, fields, "Profile")
     if document["format"] != _FORMAT:
         raise ProfileError("Unsupported profile format.")
@@ -237,12 +279,19 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
     except AmountParseError:
         raise ProfileError("amount_tolerance must be valid finite monetary text.") from None
     return MappingProfile(
-        ColumnMapping(tuple(pairs), amounts["file_a"], amounts["file_b"]),
+        ColumnMapping(
+            tuple(pairs),
+            amounts["file_a"],
+            amounts["file_b"],
+            comparison_fields=(
+                _parse_comparison_fields(document["comparison_fields"]) if version == 4 else ()
+            ),
+        ),
         tolerance,
         reconciliation_mode=mode,
         key_normalization=(
             _parse_key_normalization(document["key_normalization"], len(pairs))
-            if version == 3
+            if version >= 3
             else None
         ),
     )

@@ -252,7 +252,7 @@ def test_physical_csv_shuffles_preserve_normalized_financial_results(mode) -> No
 @pytest.mark.parametrize(
     "formats", [("csv", "csv"), ("csv", "xlsx"), ("xlsx", "csv"), ("xlsx", "xlsx")]
 )
-def test_normalized_formats_and_profile_v3_match_independent_truth(
+def test_normalized_formats_and_profile_v4_match_independent_truth(
     mode, formats, xlsx_bytes
 ) -> None:
     pair = generate_pair(600, seed=42, workload="normalization")
@@ -263,7 +263,8 @@ def test_normalized_formats_and_profile_v3_match_independent_truth(
         key_normalization=CONFIG,
     )
     document = json.loads(profile_bytes)
-    assert document["version"] == 3
+    assert document["version"] == 4
+    assert document["comparison_fields"] == []
     assert document["key_normalization"] == list(NORMALIZATION_RULES)
     assert set(document) == {
         "format",
@@ -273,6 +274,7 @@ def test_normalized_formats_and_profile_v3_match_independent_truth(
         "amount_tolerance",
         "reconciliation_mode",
         "key_normalization",
+        "comparison_fields",
     }
     assert not any(
         scenario.raw_key_a[0].encode() in profile_bytes
