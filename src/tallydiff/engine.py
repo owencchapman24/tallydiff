@@ -80,7 +80,7 @@ def reconcile(
     Secondary fields compare distinct sets of original evidence strings, in
     configuration order. One-sided and UNIQUE duplicate-ambiguous groups retain
     their summaries as NOT_COMPARABLE. Secondary status does not change primary
-    categories, financial deltas, or exception membership.
+    categories or financial deltas. Any secondary MISMATCH additionally requires review.
     """
 
     if not isinstance(amount_tolerance, Decimal):

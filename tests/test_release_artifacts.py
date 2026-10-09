@@ -13,7 +13,7 @@ from scripts.check_release_artifacts import (
     check_release_artifacts,
 )
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 PACKAGE = f"tallydiff-{VERSION}"
 INFO = f"{PACKAGE}.dist-info"
 METADATA = (
@@ -144,7 +144,7 @@ def test_sdist_rejects_arbitrary_package_local_files(release, name):
 @pytest.mark.parametrize(
     "old,new",
     [
-        (b"Version: 0.4.0", b"Version: 0.3.0"),
+        (b"Version: 0.5.0", b"Version: 0.3.0"),
         (b"Name: tallydiff", b"Name: another-project"),
         (b"Requires-Python: >=3.12", b"Requires-Python: >=3.10"),
     ],

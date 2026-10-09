@@ -1,12 +1,11 @@
 # TallyDiff
 
-**TallyDiff (v0.5 development)** compares two structured financial exports locally
+**TallyDiff v0.5.0** compares two structured financial exports locally
 and explains which matching key groups account for their difference. Pair key columns, such as
 vendor and invoice number, then compare unique records or explicitly aggregate
 all rows sharing each key. Optional normalization handles known differences in
 key representation while preserving every original source row as evidence.
 Optional secondary fields compare additional evidence after keys are matched.
-Package metadata remains **0.4.0** until separate release preparation.
 
 - **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
   worksheet per workbook; multiple worksheets require an explicit choice.
@@ -370,7 +369,7 @@ blank or repeated key selections, invalid amount names, incomplete/repeated
 secondary selections, same-side amount/secondary overlap, and invalid or negative
 tolerance are rejected with a concise message. Key/secondary overlap is allowed.
 
-Package version **0.4.0** and profile schema version **4** are separate versions.
+Package version **0.5.0** and profile schema version **4** are separate versions.
 
 ## Supported inputs
 
