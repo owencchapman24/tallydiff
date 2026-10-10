@@ -137,12 +137,13 @@ def _semantics(result):
 
 @pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("formats", FORMATS)
-def test_realistic_comparison_schema_all_formats_and_v4_profile(mode, formats, xlsx_bytes):
+def test_realistic_comparison_schema_all_formats_and_v5_profile(mode, formats, xlsx_bytes):
     pair = generate_pair(300, seed=314, workload="comparison")
     mapping = comparison_mapping()
     data = export_mapping_profile(mapping, amount_tolerance=TOLERANCE, reconciliation_mode=mode)
     document = json.loads(data)
-    assert document["version"] == 4
+    assert document["version"] == 5
+    assert document["one_to_many_policy"] is None
     assert document["comparison_fields"] == [
         {"file_a": a, "file_b": b} for a, b in COMPARISON_MAPPINGS
     ]
@@ -157,6 +158,7 @@ def test_realistic_comparison_schema_all_formats_and_v4_profile(mode, formats, x
         "reconciliation_mode",
         "key_normalization",
         "comparison_fields",
+        "one_to_many_policy",
     }
     assert not any(scenario.key[0].encode() in data for scenario in pair.scenarios)
     profile = load_mapping_profile(data)
@@ -410,6 +412,7 @@ def test_legacy_profile_versions_imply_zero_comparisons_for_current_workload(ver
         )
     )
     document["version"] = version
+    del document["one_to_many_policy"]
     del document["comparison_fields"]
     if version < 3:
         del document["key_normalization"]

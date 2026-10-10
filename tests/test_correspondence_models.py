@@ -1055,7 +1055,7 @@ def test_current_engine_behavior_and_defaults_remain_unchanged(mode, normalized,
     assert result == expected == replace(expected, one_to_many_policy=None)
 
 
-def test_legacy_profile_identity_and_export_bytes_are_unchanged():
+def test_legacy_profile_loads_and_identity_and_csv_bytes_are_unchanged():
     mapping = ColumnMapping((("id", "ref"),), "amount", "gross")
     assert configuration_id(b"a", b"b", mapping, name_a="a.csv", name_b="b.csv") == (
         "21571386499163214f24658dc0194953102a80a80ae21faf91fd98d6ad4b1f34"
@@ -1086,7 +1086,11 @@ def test_legacy_profile_identity_and_export_bytes_are_unchanged():
   "comparison_fields": []
 }
 """
-    assert export_mapping_profile(mapping) == expected_profile
+    expected_current = expected_profile.replace(b'"version": 4', b'"version": 5').replace(
+        b'"comparison_fields": []\n',
+        b'"comparison_fields": [],\n  "one_to_many_policy": null\n',
+    )
+    assert export_mapping_profile(mapping) == expected_current
     assert load_mapping_profile(expected_profile).mapping == mapping
     result = reconcile((_record(Source.A, 2, "300"),), (_record(Source.B, 3, "301"),))
     expected_csv = (

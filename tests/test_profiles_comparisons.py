@@ -1,4 +1,4 @@
-"""Schema v4 secondary configuration and strict v1–v3 migration."""
+"""Current secondary configuration and strict historical schema compatibility."""
 
 import json
 from copy import deepcopy
@@ -81,12 +81,12 @@ def _boundary(kind, comparisons, document):
     return load_mapping_profile(json.dumps(document))
 
 
-@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
 @pytest.mark.parametrize("comparisons", [(), (DEPARTMENT,), (CURRENCY, DATE, DEPARTMENT)])
 @pytest.mark.parametrize(
     "configuration", [None, KeyNormalizationConfig((KeyNormalizationRules(),) * 2), ACTIVE]
 )
-def test_current_v4_schema_is_exact_deterministic_and_round_trips(mode, comparisons, configuration):
+def test_current_v5_schema_is_exact_deterministic_and_round_trips(mode, comparisons, configuration):
     mapping = _mapping(comparisons)
     tolerance = Decimal("0.000000000000000000000012345678900")
     with localcontext() as context:
@@ -105,7 +105,7 @@ def test_current_v4_schema_is_exact_deterministic_and_round_trips(mode, comparis
     )
     expected = {
         "format": "tallydiff-mapping-profile",
-        "version": 4,
+        "version": 5,
         "key_pairs": [{"file_a": "id_a", "file_b": "id_b"}, {"file_a": "ref_a", "file_b": "ref_b"}],
         "amount_columns": {"file_a": "amount", "file_b": "gross"},
         "amount_tolerance": "0.000000000000000000000012345678900",
@@ -114,10 +114,13 @@ def test_current_v4_schema_is_exact_deterministic_and_round_trips(mode, comparis
             {name: getattr(rule, name) for name in RULE_FIELDS} for rule in rules
         ],
         "comparison_fields": [{"file_a": c.file_a, "file_b": c.file_b} for c in comparisons],
+        "one_to_many_policy": (
+            "exact_unique_v1" if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY else None
+        ),
     }
     actual = json.loads(data)
     assert actual == expected
-    assert tuple(actual) == TOP_FIELDS
+    assert tuple(actual) == (*TOP_FIELDS, "one_to_many_policy")
     assert all(tuple(pair) == ("file_a", "file_b") for pair in actual["comparison_fields"])
     assert all(tuple(rule) == RULE_FIELDS for rule in actual["key_normalization"])
     assert data == (json.dumps(expected, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
@@ -341,7 +344,7 @@ def test_v4_preserves_strict_normalization_booleans(document, field, value):
         (3, ReconciliationMode.GROUPED_BY_KEY, True),
     ],
 )
-def test_historical_versions_load_without_comparisons_and_upgrade_to_v4(version, mode, active):
+def test_historical_versions_load_without_comparisons_and_upgrade_to_v5(version, mode, active):
     document = json.loads(V3_PROFILE)
     document["version"] = version
     if version == 1:
@@ -371,7 +374,8 @@ def test_historical_versions_load_without_comparisons_and_upgrade_to_v4(version,
         reconciliation_mode=profile.reconciliation_mode,
         key_normalization=profile.key_normalization,
     )
-    assert json.loads(upgraded)["version"] == 4
+    assert json.loads(upgraded)["version"] == 5
+    assert json.loads(upgraded)["one_to_many_policy"] is None
     assert json.loads(upgraded)["comparison_fields"] == []
     assert load_mapping_profile(upgraded) == profile
     assert json.loads(data) == document == before
@@ -470,4 +474,4 @@ def test_profiles_never_process_source_records_comparisons_or_normalization(monk
         ("id_a", "ref_a", "amount", "Department", "Currency", "Posting Date"),
         ("id_b", "ref_b", "gross", "Cost Center", "Currency Code", "Document Date"),
     )
-    assert tuple(json.loads(data)) == TOP_FIELDS
+    assert tuple(json.loads(data)) == (*TOP_FIELDS, "one_to_many_policy")

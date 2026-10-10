@@ -8,6 +8,9 @@ from decimal import Decimal
 from tallydiff.configuration import ColumnMapping as ColumnMapping
 from tallydiff.ingest import IngestionError
 from tallydiff.models import (
+    EXACT_UNIQUE_ONE_TO_MANY_POLICY,
+    CorrespondenceReason,
+    CorrespondenceStatus,
     FindingCategory,
     ReconciliationFinding,
     ReconciliationMode,
@@ -29,6 +32,22 @@ CATEGORY_LABELS = {
 MODE_LABELS = {
     ReconciliationMode.UNIQUE: "Unique records",
     ReconciliationMode.GROUPED_BY_KEY: "Group by matching key",
+}
+
+CORRESPONDENCE_STATUS_LABELS = {
+    CorrespondenceStatus.UNIQUE_EXACT: "Unique exact subset",
+    CorrespondenceStatus.AMBIGUOUS: "Ambiguous exact subsets",
+    CorrespondenceStatus.NO_EXACT_SUBSET: "No exact subset",
+    CorrespondenceStatus.SINGLETON_ONLY: "Singleton match only",
+    CorrespondenceStatus.BOUND_EXCEEDED: "Search bound exceeded",
+    CorrespondenceStatus.NOT_ELIGIBLE: "Not eligible for subset search",
+}
+
+CORRESPONDENCE_REASON_LABELS = {
+    CorrespondenceReason.BOTH_SIDES_MULTIPLE: "Multiple records on both sides",
+    CorrespondenceReason.MISSING_OPPOSITE_SIDE: "Missing records on the opposite side",
+    CorrespondenceReason.CANDIDATE_ROW_LIMIT: "Candidate row limit exceeded",
+    CorrespondenceReason.RUN_BUDGET_EXHAUSTED: "Run search budget exhausted",
 }
 
 
@@ -71,6 +90,7 @@ def configuration_id(
     and component order are included as primitive data, independently of UI labels.
     Nonempty secondary mappings append their exact directional editing values,
     including incomplete selections. Empty comparisons preserve existing digests.
+    Bounded mode appends its fixed policy identifier after those optional components.
     """
 
     if not isinstance(reconciliation_mode, ReconciliationMode):
@@ -115,6 +135,8 @@ def configuration_id(
                 ]
             }
         )
+    if reconciliation_mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+        identity.append({"one_to_many_policy": EXACT_UNIQUE_ONE_TO_MANY_POLICY.policy_id})
     return hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
@@ -125,7 +147,7 @@ def display_amount(amount: Decimal, *, signed: bool = False) -> str:
 
 
 def finding_rows(findings: Sequence[ReconciliationFinding]) -> list[dict[str, str]]:
-    """Summarize findings; secondary differences name fields without flattening evidence."""
+    """Summarize findings, appending metadata columns only when evidence is present."""
 
     rows = [
         {
@@ -144,6 +166,13 @@ def finding_rows(findings: Sequence[ReconciliationFinding]) -> list[dict[str, st
             row["Secondary differences"] = "; ".join(
                 f"{comparison.mapping.file_a} ↔ {comparison.mapping.file_b}"
                 for comparison in finding.secondary_mismatches
+            )
+    if any(finding.correspondence_analysis is not None for finding in findings):
+        for row, finding in zip(rows, findings, strict=True):
+            row["Correspondence status"] = (
+                CORRESPONDENCE_STATUS_LABELS[finding.correspondence_status]
+                if finding.correspondence_analysis is not None
+                else ""
             )
     return rows
 

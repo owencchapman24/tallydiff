@@ -347,7 +347,8 @@ def test_profile_download_apply_sample_round_trip_and_manual_edits(
     data = downloaded_profile["data"]
     assert downloaded_profile["filename"] == "tallydiff_profile.json"
     assert load_mapping_profile(data).amount_tolerance.as_tuple() == Decimal("0.0100").as_tuple()
-    assert json.loads(data)["version"] == 4
+    assert json.loads(data)["version"] == 5
+    assert json.loads(data)["one_to_many_policy"] is None
     assert json.loads(data)["reconciliation_mode"] == mode.value
     app.button(key="run").click().run()
     original_identity = app.session_state["completed"][0]
@@ -875,7 +876,8 @@ def test_applying_v1_profile_restores_unique_only_after_explicit_apply(
     assert app.radio(key="reconciliation_mode").value is ReconciliationMode.UNIQUE
     assert app.text_input(key="amount_tolerance").value == "0.0100"
     exported = json.loads(downloaded_profile["data"])
-    assert exported["version"] == 4 and exported["reconciliation_mode"] == "unique"
+    assert exported["version"] == 5 and exported["reconciliation_mode"] == "unique"
+    assert exported["one_to_many_policy"] is None
 
     app.button(key="run").click().run()
     assert not app.exception

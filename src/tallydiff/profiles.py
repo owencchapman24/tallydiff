@@ -7,11 +7,11 @@ from decimal import Decimal, InvalidOperation
 
 from tallydiff.amounts import AmountParseError, parse_amount
 from tallydiff.configuration import ColumnMapping, ComparisonFieldMapping
-from tallydiff.models import ReconciliationMode
+from tallydiff.models import EXACT_UNIQUE_ONE_TO_MANY_POLICY, OneToManyPolicy, ReconciliationMode
 from tallydiff.normalization_config import KeyNormalizationConfig, KeyNormalizationRules
 
 _FORMAT = "tallydiff-mapping-profile"
-_VERSION = 4
+_VERSION = 5
 _RULE_FIELDS = ("casefold", "collapse_whitespace", "remove_punctuation", "strip_leading_zeros")
 
 
@@ -89,19 +89,19 @@ class MappingProfile:
             raise ProfileError("amount_tolerance must be finite and zero or greater.")
         if not isinstance(self.reconciliation_mode, ReconciliationMode):
             raise ProfileError("reconciliation_mode must be a ReconciliationMode enum member.")
-        if self.reconciliation_mode not in (
-            ReconciliationMode.UNIQUE,
-            ReconciliationMode.GROUPED_BY_KEY,
-        ):
-            raise ProfileError(
-                "Unsupported reconciliation_mode; profiles v1-v4 support only "
-                "unique or grouped_by_key."
-            )
         object.__setattr__(
             self,
             "key_normalization",
             _canonical_key_normalization(self.key_normalization, len(pairs)),
         )
+
+    @property
+    def one_to_many_policy(self) -> OneToManyPolicy | None:
+        """The mode determines the fixed policy; profiles cannot configure bounds."""
+
+        if self.reconciliation_mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+            return EXACT_UNIQUE_ONE_TO_MANY_POLICY
+        return None
 
     def validate_columns(self, columns_a: Sequence[str], columns_b: Sequence[str]) -> None:
         """Reject missing directional columns before any configuration is applied."""
@@ -133,7 +133,7 @@ def export_mapping_profile(
     reconciliation_mode: ReconciliationMode = ReconciliationMode.UNIQUE,
     key_normalization: KeyNormalizationConfig | None = None,
 ) -> bytes:
-    """Serialize v4 configuration to UTF-8 JSON, retaining all tolerance digits.
+    """Serialize v5 configuration to UTF-8 JSON, retaining all tolerance digits.
 
     Exact matching is always an array of all-false rule objects, one per key pair.
     Ordered secondary mappings contain only directional column names. No source
@@ -160,6 +160,9 @@ def export_mapping_profile(
             {"file_a": mapping.file_a, "file_b": mapping.file_b}
             for mapping in profile.mapping.comparison_fields
         ],
+        "one_to_many_policy": (
+            profile.one_to_many_policy.policy_id if profile.one_to_many_policy is not None else None
+        ),
     }
     return (json.dumps(document, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
 
@@ -222,10 +225,11 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
     """Parse and validate a profile atomically, returning structured configuration.
 
     Column compatibility is checked separately by MappingProfile.validate_columns.
-    Version 1 implies UNIQUE; versions 2–4 require an exact supported mode.
-    Versions 1 and 2 imply no normalization. Versions 3 and 4 require ordered rule
+    Version 1 implies UNIQUE; versions 2–4 accept only the two historical modes.
+    Version 5 accepts all modes and requires their corresponding policy identifier.
+    Versions 1 and 2 imply no normalization. Versions 3–5 require ordered rule
     objects; all-false rules canonicalize to None through the MappingProfile model.
-    Versions 1–3 imply no comparisons. Version 4 requires ordered secondary mappings.
+    Versions 1–3 imply no comparisons. Versions 4–5 require ordered secondary mappings.
     No numeric tolerance is coerced, and no files or reconciliation data are read.
     """
 
@@ -246,15 +250,17 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
     if "version" not in document:
         raise ProfileError("Profile must contain the required fields: version.")
     version = document["version"]
-    if type(version) is not int or version not in (1, 2, 3, 4):
-        raise ProfileError("Unsupported profile version; expected version 1, 2, 3, or 4.")
+    if type(version) is not int or version not in (1, 2, 3, 4, 5):
+        raise ProfileError("Unsupported profile version; expected version 1, 2, 3, 4, or 5.")
     fields = {"format", "version", "key_pairs", "amount_columns", "amount_tolerance"}
     if version >= 2:
         fields.add("reconciliation_mode")
     if version >= 3:
         fields.add("key_normalization")
-    if version == 4:
+    if version >= 4:
         fields.add("comparison_fields")
+    if version == 5:
+        fields.add("one_to_many_policy")
     document = _object(document, fields, "Profile")
     if document["format"] != _FORMAT:
         raise ProfileError("Unsupported profile format.")
@@ -267,8 +273,26 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
             mode = ReconciliationMode(raw_mode)
         except ValueError:
             raise ProfileError(
-                "Unsupported reconciliation_mode; expected unique or grouped_by_key."
+                "Unsupported reconciliation_mode; expected unique or grouped_by_key"
+                + (" or bounded_one_to_many." if version == 5 else ".")
             ) from None
+        if version < 5 and mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+            raise ProfileError(
+                "Unsupported reconciliation_mode; profiles v1-v4 support only "
+                "unique or grouped_by_key."
+            )
+    if version == 5:
+        raw_policy = document["one_to_many_policy"]
+        if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+            if (
+                type(raw_policy) is not str
+                or raw_policy != EXACT_UNIQUE_ONE_TO_MANY_POLICY.policy_id
+            ):
+                raise ProfileError(
+                    'one_to_many_policy must be "exact_unique_v1" for bounded_one_to_many.'
+                )
+        elif raw_policy is not None:
+            raise ProfileError("one_to_many_policy must be null for unique or grouped_by_key.")
     raw_pairs = document["key_pairs"]
     if not isinstance(raw_pairs, list):
         raise ProfileError("key_pairs must be an array of key mappings.")
@@ -292,7 +316,7 @@ def load_mapping_profile(data: bytes | str) -> MappingProfile:
             amounts["file_a"],
             amounts["file_b"],
             comparison_fields=(
-                _parse_comparison_fields(document["comparison_fields"]) if version == 4 else ()
+                _parse_comparison_fields(document["comparison_fields"]) if version >= 4 else ()
             ),
         ),
         tolerance,

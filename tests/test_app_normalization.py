@@ -257,7 +257,8 @@ def test_normalized_profile_download_apply_and_filename_identity(review_download
     _simple_mapping(app)
     _set_flags(app, casefold=True)
     manual_profile = json.loads(review_downloads["Download mapping profile"])
-    assert manual_profile["version"] == 4
+    assert manual_profile["version"] == 5
+    assert manual_profile["one_to_many_policy"] is None
     assert manual_profile["comparison_fields"] == []
     assert manual_profile["key_normalization"] == [
         dict(zip(FIELDS, (True, False, False, False), strict=True))
@@ -335,6 +336,7 @@ def test_legacy_and_exact_v3_profiles_explicitly_clear_every_rule(version, mode)
         )
     )
     profile["version"] = version
+    profile.pop("one_to_many_policy")
     profile.pop("comparison_fields")
     if version < 3:
         profile.pop("key_normalization")

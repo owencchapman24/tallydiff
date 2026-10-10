@@ -166,6 +166,11 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
     if st.button("Apply profile", key="apply_profile", disabled=upload is None):
         try:
             profile = load_mapping_profile(upload.getvalue())
+            if profile.reconciliation_mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+                raise ProfileError(
+                    "Cannot apply profile: bounded one-to-many mode is not yet available "
+                    "in this interface."
+                )
             profile.validate_columns(columns_a, columns_b)
         except ProfileError as exc:
             st.error(str(exc))
