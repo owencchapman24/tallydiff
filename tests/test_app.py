@@ -64,18 +64,23 @@ def _simple_mapping(app: AppTest) -> None:
     app.run()
 
 
-def test_mode_radio_remains_limited_to_the_two_legacy_modes():
+def test_mode_radio_exposes_three_modes_in_order():
     app = _uploaded_app(b"id,amount\nINV,300\n", b"id,amount\nINV,100\nINV,200\n")
     mode_radio = app.radio(key="reconciliation_mode")
-    assert mode_radio.options == ["Unique records", "Group by matching key"]
+    assert mode_radio.options == ["Unique records", "Group by matching key", "Bounded one-to-many"]
     assert mode_radio.value is ReconciliationMode.UNIQUE
     mode_radio.set_value(ReconciliationMode.GROUPED_BY_KEY).run()
     assert not app.exception
     assert app.radio(key="reconciliation_mode").options == [
         "Unique records",
         "Group by matching key",
+        "Bounded one-to-many",
     ]
     assert app.radio(key="reconciliation_mode").value is ReconciliationMode.GROUPED_BY_KEY
+    app.radio(key="reconciliation_mode").set_value(ReconciliationMode.BOUNDED_ONE_TO_MANY).run()
+    assert not app.exception
+    assert app.radio(key="reconciliation_mode").value is ReconciliationMode.BOUNDED_ONE_TO_MANY
+    assert app.radio(key="reconciliation_mode").options == mode_radio.options
 
 
 def _select_first_finding(app: AppTest) -> None:
@@ -698,7 +703,7 @@ def test_mode_control_defaults_to_unique_records_and_discloses_result_mode() -> 
     control = app.radio(key="reconciliation_mode")
 
     assert control.label == "Reconciliation mode"
-    assert control.options == ["Unique records", "Group by matching key"]
+    assert control.options == ["Unique records", "Group by matching key", "Bounded one-to-many"]
     assert control.value is ReconciliationMode.UNIQUE
     assert any(
         "Duplicate matching keys remain ambiguous and require review." == caption.value

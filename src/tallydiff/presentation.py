@@ -32,6 +32,7 @@ CATEGORY_LABELS = {
 MODE_LABELS = {
     ReconciliationMode.UNIQUE: "Unique records",
     ReconciliationMode.GROUPED_BY_KEY: "Group by matching key",
+    ReconciliationMode.BOUNDED_ONE_TO_MANY: "Bounded one-to-many",
 }
 
 CORRESPONDENCE_STATUS_LABELS = {

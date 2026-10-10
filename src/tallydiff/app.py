@@ -12,12 +12,15 @@ from tallydiff import (
     AmountParseError,
     ColumnMapping,
     ComparisonFieldMapping,
+    CorrespondenceReason,
+    CorrespondenceStatus,
     FindingCategory,
     IngestionError,
     KeyNormalizationConfig,
     KeyNormalizationError,
     KeyNormalizationRules,
     NormalizationCollisionError,
+    OneToManyPolicy,
     ProfileError,
     ReconciliationFinding,
     ReconciliationIntegrityError,
@@ -38,6 +41,8 @@ from tallydiff import (
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
+    CORRESPONDENCE_REASON_LABELS,
+    CORRESPONDENCE_STATUS_LABELS,
     EXCEPTION_CATEGORIES,
     EXCEPTION_SORT_LABELS,
     MODE_LABELS,
@@ -166,11 +171,6 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
     if st.button("Apply profile", key="apply_profile", disabled=upload is None):
         try:
             profile = load_mapping_profile(upload.getvalue())
-            if profile.reconciliation_mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
-                raise ProfileError(
-                    "Cannot apply profile: bounded one-to-many mode is not yet available "
-                    "in this interface."
-                )
             profile.validate_columns(columns_a, columns_b)
         except ProfileError as exc:
             st.error(str(exc))
@@ -391,7 +391,112 @@ def _show_normalization_collisions(error: NormalizationCollisionError) -> None:
                     _show_evidence(original.records, source)
 
 
-def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_key: str) -> None:
+def _reference_rows(rows: tuple[SourceRecord, ...]) -> list[dict[str, str | int]]:
+    """Compact original record references; full raw evidence remains below."""
+
+    return [
+        {
+            "Source": f"File {row.source.value}",
+            "Source row": row.source_row,
+            "Amount": display_amount(row.amount),
+            "Original key": json.dumps(row.key, ensure_ascii=False),
+        }
+        for row in rows
+    ]
+
+
+def _show_references(label: str, rows: tuple[SourceRecord, ...]) -> None:
+    st.markdown(f"**{label}**")
+    st.dataframe(_reference_rows(rows), hide_index=True, width="stretch")
+
+
+def _show_correspondence(finding: ReconciliationFinding, policy: OneToManyPolicy) -> None:
+    """Display the stored analysis without searching or reallocating parent records."""
+
+    analysis = finding.correspondence_analysis
+    st.subheader("Correspondence analysis")
+    st.text(f"Status: {CORRESPONDENCE_STATUS_LABELS[analysis.status]}")
+    if analysis.reason is not None:
+        st.text(f"Reason: {CORRESPONDENCE_REASON_LABELS[analysis.reason]}")
+    st.text(
+        f"Search complete: {'Yes' if analysis.search_complete else 'No'}\n"
+        f"Planned combinations: {analysis.planned_combinations:,}\n"
+        f"Examined combinations: {analysis.examined_combinations:,}\n"
+        f"Reserved combinations: {analysis.reserved_combinations:,}"
+    )
+    # A singleton witness has no intrinsic direction; the complete parent does.
+    anchor = None
+    if len(finding.rows_a) == 1 and len(finding.rows_b) > 1:
+        anchor = finding.rows_a[0]
+    elif len(finding.rows_b) == 1 and len(finding.rows_a) > 1:
+        anchor = finding.rows_b[0]
+    if anchor is not None:
+        _show_references("Search anchor", (anchor,))
+
+    if analysis.status is CorrespondenceStatus.UNIQUE_EXACT:
+        st.markdown("**Inferred exact correspondence — review required**")
+        solution = analysis.accepted_solution
+        selected = solution.rows_b if anchor.source is Source.A else solution.rows_a
+        _show_references("Selected subset records", selected)
+        residuals = analysis.unassigned_rows_a + analysis.unassigned_rows_b
+        if residuals:
+            st.subheader("Unassigned residual records")
+            st.caption(
+                "These records remain part of the parent finding and its complete financial delta."
+            )
+            st.dataframe(_reference_rows(residuals), hide_index=True, width="stretch")
+    elif analysis.status is CorrespondenceStatus.AMBIGUOUS:
+        st.caption(
+            "At least two physical-row exact solutions were found; TallyDiff did not choose one."
+        )
+        if not analysis.search_complete:
+            st.caption(
+                "At least two exact solutions were found; enumeration stopped once ambiguity "
+                "was proven."
+            )
+        for index, witness in enumerate(analysis.ambiguity_witnesses, start=1):
+            _show_references(f"Candidate witness {index}", witness.rows_a + witness.rows_b)
+    elif analysis.status is CorrespondenceStatus.SINGLETON_ONLY:
+        st.caption(
+            "A one-row candidate solution exists, but bounded one-to-many mode does not "
+            "promote one-to-one matching inside a duplicate group."
+        )
+        witness = analysis.ambiguity_witnesses[0]
+        _show_references("Singleton candidate witness", witness.rows_a + witness.rows_b)
+    elif analysis.status is CorrespondenceStatus.NO_EXACT_SUBSET:
+        st.caption(
+            "The complete bounded search found no physical-row subset whose amount equals "
+            "the anchor exactly."
+        )
+    elif analysis.reason is CorrespondenceReason.CANDIDATE_ROW_LIMIT:
+        st.caption(
+            f"This group exceeds the policy limit of {policy.max_candidate_rows:,} candidate rows. "
+            "The search was not started."
+        )
+    elif analysis.reason is CorrespondenceReason.RUN_BUDGET_EXHAUSTED:
+        st.caption(
+            "The complete search for this group was not started because its full planned cost "
+            "could not be reserved under the deterministic per-run budget."
+        )
+    elif analysis.reason is CorrespondenceReason.BOTH_SIDES_MULTIPLE:
+        st.caption("v0.6 does not perform many-to-many allocation or partition search.")
+    elif analysis.reason is CorrespondenceReason.MISSING_OPPOSITE_SIDE:
+        st.caption(
+            "This duplicate group lacks an opposite-side anchor and cannot undergo "
+            "one-to-many inference."
+        )
+    if analysis.status is not CorrespondenceStatus.UNIQUE_EXACT:
+        _show_references(
+            "Unassigned parent records", analysis.unassigned_rows_a + analysis.unassigned_rows_b
+        )
+
+
+def _show_finding_table(
+    findings: tuple[ReconciliationFinding, ...],
+    *,
+    table_key: str,
+    one_to_many_policy: OneToManyPolicy | None = None,
+) -> None:
     st.caption("Select a row to inspect its original source records below.")
     event = st.dataframe(
         finding_rows(findings),
@@ -406,6 +511,8 @@ def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_ke
     if event.selection.rows:
         finding = findings[event.selection.rows[0]]
         st.text(f"Selected key: {' / '.join(finding.key)}")
+        if finding.correspondence_analysis is not None:
+            _show_correspondence(finding, one_to_many_policy)
         if finding.field_comparisons:
             st.subheader("Secondary comparison details")
             st.dataframe(
@@ -427,6 +534,11 @@ def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_ke
                 hide_index=True,
                 width="stretch",
             )
+            if finding.correspondence_analysis is not None:
+                st.caption(
+                    "Secondary fields are retained as evidence but were not used to select "
+                    "or disambiguate this correspondence."
+                )
         st.caption(
             "CSV evidence preserves parsed text; source numbers count logical records. "
             "XLSX evidence shows underlying cell values, not display formatting; "
@@ -439,7 +551,12 @@ def _show_finding_table(findings: tuple[ReconciliationFinding, ...], *, table_ke
             _show_evidence(finding.rows_b, Source.B)
 
 
-def _show_exception_review(findings: tuple[ReconciliationFinding, ...], *, identity: str) -> None:
+def _show_exception_review(
+    findings: tuple[ReconciliationFinding, ...],
+    *,
+    identity: str,
+    one_to_many_policy: OneToManyPolicy | None = None,
+) -> None:
     query = st.text_input(
         "Search matching keys",
         key=f"review_search_{identity}",
@@ -505,7 +622,11 @@ def _show_exception_review(findings: tuple[ReconciliationFinding, ...], *, ident
     if has_comparisons:
         view_state.append(secondary_only)
     view_id = sha256(json.dumps(view_state).encode("utf-8")).hexdigest()
-    _show_finding_table(visible, table_key=f"exceptions_{identity}_{view_id}")
+    _show_finding_table(
+        visible,
+        table_key=f"exceptions_{identity}_{view_id}",
+        one_to_many_policy=one_to_many_policy,
+    )
 
 
 def _show_results(
@@ -541,6 +662,22 @@ def _show_results(
             "Grouped results compare totals for each matching key; "
             "they do not claim that individual rows correspond."
         )
+    elif result.mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+        policy = result.one_to_many_policy
+        st.text(
+            f"Inferred correspondence policy: {policy.policy_id}\n"
+            f"Maximum candidate rows: {policy.max_candidate_rows:,}\n"
+            f"Maximum planned combinations per run: {policy.max_planned_combinations_per_run:,}\n"
+            f"Exact amounts only: {'Yes' if policy.exact_amounts_only else 'No'}\n"
+            f"Physical-row uniqueness: {'Yes' if policy.physical_row_uniqueness else 'No'}\n"
+            "Singleton alternatives count as rivals: "
+            f"{'Yes' if policy.singleton_rivals_count else 'No'}"
+        )
+        st.caption(
+            "Correspondence is inferred under this fixed policy. An accepted subset proves "
+            "amount consistency under this policy. It does not establish which source is "
+            "authoritative or prove business transaction identity."
+        )
 
     if result.comparison_fields:
         st.text("Secondary comparisons: exact original evidence")
@@ -570,6 +707,21 @@ def _show_results(
         st.caption(
             "Primary category counts describe amount/presence. "
             "An Exact match or Within tolerance group may still require secondary review."
+        )
+    if result.mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+        st.subheader("Correspondence summary")
+        analyzed = result.correspondence_analysis_findings
+        left, right = st.columns(2)
+        left.metric("Analyzed duplicate groups", str(len(analyzed)))
+        right.metric("Inferred correspondences", str(len(result.inferred_correspondence_findings)))
+        statuses = Counter(finding.correspondence_status for finding in analyzed)
+        st.caption(
+            "Unresolved analyzed groups: "
+            + "; ".join(
+                f"{label}: {statuses[status]:,}"
+                for status, label in CORRESPONDENCE_STATUS_LABELS.items()
+                if status is not CorrespondenceStatus.UNIQUE_EXACT
+            )
         )
 
     exceptions = result.exceptions
@@ -611,7 +763,9 @@ def _show_results(
             key=f"download_{identity}",
             on_click="ignore",
         )
-        _show_exception_review(exceptions, identity=identity)
+        _show_exception_review(
+            exceptions, identity=identity, one_to_many_policy=result.one_to_many_policy
+        )
     if tolerated:
         st.subheader("Within tolerance")
         st.metric(
@@ -673,19 +827,36 @@ def main() -> None:
     st.session_state.setdefault("reconciliation_mode", ReconciliationMode.UNIQUE)
     mode = st.radio(
         "Reconciliation mode",
-        (ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY),
+        (
+            ReconciliationMode.UNIQUE,
+            ReconciliationMode.GROUPED_BY_KEY,
+            ReconciliationMode.BOUNDED_ONE_TO_MANY,
+        ),
         format_func=MODE_LABELS.__getitem__,
         key="reconciliation_mode",
         horizontal=True,
         on_change=_clear_result,
     )
-    st.caption(
-        "Rows sharing the same matching key are totaled on each side "
-        "and the key totals are compared. "
-        "This does not claim that individual rows correspond."
-        if mode is ReconciliationMode.GROUPED_BY_KEY
-        else "Duplicate matching keys remain ambiguous and require review."
-    )
+    if mode is ReconciliationMode.UNIQUE:
+        st.caption("Duplicate matching keys remain ambiguous and require review.")
+    elif mode is ReconciliationMode.GROUPED_BY_KEY:
+        st.caption(
+            "Rows sharing the same matching key are totaled on each side "
+            "and the key totals are compared. "
+            "This does not claim that individual rows correspond."
+        )
+    else:
+        st.caption(
+            "TallyDiff may explain one source row using one uniquely determined exact subset "
+            "of rows on the opposite side, within fixed search limits. "
+            "Inferred correspondence always requires review."
+        )
+        st.caption(
+            "Ordinary deterministic one-row-per-side groups retain normal secondary comparison. "
+            "Duplicate-shaped groups undergoing correspondence analysis report secondary fields "
+            "as NOT_COMPARABLE. Secondary fields do not select, rank, or disambiguate "
+            "financial subsets."
+        )
     st.session_state.setdefault("amount_tolerance", "0")
     tolerance_text = st.text_input(
         "Amount tolerance",
@@ -696,6 +867,12 @@ def main() -> None:
         "The boundary is inclusive; 0 requires exact equality. Actual deltas stay visible.",
         on_change=_clear_result,
     )
+    if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+        st.caption(
+            "Amount tolerance applies only to ordinary one-row-per-side comparisons. "
+            "Subset inference requires exact Decimal equality. Residual-bearing inferred groups "
+            "remain Amount mismatch even when their residual delta is within tolerance."
+        )
     try:
         amount_tolerance = parse_amount(tolerance_text)
         if amount_tolerance < 0:
