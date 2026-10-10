@@ -25,6 +25,7 @@ PACKAGE_MODULES = frozenset(
         "normalization_config",
         "presentation",
         "profiles",
+        "subset_matching",
         "xlsx",
     )
 )

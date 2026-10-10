@@ -59,6 +59,7 @@ only-include = [
     "src/tallydiff/normalization_config.py",
     "src/tallydiff/presentation.py",
     "src/tallydiff/profiles.py",
+    "src/tallydiff/subset_matching.py",
     "src/tallydiff/xlsx.py",
 ]
 sources = ["src"]
@@ -78,6 +79,7 @@ include = [
     "/src/tallydiff/normalization_config.py",
     "/src/tallydiff/presentation.py",
     "/src/tallydiff/profiles.py",
+    "/src/tallydiff/subset_matching.py",
     "/src/tallydiff/xlsx.py",
     "/tests/*.py",
     "/scripts/*.py",

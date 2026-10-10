@@ -2,6 +2,8 @@
 
 import io
 import tarfile
+import tomllib
+from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
@@ -64,6 +66,35 @@ def test_valid_artifacts_preserve_runtime_and_repository_files(release):
     assert check(release) == (len(wheel), len(source))
 
 
+def test_subset_matching_is_in_each_runtime_allowlist_exactly_once():
+    project = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+    targets = config["tool"]["hatch"]["build"]["targets"]
+    assert targets["wheel"]["only-include"].count("src/tallydiff/subset_matching.py") == 1
+    assert targets["sdist"]["include"].count("/src/tallydiff/subset_matching.py") == 1
+    assert "tallydiff/subset_matching.py" in PACKAGE_MODULES
+
+
+def test_subset_matching_ships_exactly_once_in_both_archives(release):
+    _, dist, _, _ = release
+    check(release)
+    with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl") as archive:
+        assert archive.namelist().count("tallydiff/subset_matching.py") == 1
+    with tarfile.open(dist / f"{PACKAGE}.tar.gz", "r:gz") as archive:
+        assert archive.getnames().count(f"{PACKAGE}/src/tallydiff/subset_matching.py") == 1
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "sdist"])
+def test_subset_matching_source_bytes_must_match_checkout(release, artifact):
+    _, _, wheel, source = release
+    if artifact == "wheel":
+        wheel["tallydiff/subset_matching.py"] = b"# stale subset search"
+    else:
+        source[f"{PACKAGE}/src/tallydiff/subset_matching.py"] = b"# stale subset search"
+    with pytest.raises(ArtifactContentError, match="differs from current project"):
+        check(release)
+
+
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 @pytest.mark.parametrize(
     "name",
@@ -116,7 +147,9 @@ def test_sdist_rejects_arbitrary_untracked_root_files(release):
 
 
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
-@pytest.mark.parametrize("module", ["engine", "normalization", "normalization_config"])
+@pytest.mark.parametrize(
+    "module", ["engine", "normalization", "normalization_config", "subset_matching"]
+)
 def test_required_runtime_module_cannot_be_omitted(release, artifact, module):
     _, _, wheel, source = release
     del (wheel if artifact == "wheel" else source)[
