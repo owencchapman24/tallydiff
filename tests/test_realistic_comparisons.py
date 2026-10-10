@@ -135,7 +135,7 @@ def _semantics(result):
     )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("formats", FORMATS)
 def test_realistic_comparison_schema_all_formats_and_v4_profile(mode, formats, xlsx_bytes):
     pair = generate_pair(300, seed=314, workload="comparison")
@@ -194,7 +194,7 @@ def ci_comparison_exports():
     return pair, _ingest_pair(pair)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_twenty_thousand_groups_full_comparison_integrity(ci_comparison_exports, mode):
     pair, inputs = ci_comparison_exports
     mapping = comparison_mapping()
@@ -226,7 +226,7 @@ def test_twenty_thousand_groups_full_comparison_integrity(ci_comparison_exports,
     assert export_exceptions_csv(result) == report
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_physical_shuffle_changes_row_references_without_changing_comparison_truth(mode):
     outputs = []
     trace_positions = []
@@ -243,7 +243,7 @@ def test_physical_shuffle_changes_row_references_without_changing_comparison_tru
     assert trace_positions[0] != trace_positions[1]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_review_filters_do_not_change_complete_secondary_exception_export(mode):
     pair = generate_pair(300, seed=42, workload="comparison")
     inputs = _ingest_pair(pair)
@@ -272,7 +272,7 @@ def test_review_filters_do_not_change_complete_secondary_exception_export(mode):
     verify_comparison_result(*inputs, result, report, truth)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_key_normalization_joins_identifiers_while_secondary_evidence_stays_original(mode):
     mapping = replace(
         comparison_mapping(),
@@ -349,7 +349,7 @@ def test_key_normalization_joins_identifiers_while_secondary_evidence_stays_orig
     assert json.loads(row["Comparison 1 File A values — Vendor ID"]) == ["ACME-01"]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("source", list(Source))
 def test_same_source_normalization_collision_blocks_before_comparison_results(
     mode, source, monkeypatch
@@ -436,7 +436,7 @@ def test_legacy_profile_versions_imply_zero_comparisons_for_current_workload(ver
         ("2026-01-02", datetime(2026, 1, 2), "2026-01-02T00:00:00", "mismatch"),
     ],
 )
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_csv_and_typed_xlsx_values_compare_exact_observed_representations(
     csv_value, xlsx_value, observed, status, mode, xlsx_bytes
 ):
@@ -575,7 +575,7 @@ def test_high_cardinality_distinct_sets_keep_all_rows_and_export_every_original_
     assert row["File B records"] == "; ".join(str(n) for n in range(2, len(b) + 2))
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_zero_comparison_export_remains_exact_historical_seven_column_bytes(mode):
     a = ingest_csv(
         "id,amount\r\nA,100.00\r\nB,0.00\r\nD,10.00\r\n",

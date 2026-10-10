@@ -21,6 +21,32 @@ MAPPING = ColumnMapping(
 COLUMNS_A = ("Vendor ID", "Invoice Number", "Invoice Amount")
 COLUMNS_B = ("Supplier", "Invoice Ref", "Gross Amount")
 
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_historical_profile_schemas_reject_bounded_one_to_many(version):
+    document = json.loads(export_mapping_profile(MAPPING))
+    document["version"] = version
+    document["reconciliation_mode"] = "bounded_one_to_many"
+    if version < 4:
+        del document["comparison_fields"]
+    if version < 3:
+        del document["key_normalization"]
+    with pytest.raises(
+        ProfileError, match="required fields" if version == 1 else "unique or grouped_by_key"
+    ):
+        load_mapping_profile(json.dumps(document))
+
+
+def test_mapping_profile_rejects_bounded_mode_until_schema_v5():
+    with pytest.raises(ProfileError, match="profiles v1-v4"):
+        MappingProfile(MAPPING, reconciliation_mode=ReconciliationMode.BOUNDED_ONE_TO_MANY)
+
+
+def test_v4_writer_rejects_bounded_mode():
+    with pytest.raises(ProfileError, match="profiles v1-v4"):
+        export_mapping_profile(MAPPING, reconciliation_mode=ReconciliationMode.BOUNDED_ONE_TO_MANY)
+
+
 V1_PROFILE = b"""{
   "format": "tallydiff-mapping-profile",
   "version": 1,
@@ -58,7 +84,7 @@ def v2_document() -> dict:
     return profile
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_serialized_profile_has_only_versioned_configuration_fields(
     mode: ReconciliationMode,
 ) -> None:
@@ -92,7 +118,7 @@ def test_serialized_profile_has_only_versioned_configuration_fields(
     assert PresentationColumnMapping is ColumnMapping
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", ["0", "0.0100", "0.000000000000000000000012345678900"])
 def test_round_trip_preserves_order_and_exact_decimal_digits(
     tolerance: str, mode: ReconciliationMode
@@ -217,7 +243,7 @@ def test_export_rejects_incomplete_configuration_and_non_decimal_tolerance() -> 
         export_mapping_profile(MAPPING, amount_tolerance=0.01)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("side", ["A", "B"])
 def test_compatibility_reports_exact_missing_directional_columns(
     side: str, mode: ReconciliationMode
@@ -230,7 +256,7 @@ def test_compatibility_reports_exact_missing_directional_columns(
         profile.validate_columns(a, b)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_compatibility_checks_amount_columns_and_never_swaps_sides_or_guesses(
     mode: ReconciliationMode,
 ) -> None:
@@ -245,7 +271,7 @@ def test_compatibility_checks_amount_columns_and_never_swaps_sides_or_guesses(
         profile.validate_columns(("vendor id", *COLUMNS_A[1:]), COLUMNS_B)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_extra_columns_and_changed_header_order_remain_compatible(mode: ReconciliationMode) -> None:
     profile = MappingProfile(MAPPING, reconciliation_mode=mode)
     profile.validate_columns((*reversed(COLUMNS_A), "new A column"), (*COLUMNS_B, "new B column"))
@@ -328,7 +354,7 @@ def test_real_v1_profile_loads_as_unique_and_round_trips_logically(data: bytes |
     assert load_mapping_profile(upgraded) == profile
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_v2_loads_each_exact_supported_mode(v2_document: dict, mode: ReconciliationMode) -> None:
     v2_document["reconciliation_mode"] = mode.value
 
@@ -428,7 +454,7 @@ def test_duplicate_mode_fields_are_rejected_even_if_values_agree(
         load_mapping_profile(data)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_export_formatting_preserves_v1_fields_with_v4_schema_additions(
     mode: ReconciliationMode,
 ) -> None:

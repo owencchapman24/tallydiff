@@ -551,9 +551,9 @@ def test_selected_comparison_end_to_end_is_equivalent_across_formats(mode, forma
     result = reconcile(*inputs, mode=mode, comparison_fields=FIELDS)
 
     assert [finding.category for finding in result.findings] == [
-        FindingCategory.DUPLICATE_AMBIGUOUS
-        if mode is ReconciliationMode.UNIQUE
-        else FindingCategory.EXACT_MATCH,
+        FindingCategory.EXACT_MATCH
+        if mode is ReconciliationMode.GROUPED_BY_KEY
+        else FindingCategory.DUPLICATE_AMBIGUOUS,
         FindingCategory.EXACT_MATCH,
     ]
     assert (
@@ -562,9 +562,9 @@ def test_selected_comparison_end_to_end_is_equivalent_across_formats(mode, forma
         == ("", " Sales ")
     )
     assert result.findings[0].field_comparisons[0].status is (
-        FieldComparisonStatus.NOT_COMPARABLE
-        if mode is ReconciliationMode.UNIQUE
-        else FieldComparisonStatus.MATCH
+        FieldComparisonStatus.MATCH
+        if mode is ReconciliationMode.GROUPED_BY_KEY
+        else FieldComparisonStatus.NOT_COMPARABLE
     )
     assert result.findings[1].field_comparisons[0].status is FieldComparisonStatus.MATCH
     assert result.total_a == result.total_b == Decimal("31.00")

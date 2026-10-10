@@ -668,7 +668,7 @@ def main() -> None:
     st.session_state.setdefault("reconciliation_mode", ReconciliationMode.UNIQUE)
     mode = st.radio(
         "Reconciliation mode",
-        tuple(ReconciliationMode),
+        (ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY),
         format_func=MODE_LABELS.__getitem__,
         key="reconciliation_mode",
         horizontal=True,

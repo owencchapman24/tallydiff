@@ -64,6 +64,20 @@ def _simple_mapping(app: AppTest) -> None:
     app.run()
 
 
+def test_mode_radio_remains_limited_to_the_two_legacy_modes():
+    app = _uploaded_app(b"id,amount\nINV,300\n", b"id,amount\nINV,100\nINV,200\n")
+    mode_radio = app.radio(key="reconciliation_mode")
+    assert mode_radio.options == ["Unique records", "Group by matching key"]
+    assert mode_radio.value is ReconciliationMode.UNIQUE
+    mode_radio.set_value(ReconciliationMode.GROUPED_BY_KEY).run()
+    assert not app.exception
+    assert app.radio(key="reconciliation_mode").options == [
+        "Unique records",
+        "Group by matching key",
+    ]
+    assert app.radio(key="reconciliation_mode").value is ReconciliationMode.GROUPED_BY_KEY
+
+
 def _select_first_finding(app: AppTest) -> None:
     app.session_state[app.dataframe[0].key] = {
         "selection": {"rows": [0], "columns": [], "cells": []}
@@ -183,7 +197,7 @@ def test_integrity_failure_is_displayed_without_a_traceback(
     assert not _exception_downloads(app)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("data", [b"id,amount\n", b"id,amount\nMATCH,1.00\n"])
 def test_no_exception_download_for_empty_or_exact_results(
     data: bytes, mode: ReconciliationMode
@@ -306,7 +320,7 @@ def downloaded_profile(monkeypatch: pytest.MonkeyPatch) -> dict:
     return captured
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_profile_download_apply_sample_round_trip_and_manual_edits(
     downloaded_profile: dict, caplog: pytest.LogCaptureFixture, mode: ReconciliationMode
 ) -> None:
@@ -402,7 +416,7 @@ def test_applying_same_profile_clears_result_without_profile_filename_in_identit
         assert app.session_state["completed"][0] == identity
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("failure", ["json", "mode", "columns"])
 def test_failed_profile_application_is_atomic_and_preserves_current_configuration(
     failure: str,
@@ -598,7 +612,7 @@ def test_multi_sheet_requires_explicit_selection_and_resets_schema(xlsx_bytes) -
     assert not app.metric and not _exception_downloads(app)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("side", ["A", "B"])
 def test_same_schema_sheet_changes_invalidate_result_identity(xlsx_bytes, side, mode) -> None:
     data = xlsx_bytes(
@@ -650,7 +664,7 @@ def test_replacing_workbook_requires_fresh_multi_sheet_selection(xlsx_bytes) -> 
     assert not app.exception
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_xlsx_formula_error_is_readable_and_blocks_download(xlsx_bytes, mode) -> None:
     data = xlsx_bytes({"Data": [["id", "amount"], ["INV", "=100+1"]]})
     app = _uploaded_app(b"id,amount\nINV,101\n", data, name_b="formula.xlsx")
@@ -981,7 +995,7 @@ def _exception_table(app: AppTest):
     )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_exception_review_defaults_show_all_with_fixed_exception_categories(mode) -> None:
     app = _review_app(mode)
     assert _review_widget(app, "Search matching keys").value == ""
@@ -1033,7 +1047,7 @@ def test_exception_review_controls_are_absent_without_exceptions(data_b, toleran
     )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(
     ("label", "value", "visible_keys"),
     [
@@ -1144,7 +1158,7 @@ def test_blank_review_minimum_is_equivalent_to_zero(value) -> None:
     assert len(_exception_table(app).value) == 7
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_filtered_finding_keeps_every_source_row_in_both_modes(mode) -> None:
     app = _uploaded_app(
         b"id,amount\nMULTI,100\nMULTI,200\nHIDDEN,7\n",

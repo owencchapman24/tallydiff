@@ -168,7 +168,7 @@ def test_normalized_one_sided_presence_remains_an_exception(
     assert result.control_difference == result.finding_delta_sum
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(
     ("amounts_a", "amounts_b", "grouped_category"),
     [
@@ -569,7 +569,7 @@ def test_normalized_grouped_arithmetic_ignores_callers_decimal_context(
         assert context.flags == before.flags
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", ["0", "0.01"])
 def test_none_and_explicit_exact_rules_preserve_all_default_categories(
     mode: ReconciliationMode, tolerance: str

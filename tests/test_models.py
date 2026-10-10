@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from tallydiff import (
+    EXACT_UNIQUE_ONE_TO_MANY_POLICY,
     FindingCategory,
     ReconciliationMode,
     ReconciliationResult,
@@ -93,7 +94,17 @@ def test_result_default_mode_preserves_existing_constructor_positions() -> None:
 
 @pytest.mark.parametrize("mode", list(ReconciliationMode))
 def test_result_retains_explicit_mode(mode: ReconciliationMode) -> None:
-    result = ReconciliationResult(Decimal("0"), Decimal("0"), (), mode=mode)
+    result = ReconciliationResult(
+        Decimal("0"),
+        Decimal("0"),
+        (),
+        mode=mode,
+        one_to_many_policy=(
+            EXACT_UNIQUE_ONE_TO_MANY_POLICY
+            if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY
+            else None
+        ),
+    )
 
     assert result.mode is mode
     with pytest.raises(FrozenInstanceError):

@@ -83,7 +83,7 @@ def _review_app():
     return app
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_zero_comparisons_retains_existing_result_and_review_workflow(mode) -> None:
     app = _uploaded_app(b"id,amount\nINV,10\n", b"id,amount\nINV,9\n")
     _simple_mapping(app)
@@ -166,7 +166,7 @@ def test_unique_secondary_mismatch_requires_review_without_changing_amounts(
     ]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(("amount_b", "tolerance"), [("10", "0"), ("10.01", "0.01")])
 def test_matching_secondary_fields_are_accepted_where_comparable(mode, amount_b, tolerance) -> None:
     app = _uploaded_app(
@@ -286,7 +286,7 @@ def test_ordered_comparisons_keep_matching_and_mismatching_fields_associated(
     assert detail_index < evidence_index
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_normalized_matching_key_preserves_original_secondary_comparison(mode) -> None:
     app = _uploaded_app(b"id,amount\nACME-01,10\n", b"id,amount\nACME01,10\n")
     _simple_mapping(app)
@@ -381,7 +381,7 @@ def test_selected_xlsx_secondary_formula_or_error_blocks_completed_result(
     assert "formula" in context.lower() if value.startswith("=") else "error" in context.lower()
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("format", ["csv", "xlsx"])
 def test_header_only_inputs_keep_comparison_configuration_without_crashing(
     review_downloads, xlsx_bytes, mode, format
@@ -524,7 +524,7 @@ def test_review_category_extensions_exist_only_for_supplied_secondary_exceptions
     assert categories.options == [CATEGORY_LABELS[category] for category in categories.value]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_selected_detail_preserves_unicode_blank_and_absent_side_as_distinct_json(mode) -> None:
     app = _uploaded_app(
         _csv([["id", "amount", "department"], ["A_ONLY", 0, ""], ["BOTH", 10, "Café\n東京"]]),

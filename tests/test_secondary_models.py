@@ -439,7 +439,7 @@ def test_secondary_mismatch_moves_exact_and_tolerated_findings_to_exceptions() -
     )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", ["0", "0.01"])
 @pytest.mark.parametrize("normalized", [False, True])
 def test_current_reconcile_outputs_equal_primary_only_results_in_both_modes(

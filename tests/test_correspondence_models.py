@@ -1,4 +1,4 @@
-"""Immutable one-to-many contracts, without enabling reconciliation inference."""
+"""Immutable correspondence contracts, parent accounting, and mode-policy consistency."""
 
 from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal, localcontext
@@ -173,7 +173,7 @@ def _finding(analysis=None, **overrides):
     return ReconciliationFinding(**values)
 
 
-def test_package_root_exposes_all_correspondence_contracts_without_growing_modes():
+def test_package_root_exposes_all_correspondence_contracts_and_supported_modes():
     for name in (
         "OneToManyPolicy",
         "EXACT_UNIQUE_ONE_TO_MANY_POLICY",
@@ -187,6 +187,7 @@ def test_package_root_exposes_all_correspondence_contracts_without_growing_modes
     assert [(mode.name, mode.value) for mode in ReconciliationMode] == [
         ("UNIQUE", "unique"),
         ("GROUPED_BY_KEY", "grouped_by_key"),
+        ("BOUNDED_ONE_TO_MANY", "bounded_one_to_many"),
     ]
 
 
@@ -668,13 +669,13 @@ def test_finding_accepts_full_or_residual_partition_in_both_directions(anchor_so
     assert finding.delta == Decimal(
         "50" if residual and anchor_source is Source.B else "-50" if residual else "0"
     )
-    assert finding.is_exception is residual  # Task 3 will add inference review.
+    assert finding.is_exception
     assert solution.amount == Decimal("300")
     with pytest.raises(FrozenInstanceError):
         finding.correspondence_analysis = None
 
 
-def test_task_one_does_not_override_existing_secondary_review():
+def test_inference_does_not_override_existing_secondary_review():
     analysis = _analysis()
     comparison = FieldComparison(
         ComparisonFieldMapping("department", "cost_center"),
@@ -913,8 +914,13 @@ def test_result_legacy_positions_defaults_and_keyword_only_policy():
 def test_result_requires_policy_when_any_finding_has_analysis():
     ordinary = _finding()
     inferred = _finding(_analysis())
-    with pytest.raises(ValueError, match="one_to_many_policy is required"):
-        ReconciliationResult(Decimal("600"), Decimal("600"), (ordinary, inferred))
+    with pytest.raises(ValueError, match="canonical one_to_many_policy"):
+        ReconciliationResult(
+            Decimal("600"),
+            Decimal("600"),
+            (ordinary, inferred),
+            mode=ReconciliationMode.BOUNDED_ONE_TO_MANY,
+        )
 
 
 def test_result_checks_every_analysis_policy_by_value():
@@ -922,19 +928,33 @@ def test_result_checks_every_analysis_policy_by_value():
     different = _finding(_analysis(policy=replace(POLICY, policy_id="other")))
     with pytest.raises(ValueError, match="analysis policy.*equal"):
         ReconciliationResult(
-            Decimal("600"), Decimal("600"), (inferred, different), one_to_many_policy=POLICY
+            Decimal("600"),
+            Decimal("600"),
+            (inferred, different),
+            mode=ReconciliationMode.BOUNDED_ONE_TO_MANY,
+            one_to_many_policy=POLICY,
         )
     equivalent = replace(POLICY)
     assert equivalent == POLICY and equivalent is not POLICY
     result = ReconciliationResult(
-        Decimal("300"), Decimal("300"), (inferred,), one_to_many_policy=equivalent
+        Decimal("300"),
+        Decimal("300"),
+        (inferred,),
+        mode=ReconciliationMode.BOUNDED_ONE_TO_MANY,
+        one_to_many_policy=equivalent,
     )
     assert result.one_to_many_policy is equivalent
 
 
 @pytest.mark.parametrize("findings", [(), (_finding(),)])
 def test_result_policy_can_be_retained_without_analysis(findings):
-    result = ReconciliationResult(Decimal("0"), Decimal("0"), findings, one_to_many_policy=POLICY)
+    result = ReconciliationResult(
+        Decimal("0"),
+        Decimal("0"),
+        findings,
+        mode=ReconciliationMode.BOUNDED_ONE_TO_MANY,
+        one_to_many_policy=POLICY,
+    )
     assert result.one_to_many_policy is POLICY
     assert result.correspondence_analysis_findings == result.inferred_correspondence_findings == ()
     with pytest.raises(FrozenInstanceError):
@@ -953,7 +973,11 @@ def test_result_analysis_subsets_are_ordered_derived_and_retain_finding_identity
     exact = _finding(_analysis())
     findings = (first, ordinary, ambiguous, exact)
     result = ReconciliationResult(
-        Decimal("1200"), Decimal("1350"), findings, one_to_many_policy=POLICY
+        Decimal("1200"),
+        Decimal("1350"),
+        findings,
+        mode=ReconciliationMode.BOUNDED_ONE_TO_MANY,
+        one_to_many_policy=POLICY,
     )
     assert result.findings is findings
     assert result.correspondence_analysis_findings == (first, ambiguous, exact)
@@ -968,12 +992,12 @@ def test_result_analysis_subsets_are_ordered_derived_and_retain_finding_identity
         {"correspondence_analysis_findings", "inferred_correspondence_findings"}
     )
     assert result.control_difference == result.finding_delta_sum == Decimal("-150")
-    assert result.exceptions == (first, ambiguous)
+    assert result.exceptions == (first, ambiguous, exact)
     assert result.tolerated_findings == ()
     assert result.tolerated_delta_total == Decimal("0")
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("normalized", [False, True])
 @pytest.mark.parametrize("comparisons", [False, True])
 def test_current_engine_behavior_and_defaults_remain_unchanged(mode, normalized, comparisons):

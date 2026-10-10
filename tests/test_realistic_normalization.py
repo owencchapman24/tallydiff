@@ -178,7 +178,7 @@ def test_independent_construction_guard_rejects_broken_key_plans(problem) -> Non
         oracle._validate_normalization_keys(tuple(plans))
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_large_normalized_results_account_for_every_row_and_raw_key(large_normalized, mode) -> None:
     pair, a, b = large_normalized
     result, report = _run(pair, a, b, mode)
@@ -194,7 +194,7 @@ def test_large_normalized_results_account_for_every_row_and_raw_key(large_normal
     assert export_exceptions_csv(result) == report
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_normalization_materially_increases_intended_cross_source_groups(
     realistic_normalized, mode
 ) -> None:
@@ -217,7 +217,7 @@ def test_normalization_materially_increases_intended_cross_source_groups(
     assert exact.key_normalization is None
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_reversed_and_seeded_record_order_preserve_findings_and_sorted_evidence(
     realistic_normalized, mode
 ) -> None:
@@ -235,7 +235,7 @@ def test_reversed_and_seeded_record_order_preserve_findings_and_sorted_evidence(
     assert _snapshot((*a, *b)) == before
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_physical_csv_shuffles_preserve_normalized_financial_results(mode) -> None:
     outputs = []
     for seed in (3, 17):
@@ -248,7 +248,7 @@ def test_physical_csv_shuffles_preserve_normalized_financial_results(mode) -> No
     assert outputs[0] == outputs[1]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(
     "formats", [("csv", "csv"), ("csv", "xlsx"), ("xlsx", "csv"), ("xlsx", "xlsx")]
 )
@@ -332,7 +332,7 @@ def test_normalized_formats_and_profile_v4_match_independent_truth(
         assert row["File B records"] == "; ".join(str(r.source_row) for r in finding.rows_b)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_all_false_profile_is_canonical_none_on_realistic_exports(
     realistic_normalized, mode
 ) -> None:
@@ -354,7 +354,7 @@ def test_all_false_profile_is_canonical_none_on_realistic_exports(
     assert len(pair.scenarios) == 1_200
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_normalized_export_and_review_use_all_independent_exception_keys(
     realistic_normalized, mode
 ) -> None:
@@ -449,7 +449,7 @@ def _assert_collision_evidence(collisions, expected_key, originals):
         )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("sources", [("A",), ("B",), ("A", "B")])
 def test_intentional_collisions_block_before_any_result_and_retain_all_originals(
     mode, sources, monkeypatch
@@ -492,7 +492,7 @@ def test_intentional_collisions_block_before_any_result_and_retain_all_originals
     assert _snapshot((*a, *b)) == before
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_partial_composite_and_cross_source_convergence_are_safe(mode) -> None:
     a = (
         _risk_record(Source.A, 3, ("ACME-01 West", "00042")),
@@ -533,7 +533,7 @@ def _with_collision(records, scenario, source):
     return (*records, *extra), (original, *extra)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_large_collision_preflight_blocks_without_losing_sparse_evidence(
     large_normalized, mode, monkeypatch
 ) -> None:
@@ -567,7 +567,7 @@ def test_large_collision_preflight_blocks_without_losing_sparse_evidence(
     assert _snapshot((*originals_a, *originals_b)) == before
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("source", [Source.A, Source.B])
 @pytest.mark.parametrize("component", [0, 1])
 def test_normalization_erasing_risky_component_blocks_with_logical_record_context(
@@ -609,7 +609,7 @@ def test_normalization_erasing_risky_component_blocks_with_logical_record_contex
     assert _snapshot(records) == before
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_benchmark_validates_normalization_with_configuration_and_summary(mode) -> None:
     measured = measure(100, 42, TOLERANCE, mode=mode, workload="normalization")
     assert (measured.rows_a, measured.rows_b) == (187, 186)

@@ -108,7 +108,7 @@ def test_defaults_pass_canonical_none_to_engine_identity_and_profile(monkeypatch
     assert "Key normalization: Exact — no transformations" in _texts(app)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(
     ("field", "key_a", "key_b", "normalized"),
     [
@@ -384,7 +384,7 @@ def test_failed_profile_application_keeps_configuration_and_completed_result(fai
     assert app.metric and _exception_downloads(app)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_normalized_table_evidence_review_and_complete_export(
     review_downloads, monkeypatch, mode
 ) -> None:
@@ -438,7 +438,7 @@ def test_normalized_table_evidence_review_and_complete_export(
     assert review_downloads["Download mapping profile"] == full_profile
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("source", ["A", "B"])
 def test_blank_normalized_key_blocks_with_original_source_context(mode, source) -> None:
     bad, good = b"id,amount\n---,10\n", b"id,amount\nX,9\n"
@@ -458,7 +458,7 @@ def test_blank_normalized_key_blocks_with_original_source_context(mode, source) 
     assert "original value: '---'" in message
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("sources", [("A",), ("B",), ("A", "B")])
 def test_collision_blocks_both_modes_and_shows_structured_original_evidence(mode, sources) -> None:
     colliding = b"id,amount\nACME-01,10\nACME01,20\nACME-01,30\n"

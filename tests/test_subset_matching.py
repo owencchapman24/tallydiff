@@ -584,19 +584,20 @@ def test_repeated_calls_produce_identical_model_bytes_without_changing_records(
         assert _model_bytes(rows) == original_bytes
 
 
-def test_primitive_remains_internal_and_modes_remain_exactly_two():
+def test_primitive_remains_internal_and_modes_are_exactly_the_three_supported_modes():
     assert tuple(ReconciliationMode) == (
         ReconciliationMode.UNIQUE,
         ReconciliationMode.GROUPED_BY_KEY,
+        ReconciliationMode.BOUNDED_ONE_TO_MANY,
     )
     assert not hasattr(tallydiff, "analyze_bounded_one_to_many")
-    assert "subset_matching" not in engine.__dict__
+    assert engine.analyze_bounded_one_to_many is analyze_bounded_one_to_many
 
 
 @pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("normalized", [False, True])
 @pytest.mark.parametrize("comparisons", [False, True])
-def test_existing_reconcile_never_invokes_search(monkeypatch, mode, normalized, comparisons):
+def test_legacy_reconcile_never_invokes_search(monkeypatch, mode, normalized, comparisons):
     monkeypatch.setattr(subset_matching, "analyze_bounded_one_to_many", _fail_search)
     monkeypatch.setattr(subset_matching, "combinations", _fail_search)
     monkeypatch.setattr(subset_matching, "sum_decimals", _fail_search)

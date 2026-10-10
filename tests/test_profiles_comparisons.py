@@ -81,7 +81,7 @@ def _boundary(kind, comparisons, document):
     return load_mapping_profile(json.dumps(document))
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("comparisons", [(), (DEPARTMENT,), (CURRENCY, DATE, DEPARTMENT)])
 @pytest.mark.parametrize(
     "configuration", [None, KeyNormalizationConfig((KeyNormalizationRules(),) * 2), ACTIVE]

@@ -24,10 +24,11 @@ class Source(StrEnum):
 
 
 class ReconciliationMode(StrEnum):
-    """Whether matching keys require unique rows or compare all source-row totals."""
+    """Compare unique rows, whole-key totals, or bounded exact one-to-many subsets."""
 
     UNIQUE = "unique"
     GROUPED_BY_KEY = "grouped_by_key"
+    BOUNDED_ONE_TO_MANY = "bounded_one_to_many"
 
 
 class FindingCategory(StrEnum):
@@ -134,7 +135,8 @@ class FieldComparison:
     """Sorted distinct ingested strings; a present blank is ("",), not ().
 
     Source records remain on the finding. NOT_COMPARABLE permits either equal
-    or unequal summaries; the primary category explains why comparison is unavailable.
+    or unequal summaries. Group structure determines comparability; even an inferred
+    EXACT_MATCH retains NOT_COMPARABLE secondary evidence.
     """
 
     mapping: ComparisonFieldMapping
@@ -506,20 +508,21 @@ class ReconciliationFinding:
 
     @property
     def is_exception(self) -> bool:
-        """Whether a primary exception or any secondary mismatch requires review."""
+        """Whether a financial exception, secondary mismatch, or inference needs review."""
 
         primary_exception = self.category not in (
             FindingCategory.EXACT_MATCH,
             FindingCategory.WITHIN_TOLERANCE,
         )
-        return primary_exception or self.has_secondary_mismatch
+        return primary_exception or self.has_secondary_mismatch or self.has_inferred_correspondence
 
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationResult:
     """Complete result retaining explicit normalization, or None for exact matching.
 
-    Optional correspondence evidence does not enable a mode or alter review rules.
+    Bounded one-to-many results retain the canonical policy, including empty results.
+    Legacy modes contain neither a policy nor correspondence analysis.
     """
 
     total_a: Decimal
@@ -538,6 +541,14 @@ class ReconciliationResult:
             raise TypeError("one_to_many_policy must be a OneToManyPolicy or None")
         if not isinstance(self.mode, ReconciliationMode):
             raise TypeError("mode must be a ReconciliationMode enum member")
+        if self.mode in (ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY):
+            if self.one_to_many_policy is not None:
+                raise ValueError("legacy modes require one_to_many_policy to be None")
+            if any(finding.correspondence_analysis is not None for finding in self.findings):
+                raise ValueError("correspondence analysis requires BOUNDED_ONE_TO_MANY mode")
+        elif self.mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+            if self.one_to_many_policy != EXACT_UNIQUE_ONE_TO_MANY_POLICY:
+                raise ValueError("BOUNDED_ONE_TO_MANY requires the canonical one_to_many_policy")
         if self.key_normalization is not None and not isinstance(
             self.key_normalization, KeyNormalizationConfig
         ):
@@ -603,8 +614,7 @@ class ReconciliationResult:
         return tuple(
             finding
             for finding in self.findings
-            if finding.category is FindingCategory.WITHIN_TOLERANCE
-            and not finding.has_secondary_mismatch
+            if finding.category is FindingCategory.WITHIN_TOLERANCE and not finding.is_exception
         )
 
     @property

@@ -62,7 +62,7 @@ def v3_document() -> dict:
     return document
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_v4_export_preserves_schema_order_boolean_rules_and_format(
     mode: ReconciliationMode,
 ) -> None:
@@ -122,7 +122,7 @@ def test_v3_restores_each_enabled_rule_and_preserves_exact_component_positions(
     assert profile.key_normalization.component_rules[1 - index] == KeyNormalizationRules()
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(
     "configuration",
     [
@@ -328,7 +328,7 @@ def test_numeric_version_variants_are_not_coerced(v3_document: dict, number: str
         load_mapping_profile(data)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("encoding", ["bytes", "str", "bom"])
 def test_original_v2_json_bytes_still_load_with_no_normalization(
     mode: ReconciliationMode, encoding: str
@@ -448,7 +448,7 @@ def test_v3_rejects_source_and_runtime_metadata(v3_document: dict, field: str) -
         load_mapping_profile(json.dumps(v3_document))
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_normalized_profile_column_validation_preserves_exact_directional_requirements(
     mode: ReconciliationMode,
 ) -> None:

@@ -254,7 +254,7 @@ def test_configuration_identity_includes_canonical_mode_and_preserves_default() 
     )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_configuration_identity_does_not_depend_on_mode_display_labels(
     monkeypatch: pytest.MonkeyPatch, mode: ReconciliationMode
 ) -> None:
@@ -277,7 +277,7 @@ def test_configuration_identity_requires_a_mode_enum(mode: object) -> None:
         )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_profile_and_manual_configuration_have_same_identity_regardless_of_json(
     mode: ReconciliationMode,
 ) -> None:

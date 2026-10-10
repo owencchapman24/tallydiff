@@ -20,7 +20,7 @@ from tallydiff import (
 )
 
 
-@pytest.fixture(params=tuple(ReconciliationMode))
+@pytest.fixture(params=(ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY))
 def observed_comparisons(request):
     pair = generate_pair(100, seed=42, workload="comparison")
     mapping = comparison_mapping()
@@ -54,7 +54,7 @@ def observed_comparisons(request):
     )
 
 
-@pytest.mark.parametrize("mode", tuple(ReconciliationMode))
+@pytest.mark.parametrize("mode", (ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY))
 def test_comparison_measure_runs_every_phase_and_independent_checks(mode):
     measured = measure(100, 42, Decimal("0.01"), mode=mode, workload="comparison")
     truth = generate_pair(100, seed=42, workload="comparison").expected(

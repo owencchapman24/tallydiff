@@ -89,6 +89,14 @@ class MappingProfile:
             raise ProfileError("amount_tolerance must be finite and zero or greater.")
         if not isinstance(self.reconciliation_mode, ReconciliationMode):
             raise ProfileError("reconciliation_mode must be a ReconciliationMode enum member.")
+        if self.reconciliation_mode not in (
+            ReconciliationMode.UNIQUE,
+            ReconciliationMode.GROUPED_BY_KEY,
+        ):
+            raise ProfileError(
+                "Unsupported reconciliation_mode; profiles v1-v4 support only "
+                "unique or grouped_by_key."
+            )
         object.__setattr__(
             self,
             "key_normalization",
