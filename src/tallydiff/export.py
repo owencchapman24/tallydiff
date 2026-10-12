@@ -12,6 +12,7 @@ from tallydiff.models import (
     SubsetSolution,
 )
 from tallydiff.presentation import CATEGORY_LABELS, display_amount
+from tallydiff.review import ReviewBinding, ReviewDisposition, ReviewSession, ReviewSessionError
 
 _COLUMNS = (
     "Category",
@@ -22,6 +23,11 @@ _COLUMNS = (
     "File A records",
     "File B records",
 )
+_REVIEW_DISPOSITION_LABELS = {
+    ReviewDisposition.UNREVIEWED: "Unreviewed",
+    ReviewDisposition.NEEDS_FOLLOW_UP: "Needs follow-up",
+    ReviewDisposition.REVIEW_COMPLETE: "Review complete",
+}
 
 
 def _row_reference(row: SourceRecord) -> dict[str, object]:
@@ -85,6 +91,68 @@ def _correspondence_evidence(finding: ReconciliationFinding) -> str:
     return json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
 
 
+def _exception_columns(result: ReconciliationResult, *, has_correspondence: bool) -> list[str]:
+    """Construct the original report schema from stored configuration/evidence."""
+
+    columns = list(_COLUMNS)
+    if result.comparison_fields:
+        columns.append("Secondary differences")
+        for index, mapping in enumerate(result.comparison_fields, start=1):
+            columns.extend(
+                (
+                    f"Comparison {index} File A values — {mapping.file_a}",
+                    f"Comparison {index} File B values — {mapping.file_b}",
+                    f"Comparison {index} status",
+                )
+            )
+    if has_correspondence:
+        columns.extend(("Correspondence status", "Correspondence evidence"))
+    return columns
+
+
+def _exception_row(
+    result: ReconciliationResult,
+    finding: ReconciliationFinding,
+    *,
+    has_correspondence: bool,
+) -> list[str]:
+    """Construct original cells without recomputing or rewriting evidence."""
+
+    row = [
+        CATEGORY_LABELS[finding.category],
+        " / ".join(finding.key),
+        display_amount(finding.amount_a) if finding.rows_a else "",
+        display_amount(finding.amount_b) if finding.rows_b else "",
+        display_amount(finding.delta, signed=True),
+        "; ".join(str(row.source_row) for row in finding.rows_a),
+        "; ".join(str(row.source_row) for row in finding.rows_b),
+    ]
+    if result.comparison_fields:
+        row.append(
+            "; ".join(
+                f"Comparison {index}: {comparison.mapping.file_a} ↔ {comparison.mapping.file_b}"
+                for index, comparison in enumerate(finding.field_comparisons, start=1)
+                if comparison.status is FieldComparisonStatus.MISMATCH
+            )
+        )
+        for comparison in finding.field_comparisons:
+            row.extend(
+                (
+                    json.dumps(comparison.values_a, ensure_ascii=False),
+                    json.dumps(comparison.values_b, ensure_ascii=False),
+                    comparison.status.value,
+                )
+            )
+    if has_correspondence:
+        analysis = finding.correspondence_analysis
+        row.extend(
+            (analysis.status.value, _correspondence_evidence(finding))
+            if analysis is not None
+            else ("", "")
+        )
+    return row
+
+
 def export_exceptions_csv(result: ReconciliationResult) -> bytes:
     """Return one CSV row per exception group, encoded as UTF-8 without a BOM.
 
@@ -109,52 +177,52 @@ def export_exceptions_csv(result: ReconciliationResult) -> bytes:
     writer = csv.writer(output, lineterminator="\r\n")
     exceptions = result.exceptions
     has_correspondence = any(finding.correspondence_analysis is not None for finding in exceptions)
-    columns = list(_COLUMNS)
-    if result.comparison_fields:
-        columns.append("Secondary differences")
-        for index, mapping in enumerate(result.comparison_fields, start=1):
-            columns.extend(
-                (
-                    f"Comparison {index} File A values — {mapping.file_a}",
-                    f"Comparison {index} File B values — {mapping.file_b}",
-                    f"Comparison {index} status",
-                )
-            )
-    if has_correspondence:
-        columns.extend(("Correspondence status", "Correspondence evidence"))
-    writer.writerow(columns)
+    writer.writerow(_exception_columns(result, has_correspondence=has_correspondence))
     for finding in exceptions:
-        row = [
-            CATEGORY_LABELS[finding.category],
-            " / ".join(finding.key),
-            display_amount(finding.amount_a) if finding.rows_a else "",
-            display_amount(finding.amount_b) if finding.rows_b else "",
-            display_amount(finding.delta, signed=True),
-            "; ".join(str(row.source_row) for row in finding.rows_a),
-            "; ".join(str(row.source_row) for row in finding.rows_b),
-        ]
-        if result.comparison_fields:
-            row.append(
-                "; ".join(
-                    f"Comparison {index}: {comparison.mapping.file_a} ↔ {comparison.mapping.file_b}"
-                    for index, comparison in enumerate(finding.field_comparisons, start=1)
-                    if comparison.status is FieldComparisonStatus.MISMATCH
-                )
+        writer.writerow(_exception_row(result, finding, has_correspondence=has_correspondence))
+    return output.getvalue().encode("utf-8")
+
+
+def export_reviewed_exceptions_csv(binding: ReviewBinding, session: ReviewSession) -> bytes:
+    """Append analyst annotations to the complete, unchanged exception evidence.
+
+    A session must match the binding's fingerprint and canonical exception keys
+    in order; independently reconstructed equivalent bindings are supported.
+    Mismatches raise ReviewSessionError before any output is constructed.
+    Review dispositions never filter exceptions or change reconciliation truth.
+
+    The UTF-8 CSV has no BOM and uses CRLF record terminators. Every nonempty
+    analyst note is rendered as ``"Note: " + note`` without trimming; saved notes
+    and original evidence cells remain unchanged. CSV quoting preserves embedded
+    delimiters/newlines. Only the new note column receives this display prefix.
+    """
+
+    if not isinstance(binding, ReviewBinding):
+        raise TypeError("binding must be a ReviewBinding")
+    if not isinstance(session, ReviewSession):
+        raise TypeError("session must be a ReviewSession")
+    if session.binding.result_fingerprint != binding.result_fingerprint:
+        raise ReviewSessionError("session fingerprint does not match the review binding")
+    if session.binding.exception_keys != binding.exception_keys:
+        raise ReviewSessionError("session binding exception keys do not match the review binding")
+    if tuple(review.matching_key for review in session.reviews) != binding.exception_keys:
+        raise ReviewSessionError("reviews must cover exactly the binding exception keys in order")
+
+    result = binding.result
+    exceptions = result.exceptions
+    has_correspondence = any(finding.correspondence_analysis is not None for finding in exceptions)
+    columns = _exception_columns(result, has_correspondence=has_correspondence)
+    columns.extend(("Review disposition", "Review note"))
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(columns)
+    for finding, review in zip(exceptions, session.reviews, strict=True):
+        row = _exception_row(result, finding, has_correspondence=has_correspondence)
+        row.extend(
+            (
+                _REVIEW_DISPOSITION_LABELS[review.disposition],
+                "Note: " + review.note if review.note != "" else "",
             )
-            for comparison in finding.field_comparisons:
-                row.extend(
-                    (
-                        json.dumps(comparison.values_a, ensure_ascii=False),
-                        json.dumps(comparison.values_b, ensure_ascii=False),
-                        comparison.status.value,
-                    )
-                )
-        if has_correspondence:
-            analysis = finding.correspondence_analysis
-            row.extend(
-                (analysis.status.value, _correspondence_evidence(finding))
-                if analysis is not None
-                else ("", "")
-            )
+        )
         writer.writerow(row)
     return output.getvalue().encode("utf-8")

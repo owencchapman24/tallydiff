@@ -3,7 +3,7 @@
 from tallydiff.amounts import AmountParseError, parse_amount
 from tallydiff.configuration import ColumnMapping, ComparisonFieldMapping
 from tallydiff.engine import NormalizationCollisionError, ReconciliationIntegrityError, reconcile
-from tallydiff.export import export_exceptions_csv
+from tallydiff.export import export_exceptions_csv, export_reviewed_exceptions_csv
 from tallydiff.ingest import IngestionError, ingest_csv, inspect_csv_columns
 from tallydiff.models import (
     EXACT_UNIQUE_ONE_TO_MANY_POLICY,
@@ -82,6 +82,7 @@ __all__ = [
     "export_exceptions_csv",
     "export_mapping_profile",
     "export_review_session",
+    "export_reviewed_exceptions_csv",
     "ingest_csv",
     "ingest_xlsx",
     "inspect_csv_columns",
