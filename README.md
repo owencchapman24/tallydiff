@@ -1,6 +1,6 @@
 # TallyDiff
 
-**TallyDiff** compares two structured financial exports locally
+**TallyDiff v0.6.0** compares two structured financial exports locally
 and explains which matching key groups account for their difference. Pair key columns, such as
 vendor and invoice number, then compare unique records or explicitly aggregate
 all rows sharing each key, or review bounded one-to-many correspondence.
@@ -39,8 +39,7 @@ Equal totals alone never imply a reconciliation. TallyDiff reports differences;
 it does not decide which source is authoritative. See [known limitations](#known-limitations)
 and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
 
-The package version remains **0.5.0** while the v0.6 development work is validated;
-this checkout includes bounded correspondence and profile schema v5.
+TallyDiff v0.6.0 includes bounded correspondence and profile schema v5.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
@@ -430,7 +429,7 @@ blank or repeated key selections, invalid amount names, incomplete/repeated
 secondary selections, same-side amount/secondary overlap, and invalid or negative
 tolerance are rejected with a concise message. Key/secondary overlap is allowed.
 
-Package version **0.5.0** and profile schema version **5** are separate versions.
+Package version **0.6.0** and profile schema version **5** are separate versions.
 
 ## Supported inputs
 

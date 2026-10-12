@@ -1,8 +1,12 @@
 """Focused release checks using small stdlib-built archives, without a build backend."""
 
+import base64
+import csv
+import hashlib
 import io
 import tarfile
 import tomllib
+from importlib.metadata import metadata, version
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -15,11 +19,12 @@ from scripts.check_release_artifacts import (
     check_release_artifacts,
 )
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 PACKAGE = f"tallydiff-{VERSION}"
 INFO = f"{PACKAGE}.dist-info"
 METADATA = (
-    f"Metadata-Version: 2.4\nName: tallydiff\nVersion: {VERSION}\nRequires-Python: >=3.12\n\n"
+    f"Metadata-Version: 2.4\nName: tallydiff\nVersion: {VERSION}\nRequires-Python: >=3.12\n"
+    "Requires-Dist: openpyxl>=3.1.5\nRequires-Dist: streamlit>=1.65.0\n\n"
 ).encode()
 WHEEL = b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
 
@@ -28,9 +33,13 @@ WHEEL = b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
 def release(tmp_path):
     project = tmp_path / "project"
     files = {name: b"project content\n" for name in PROJECT_FILES}
-    files["pyproject.toml"] = f'[project]\nname = "tallydiff"\nversion = "{VERSION}"\n'.encode()
+    files["pyproject.toml"] = (
+        f'[project]\nname = "tallydiff"\nversion = "{VERSION}"\n'
+        'dependencies = ["openpyxl>=3.1.5", "streamlit>=1.65.0"]\n'
+    ).encode()
     files.update({f"src/{name}": b"# runtime source\n" for name in PACKAGE_MODULES})
     files.update({"scripts/guard.py": b"# script\n", "tests/test_example.py": b"# test\n"})
+    files.update({name: b"# subset developer source\n" for name in SUBSET_DEVELOPER_FILES})
     for name, data in files.items():
         target = project / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -42,9 +51,32 @@ def release(tmp_path):
     return project, tmp_path / "dist", wheel, source
 
 
+SUBSET_DEVELOPER_FILES = (
+    "scripts/subset_oracle.py",
+    "scripts/subset_benchmark.py",
+    "tests/test_subset_oracle.py",
+    "tests/test_subset_benchmark.py",
+    "tests/test_realistic_one_to_many.py",
+)
+
+
+def record_bytes(wheel):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    for name, data in wheel.items():
+        if name == f"{INFO}/RECORD":
+            writer.writerow((name, "", ""))
+        else:
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+            writer.writerow((name, "sha256=" + digest, str(len(data))))
+    return output.getvalue().encode()
+
+
 def write_archives(release):
     _, dist, wheel, source = release
     dist.mkdir(exist_ok=True)
+    if not wheel[f"{INFO}/RECORD"]:
+        wheel[f"{INFO}/RECORD"] = record_bytes(wheel)
     with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl", "w") as archive:
         for name, data in wheel.items():
             archive.writestr(name, data)
@@ -64,6 +96,30 @@ def check(release):
 def test_valid_artifacts_preserve_runtime_and_repository_files(release):
     _, _, wheel, source = release
     assert check(release) == (len(wheel), len(source))
+
+
+def test_installed_release_metadata_matches_unchanged_runtime_contract():
+    assert version("tallydiff") == VERSION
+    installed = metadata("tallydiff")
+    assert installed["Requires-Python"] == ">=3.12"
+    assert installed.get_all("Requires-Dist") == ["openpyxl>=3.1.5", "streamlit>=1.65.0"]
+    assert not any(name.casefold().startswith("license") for name in installed.keys())
+
+
+def test_subset_developer_sources_follow_existing_sdist_only_policy(release):
+    project = Path(__file__).resolve().parents[1]
+    targets = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))["tool"][
+        "hatch"
+    ]["build"]["targets"]
+    assert "/scripts/*.py" in targets["sdist"]["include"]
+    assert "/tests/*.py" in targets["sdist"]["include"]
+    assert all((project / name).is_file() for name in SUBSET_DEVELOPER_FILES)
+    _, dist, _, _ = release
+    check(release)
+    with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl") as archive:
+        assert not set(SUBSET_DEVELOPER_FILES) & set(archive.namelist())
+    with tarfile.open(dist / f"{PACKAGE}.tar.gz", "r:gz") as archive:
+        assert {f"{PACKAGE}/{name}" for name in SUBSET_DEVELOPER_FILES} <= set(archive.getnames())
 
 
 def test_subset_matching_is_in_each_runtime_allowlist_exactly_once():
@@ -112,6 +168,7 @@ def test_subset_matching_source_bytes_must_match_checkout(release, artifact):
         "src/tallydiff/__pycache__/app.pyc",
         "review.patch",
         "review.diff",
+        "Users/cheer/temp.tmp",
     ],
 )
 def test_local_artifacts_are_rejected_on_either_side(release, artifact, name):
@@ -120,7 +177,7 @@ def test_local_artifacts_are_rejected_on_either_side(release, artifact, name):
         wheel[name] = b"local junk"
     else:
         source[f"{PACKAGE}/{name}"] = b"local junk"
-    with pytest.raises(ArtifactContentError, match="Local artifact"):
+    with pytest.raises(ArtifactContentError, match="Local artifact|unexpected"):
         check(release)
 
 
@@ -132,6 +189,7 @@ def test_local_artifacts_are_rejected_on_either_side(release, artifact, name):
         "local-note.txt",
         "tallydiff/untracked_helper.py",
         "tallydiff/local-note.txt",
+        "LICENSE",
     ],
 )
 def test_wheel_rejects_nonruntime_files(release, name):
@@ -142,6 +200,12 @@ def test_wheel_rejects_nonruntime_files(release, name):
 
 def test_sdist_rejects_arbitrary_untracked_root_files(release):
     release[3][f"{PACKAGE}/local-note.txt"] = b"untracked"
+    with pytest.raises(ArtifactContentError, match="unexpected"):
+        check(release)
+
+
+def test_sdist_rejects_unexpected_license(release):
+    release[3][f"{PACKAGE}/LICENSE"] = b"unintended license"
     with pytest.raises(ArtifactContentError, match="unexpected"):
         check(release)
 
@@ -177,9 +241,10 @@ def test_sdist_rejects_arbitrary_package_local_files(release, name):
 @pytest.mark.parametrize(
     "old,new",
     [
-        (b"Version: 0.5.0", b"Version: 0.3.0"),
+        (b"Version: 0.6.0", b"Version: 0.5.0"),
         (b"Name: tallydiff", b"Name: another-project"),
         (b"Requires-Python: >=3.12", b"Requires-Python: >=3.10"),
+        (b"streamlit>=1.65.0", b"streamlit>=1.66.0"),
     ],
 )
 def test_invalid_package_metadata_is_rejected(release, artifact, old, new):
@@ -198,6 +263,67 @@ def test_invalid_wheel_tag_is_rejected(release):
         check(release)
 
 
+def test_wheel_must_remain_pure_python(release):
+    release[2][f"{INFO}/WHEEL"] = WHEEL.replace(b"Root-Is-Purelib: true", b"Root-Is-Purelib: false")
+    with pytest.raises(ArtifactContentError, match="Wheel metadata"):
+        check(release)
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "License: MIT",
+        "License-Expression: MIT",
+        "License-File: LICENSE",
+        "Classifier: License :: OSI Approved :: MIT License",
+    ],
+)
+def test_license_metadata_is_rejected(release, artifact, field):
+    changed = METADATA.replace(b"\n\n", b"\n" + field.encode() + b"\n\n")
+    if artifact == "wheel":
+        release[2][f"{INFO}/METADATA"] = changed
+    else:
+        release[3][f"{PACKAGE}/PKG-INFO"] = changed
+    with pytest.raises(ArtifactContentError, match="unlicensed"):
+        check(release)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["hash", "size", "omitted", "duplicate", "unknown", "self_hash", "fields", "encoding", "csv"],
+)
+def test_record_integrity_is_not_optional(release, tamper):
+    wheel = release[2]
+    rows = list(csv.reader(io.StringIO(record_bytes(wheel).decode())))
+    index = next(index for index, row in enumerate(rows) if row[0] != f"{INFO}/RECORD")
+    if tamper == "hash":
+        rows[index][1] = "sha256=wrong"
+    elif tamper == "size":
+        rows[index][2] = str(int(rows[index][2]) + 1)
+    elif tamper == "omitted":
+        rows.pop(index)
+    elif tamper == "duplicate":
+        rows.append(rows[index])
+    elif tamper == "unknown":
+        rows.append(["outside.py", "sha256=wrong", "0"])
+    elif tamper == "self_hash":
+        next(row for row in rows if row[0] == f"{INFO}/RECORD")[1] = "sha256=wrong"
+    elif tamper == "fields":
+        rows[index].append("extra")
+    output = io.StringIO(newline="")
+    csv.writer(output).writerows(rows)
+    wheel[f"{INFO}/RECORD"] = (
+        b"\xff"
+        if tamper == "encoding"
+        else b'"unterminated'
+        if tamper == "csv"
+        else output.getvalue().encode()
+    )
+    with pytest.raises(ArtifactContentError, match="RECORD"):
+        check(release)
+
+
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 def test_archived_source_must_match_current_checkout(release, artifact):
     _, _, wheel, source = release
@@ -209,7 +335,16 @@ def test_archived_source_must_match_current_checkout(release, artifact):
         check(release)
 
 
-@pytest.mark.parametrize("name", ["../outside.txt", "/absolute.txt", "dir\\file.txt"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../outside.txt",
+        "/absolute.txt",
+        "dir\\file.txt",
+        "C:/Users/cheer/local.txt",
+        "C:relative.txt",
+    ],
+)
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 def test_unsafe_archive_names_are_rejected_without_extraction(release, name, artifact):
     release[2 if artifact == "wheel" else 3][name] = b"unsafe"
