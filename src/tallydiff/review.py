@@ -28,6 +28,16 @@ from tallydiff.models import (
 from tallydiff.normalization_config import KeyNormalizationConfig, KeyNormalizationRules
 
 _MAX_NOTE_BYTES = 16_384
+_SESSION_FORMAT = "tallydiff-review-session"
+_SESSION_VERSION = 1
+_FINGERPRINT_ALGORITHM = "sha256:tallydiff-review-binding-v1"
+_MAX_SESSION_BYTES = 64 * 1024 * 1024
+_MAX_JSON_DEPTH = 8
+_MAX_INTEGER_CHARS = 32
+_SESSION_FIELDS = frozenset(
+    {"format", "version", "fingerprint_algorithm", "result_fingerprint", "reviews"}
+)
+_REVIEW_FIELDS = frozenset({"matching_key", "disposition", "note"})
 _RESULT_PREFIX = b"tallydiff-review-result-v1\0"
 _BINDING_PREFIX = b"tallydiff-review-binding-v1\0"
 _RECONCILIATION_SEMANTICS = "tallydiff-reconciliation-v1"
@@ -682,3 +692,186 @@ class ReviewSession:
     @property
     def open_count(self) -> int:
         return self.total - self.complete_count
+
+
+def _session_fingerprint(value: object) -> None:
+    _require(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value),
+        "result_fingerprint must be 64 lowercase hexadecimal characters",
+    )
+
+
+def export_review_session(session: ReviewSession) -> bytes:
+    """Return a complete canonical v1 UTF-8 JSON snapshot without writing files."""
+
+    if not isinstance(session, ReviewSession):
+        raise TypeError("session must be a ReviewSession")
+    _model_invariants(session, ReviewSession, "review session")
+    _session_fingerprint(session.binding.result_fingerprint)
+    reviews = []
+    for index, review in enumerate(session.reviews, start=1):
+        _key(review.matching_key, f"review {index} matching_key")
+        reviews.append(
+            {
+                "matching_key": list(review.matching_key),
+                "disposition": review.disposition.value,
+                "note": review.note,
+            }
+        )
+    document = {
+        "format": _SESSION_FORMAT,
+        "version": _SESSION_VERSION,
+        "fingerprint_algorithm": _FINGERPRINT_ALGORITHM,
+        "result_fingerprint": session.binding.result_fingerprint,
+        "reviews": reviews,
+    }
+    data = (
+        json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    _require(len(data) <= _MAX_SESSION_BYTES, "review session export exceeds the byte-size limit")
+    return data
+
+
+def _session_text(data: bytes | str) -> str:
+    if isinstance(data, bytes):
+        _require(
+            len(data) <= _MAX_SESSION_BYTES, "review session input exceeds the byte-size limit"
+        )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ReviewSessionError("review session must contain valid UTF-8") from None
+    elif isinstance(data, str):
+        try:
+            size = len(data.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ReviewSessionError("review session text must be UTF-8 encodable") from None
+        _require(size <= _MAX_SESSION_BYTES, "review session input exceeds the byte-size limit")
+        text = data
+    else:
+        raise TypeError("data must be bytes or str")
+    return text.removeprefix("\ufeff")
+
+
+def _session_depth(text: str) -> None:
+    """Bound container depth while leaving malformed syntax to the JSON parser."""
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            _require(
+                depth <= _MAX_JSON_DEPTH, "review session JSON exceeds the nesting-depth limit"
+            )
+        elif character in "]}":
+            depth -= 1
+
+
+def _unique_session_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for name, value in pairs:
+        _require(name not in result, "review session JSON contains duplicate object field names")
+        result[name] = value
+    return result
+
+
+def _reject_session_number(token: str) -> None:
+    raise ReviewSessionError(
+        "review session JSON must not contain floating-point or nonfinite numbers"
+    )
+
+
+def _session_integer(token: str) -> int:
+    _require(
+        len(token) <= _MAX_INTEGER_CHARS, "review session JSON integer token exceeds 32 characters"
+    )
+    return int(token)
+
+
+def _session_object(value: object, fields: frozenset[str], label: str) -> dict[str, object]:
+    _require(isinstance(value, dict), f"{label} must be an object")
+    _require(
+        set(value) == fields,
+        f"{label} must contain exactly these fields: {', '.join(sorted(fields))}",
+    )
+    return value
+
+
+def _session_review(value: object, index: int) -> FindingReview:
+    label = f"review {index}"
+    review = _session_object(value, _REVIEW_FIELDS, label)
+    _require(isinstance(review["matching_key"], list), f"{label} matching_key must be an array")
+    key = tuple(review["matching_key"])
+    _key(key, f"{label} matching_key")
+    _require(isinstance(review["disposition"], str), f"{label} disposition must be a string")
+    try:
+        disposition = ReviewDisposition(review["disposition"])
+    except ValueError:
+        raise ReviewSessionError(f"{label} disposition is unsupported") from None
+    _require(isinstance(review["note"], str), f"{label} note must be a string")
+    try:
+        return FindingReview(key, disposition, review["note"])
+    except (TypeError, ValueError):
+        raise ReviewSessionError(f"{label} note is invalid") from None
+
+
+def load_review_session(data: bytes | str, *, binding: ReviewBinding) -> ReviewSession:
+    """Validate a complete v1 snapshot atomically against the expected binding.
+
+    Input object/review order and JSON whitespace may vary. The returned snapshot
+    follows binding order, replaces the full population, and mutates no external state.
+    """
+
+    if not isinstance(binding, ReviewBinding):
+        raise TypeError("binding must be a ReviewBinding")
+    text = _session_text(data)
+    _session_depth(text)
+    try:
+        document = json.loads(
+            text,
+            object_pairs_hook=_unique_session_object,
+            parse_float=_reject_session_number,
+            parse_constant=_reject_session_number,
+            parse_int=_session_integer,
+        )
+    except (json.JSONDecodeError, RecursionError):
+        raise ReviewSessionError("review session must contain valid JSON") from None
+    document = _session_object(document, _SESSION_FIELDS, "review session")
+    _require(document["format"] == _SESSION_FORMAT, "unsupported review session format")
+    _require(
+        type(document["version"]) is int and document["version"] == _SESSION_VERSION,
+        "unsupported review session version; expected integer 1",
+    )
+    _require(
+        document["fingerprint_algorithm"] == _FINGERPRINT_ALGORITHM,
+        "unsupported fingerprint_algorithm",
+    )
+    _session_fingerprint(document["result_fingerprint"])
+    _require(isinstance(document["reviews"], list), "reviews must be an array")
+    parsed = {}
+    for index, value in enumerate(document["reviews"], start=1):
+        review = _session_review(value, index)
+        _require(review.matching_key not in parsed, f"review {index} duplicates a matching_key")
+        parsed[review.matching_key] = review
+    _require(
+        document["result_fingerprint"] == binding.result_fingerprint,
+        "result_fingerprint does not match the current binding",
+    )
+    _require(
+        len(parsed) == len(binding.exception_keys) and set(parsed) == set(binding.exception_keys),
+        "reviews must contain exactly the current binding's exception keys",
+    )
+    return ReviewSession(binding, tuple(parsed[key] for key in binding.exception_keys))

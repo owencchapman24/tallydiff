@@ -40,6 +40,8 @@ from tallydiff.review import (
     ReviewSession,
     ReviewSessionError,
     bind_review_result,
+    export_review_session,
+    load_review_session,
 )
 from tallydiff.xlsx import ingest_xlsx, inspect_xlsx_columns, inspect_xlsx_sheets
 
@@ -79,12 +81,14 @@ __all__ = [
     "bind_review_result",
     "export_exceptions_csv",
     "export_mapping_profile",
+    "export_review_session",
     "ingest_csv",
     "ingest_xlsx",
     "inspect_csv_columns",
     "inspect_xlsx_columns",
     "inspect_xlsx_sheets",
     "load_mapping_profile",
+    "load_review_session",
     "parse_amount",
     "reconcile",
 ]
