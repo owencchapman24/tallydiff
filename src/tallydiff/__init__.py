@@ -33,6 +33,14 @@ from tallydiff.profiles import (
     export_mapping_profile,
     load_mapping_profile,
 )
+from tallydiff.review import (
+    FindingReview,
+    ReviewBinding,
+    ReviewDisposition,
+    ReviewSession,
+    ReviewSessionError,
+    bind_review_result,
+)
 from tallydiff.xlsx import ingest_xlsx, inspect_xlsx_columns, inspect_xlsx_sheets
 
 __all__ = [
@@ -46,6 +54,7 @@ __all__ = [
     "FieldComparison",
     "FieldComparisonStatus",
     "FindingCategory",
+    "FindingReview",
     "IngestionError",
     "KeyNormalizationConfig",
     "KeyNormalizationError",
@@ -60,9 +69,14 @@ __all__ = [
     "ReconciliationIntegrityError",
     "ReconciliationMode",
     "ReconciliationResult",
+    "ReviewBinding",
+    "ReviewDisposition",
+    "ReviewSession",
+    "ReviewSessionError",
     "Source",
     "SourceRecord",
     "SubsetSolution",
+    "bind_review_result",
     "export_exceptions_csv",
     "export_mapping_profile",
     "ingest_csv",
