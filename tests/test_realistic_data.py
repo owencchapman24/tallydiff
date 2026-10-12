@@ -184,7 +184,7 @@ def test_row_shuffle_changes_trace_positions_without_changing_financial_results(
     assert results[0] == results[1]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", [Decimal("0"), Decimal("0.01")])
 def test_grouped_workload_oracle_has_hand_auditable_counts_and_recipes(mode, tolerance) -> None:
     pair = generate_pair(100, seed=42, workload="grouped")
@@ -246,7 +246,7 @@ def test_expected_outcomes_do_not_import_or_call_product_code(monkeypatch) -> No
             assert len(pair.expected(Decimal("0.01"), mode=mode).groups) == 100
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", [Decimal("0"), Decimal("0.01")])
 @pytest.mark.parametrize(
     "formats", [("csv", "csv"), ("xlsx", "xlsx"), ("csv", "xlsx"), ("xlsx", "csv")]
@@ -319,7 +319,7 @@ def large_grouped_exports():
     return pair, a, b
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_large_grouped_result_integrity_review_and_complete_export(
     large_grouped_exports, mode
 ) -> None:
@@ -400,7 +400,7 @@ def test_large_grouped_result_integrity_review_and_complete_export(
     assert export_exceptions_csv(result) == report
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_grouped_workload_physical_row_shuffles_preserve_financial_semantics(mode) -> None:
     pairs = [generate_pair(500, seed=11, shuffle_seed=seed, workload="grouped") for seed in (1, 2)]
     assert pairs[0].scenarios == pairs[1].scenarios
@@ -416,7 +416,7 @@ def test_grouped_workload_physical_row_shuffles_preserve_financial_semantics(mod
     assert outputs[0] == outputs[1]
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", [Decimal("0"), Decimal("0.01")])
 def test_benchmark_exercises_each_mode_with_independent_verification(mode, tolerance) -> None:
     measured = measure(100, 42, tolerance, mode=mode)

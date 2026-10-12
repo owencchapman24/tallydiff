@@ -14,6 +14,7 @@ from tallydiff import (
     KeyNormalizationRules,
     ReconciliationMode,
     export_mapping_profile,
+    load_mapping_profile,
 )
 
 NORMALIZATION_FIELDS = (
@@ -272,7 +273,7 @@ def test_worksheet_change_clears_comparisons_and_completed_result(xlsx_bytes, so
     _assert_no_comparison_keys(app)
 
 
-def test_v4_profile_restores_order_all_configuration_and_filename_stays_outside_identity(
+def test_v5_profile_restores_order_all_configuration_and_filename_stays_outside_identity(
     review_downloads, caplog
 ) -> None:
     app = _app()
@@ -335,13 +336,15 @@ def test_v4_profile_restores_order_all_configuration_and_filename_stays_outside_
     assert app.session_state["completed"][0] == identity
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_legacy_and_empty_v4_profiles_explicitly_clear_all_comparison_state(version) -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_legacy_and_empty_v5_profiles_explicitly_clear_all_comparison_state(version) -> None:
     app = _app()
     _set_comparisons(app, [("department", "department"), ("currency", "currency")])
     app.button(key="run").click().run()
     profile = json.loads(export_mapping_profile(ColumnMapping((("id", "id"),), "amount", "amount")))
     profile["version"] = version
+    if version < 5:
+        profile.pop("one_to_many_policy")
     if version < 4:
         profile.pop("comparison_fields")
     if version < 3:
@@ -363,7 +366,7 @@ def test_legacy_and_empty_v4_profiles_explicitly_clear_all_comparison_state(vers
 @pytest.mark.parametrize(
     "failure", ["missing_a", "missing_b", "amount", "duplicate", "incomplete", "malformed"]
 )
-def test_invalid_v4_profile_keeps_all_configuration_and_completed_result_atomic(failure) -> None:
+def test_invalid_v5_profile_keeps_all_configuration_and_completed_result_atomic(failure) -> None:
     app = _app()
     _set_comparisons(app, [("department", "department"), ("currency", "currency")])
     app.checkbox(key="norm_casefold_0").set_value(True)
@@ -400,6 +403,63 @@ def test_invalid_v4_profile_keeps_all_configuration_and_completed_result_atomic(
     assert app.metric
 
 
+def test_bounded_v5_profile_restores_configuration_and_downloads_canonically(review_downloads):
+    app = _uploaded_app(
+        b"id,department,currency,amount,gross\nINV,Sales,USD,10,100\n",
+        b"id,department,currency,amount,gross\nINV,Sales,USD,9,200\n",
+    )
+    _simple_mapping(app)
+    _set_comparisons(app, [("department", "department"), ("currency", "currency")])
+    app.checkbox(key="norm_casefold_0").set_value(True)
+    app.radio(key="reconciliation_mode").set_value(ReconciliationMode.GROUPED_BY_KEY)
+    app.text_input(key="amount_tolerance").set_value("0.0100").run()
+    app.button(key="run").click().run()
+    before = _editing_state(app)
+    identity, result = app.session_state["completed"]
+    mapping = ColumnMapping(
+        (("currency", "department"), ("department", "currency")),
+        "gross",
+        "gross",
+        comparison_fields=(ComparisonFieldMapping("id", "id"),),
+    )
+    data = export_mapping_profile(
+        mapping,
+        amount_tolerance=Decimal("100.000"),
+        reconciliation_mode=ReconciliationMode.BOUNDED_ONE_TO_MANY,
+        key_normalization=KeyNormalizationConfig(
+            (KeyNormalizationRules(remove_punctuation=True), KeyNormalizationRules(casefold=True))
+        ),
+    )
+    assert load_mapping_profile(data).reconciliation_mode is ReconciliationMode.BOUNDED_ONE_TO_MANY
+    _upload_profile(app, data)
+    assert _editing_state(app) == before
+    assert app.session_state["completed"][0] == identity
+    assert app.session_state["completed"][1] is result
+    app.button(key="apply_profile").click().run()
+    _assert_result_cleared(app)
+    assert not app.error and app.success
+    assert app.session_state["key_count"] == 2
+    assert app.session_state["comparison_count"] == 1
+    assert _pairs(app) == [("id", "id")]
+    for index, (a, b) in enumerate(mapping.key_pairs):
+        assert app.selectbox(key=f"map_key_a_{index}").value == a
+        assert app.selectbox(key=f"map_key_b_{index}").value == b
+    assert app.selectbox(key="map_amount_a").value == "gross"
+    assert app.selectbox(key="map_amount_b").value == "gross"
+    assert app.text_input(key="amount_tolerance").value == "100.000"
+    assert app.radio(key="reconciliation_mode").value is ReconciliationMode.BOUNDED_ONE_TO_MANY
+    normalization = load_mapping_profile(data).key_normalization
+    for index, rules in enumerate(normalization.component_rules):
+        for field in NORMALIZATION_FIELDS:
+            assert app.checkbox(key=f"norm_{field}_{index}").value == getattr(rules, field)
+    assert app.radio(key="reconciliation_mode").options == [
+        "Unique records",
+        "Group by matching key",
+        "Bounded one-to-many",
+    ]
+    assert review_downloads["Download mapping profile"] == data
+
+
 def test_manual_profile_download_preserves_exact_names_order_and_readiness(
     review_downloads,
 ) -> None:
@@ -412,7 +472,8 @@ def test_manual_profile_download_preserves_exact_names_order_and_readiness(
     assert not any(button.key == "download_profile" for button in app.download_button)
     _set_comparisons(app, [("currency", "currency"), (" department ", " department ")])
     profile = json.loads(review_downloads["Download mapping profile"])
-    assert profile["version"] == 4
+    assert profile["version"] == 5
+    assert profile["one_to_many_policy"] is None
     assert profile["comparison_fields"] == [
         {"file_a": "currency", "file_b": "currency"},
         {"file_a": " department ", "file_b": " department "},

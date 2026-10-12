@@ -5,6 +5,7 @@ from decimal import Decimal, localcontext
 import pytest
 
 from tallydiff import (
+    EXACT_UNIQUE_ONE_TO_MANY_POLICY,
     ColumnMapping,
     MappingProfile,
     ProfileError,
@@ -20,6 +21,36 @@ MAPPING = ColumnMapping(
 )
 COLUMNS_A = ("Vendor ID", "Invoice Number", "Invoice Amount")
 COLUMNS_B = ("Supplier", "Invoice Ref", "Gross Amount")
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_historical_profile_schemas_reject_bounded_one_to_many(version):
+    document = json.loads(export_mapping_profile(MAPPING))
+    del document["one_to_many_policy"]
+    document["version"] = version
+    document["reconciliation_mode"] = "bounded_one_to_many"
+    if version < 4:
+        del document["comparison_fields"]
+    if version < 3:
+        del document["key_normalization"]
+    with pytest.raises(
+        ProfileError, match="required fields" if version == 1 else "unique or grouped_by_key"
+    ):
+        load_mapping_profile(json.dumps(document))
+
+
+def test_mapping_profile_supports_bounded_mode_with_derived_canonical_policy():
+    profile = MappingProfile(MAPPING, reconciliation_mode=ReconciliationMode.BOUNDED_ONE_TO_MANY)
+    assert profile.one_to_many_policy is EXACT_UNIQUE_ONE_TO_MANY_POLICY
+
+
+def test_v5_writer_supports_bounded_mode():
+    document = json.loads(
+        export_mapping_profile(MAPPING, reconciliation_mode=ReconciliationMode.BOUNDED_ONE_TO_MANY)
+    )
+    assert document["version"] == 5
+    assert document["one_to_many_policy"] == "exact_unique_v1"
+
 
 V1_PROFILE = b"""{
   "format": "tallydiff-mapping-profile",
@@ -58,7 +89,7 @@ def v2_document() -> dict:
     return profile
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_serialized_profile_has_only_versioned_configuration_fields(
     mode: ReconciliationMode,
 ) -> None:
@@ -69,7 +100,7 @@ def test_serialized_profile_has_only_versioned_configuration_fields(
     )
     assert document == {
         "format": "tallydiff-mapping-profile",
-        "version": 4,
+        "version": 5,
         "key_pairs": [
             {"file_a": "Vendor ID", "file_b": "Supplier"},
             {"file_a": "Invoice Number", "file_b": "Invoice Ref"},
@@ -87,12 +118,13 @@ def test_serialized_profile_has_only_versioned_configuration_fields(
             for _ in MAPPING.key_pairs
         ],
         "comparison_fields": [],
+        "one_to_many_policy": None,
     }
     assert export_mapping_profile(MAPPING).endswith(b"\n")
     assert PresentationColumnMapping is ColumnMapping
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("tolerance", ["0", "0.0100", "0.000000000000000000000012345678900"])
 def test_round_trip_preserves_order_and_exact_decimal_digits(
     tolerance: str, mode: ReconciliationMode
@@ -135,7 +167,7 @@ def test_invalid_json_is_a_concise_profile_error(data: bytes) -> None:
     ("field", "value", "message"),
     [
         ("format", "other", "Unsupported profile format"),
-        ("version", 5, "Unsupported profile version"),
+        ("version", 6, "Unsupported profile version"),
         ("version", True, "Unsupported profile version"),
         ("key_pairs", {}, "key_pairs must be an array"),
         ("key_pairs", [], "at least one key mapping"),
@@ -217,7 +249,7 @@ def test_export_rejects_incomplete_configuration_and_non_decimal_tolerance() -> 
         export_mapping_profile(MAPPING, amount_tolerance=0.01)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("side", ["A", "B"])
 def test_compatibility_reports_exact_missing_directional_columns(
     side: str, mode: ReconciliationMode
@@ -230,7 +262,7 @@ def test_compatibility_reports_exact_missing_directional_columns(
         profile.validate_columns(a, b)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_compatibility_checks_amount_columns_and_never_swaps_sides_or_guesses(
     mode: ReconciliationMode,
 ) -> None:
@@ -245,7 +277,7 @@ def test_compatibility_checks_amount_columns_and_never_swaps_sides_or_guesses(
         profile.validate_columns(("vendor id", *COLUMNS_A[1:]), COLUMNS_B)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_extra_columns_and_changed_header_order_remain_compatible(mode: ReconciliationMode) -> None:
     profile = MappingProfile(MAPPING, reconciliation_mode=mode)
     profile.validate_columns((*reversed(COLUMNS_A), "new A column"), (*COLUMNS_B, "new B column"))
@@ -283,7 +315,7 @@ def test_default_mode_preserves_existing_profile_and_export_callers() -> None:
     assert default.reconciliation_mode is ReconciliationMode.UNIQUE
     assert with_tolerance.reconciliation_mode is ReconciliationMode.UNIQUE
     assert with_tolerance.amount_tolerance.as_tuple() == Decimal("0.0100").as_tuple()
-    assert exported["version"] == 4
+    assert exported["version"] == 5
     assert exported["reconciliation_mode"] == "unique"
     assert exported["amount_tolerance"] == "0"
     assert load_mapping_profile(export_mapping_profile(MAPPING)) == default
@@ -323,12 +355,12 @@ def test_real_v1_profile_loads_as_unique_and_round_trips_logically(data: bytes |
         amount_tolerance=profile.amount_tolerance,
         reconciliation_mode=profile.reconciliation_mode,
     )
-    assert json.loads(upgraded)["version"] == 4
+    assert json.loads(upgraded)["version"] == 5
     assert json.loads(upgraded)["reconciliation_mode"] == "unique"
     assert load_mapping_profile(upgraded) == profile
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_v2_loads_each_exact_supported_mode(v2_document: dict, mode: ReconciliationMode) -> None:
     v2_document["reconciliation_mode"] = mode.value
 
@@ -391,7 +423,8 @@ def test_v1_rejects_the_v2_mode_field(mode: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "version", [-1, 0, 5, 99, True, False, "1", "2", "3", "4", None, 1.0, 2.0, 3.0, 4.0, [], {}]
+    "version",
+    [-1, 0, 6, 99, True, False, "1", "2", "3", "4", "5", None, 1.0, 2.0, 3.0, 4.0, 5.0, [], {}],
 )
 def test_unsupported_and_wrong_type_versions_raise_clear_errors(
     document: dict, version: object
@@ -399,7 +432,7 @@ def test_unsupported_and_wrong_type_versions_raise_clear_errors(
     document["version"] = version
 
     with pytest.raises(
-        ProfileError, match="Unsupported profile version; expected version 1, 2, 3, or 4"
+        ProfileError, match="Unsupported profile version; expected version 1, 2, 3, 4, or 5"
     ):
         load_mapping_profile(json.dumps(document))
 
@@ -428,11 +461,11 @@ def test_duplicate_mode_fields_are_rejected_even_if_values_agree(
         load_mapping_profile(data)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
-def test_export_formatting_preserves_v1_fields_with_v4_schema_additions(
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
+def test_export_formatting_preserves_v1_fields_with_v5_schema_additions(
     mode: ReconciliationMode,
 ) -> None:
-    expected = V1_PROFILE.replace(b'"version": 1', b'"version": 4').replace(
+    expected = V1_PROFILE.replace(b'"version": 1', b'"version": 5').replace(
         b'  "amount_tolerance": "0.0100"\n',
         (
             f'  "amount_tolerance": "0.0100",\n  "reconciliation_mode": "{mode.value}",\n'
@@ -450,7 +483,8 @@ def test_export_formatting_preserves_v1_fields_with_v4_schema_additions(
             '      "strip_leading_zeros": false\n'
             "    }\n"
             "  ],\n"
-            '  "comparison_fields": []\n'
+            '  "comparison_fields": [],\n'
+            '  "one_to_many_policy": null\n'
         ).encode(),
     )
 

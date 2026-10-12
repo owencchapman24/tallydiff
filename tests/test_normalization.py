@@ -564,7 +564,7 @@ def test_import_and_preflight_leave_engine_exact_matching_and_duplicates_unchang
     records_a = [first, duplicate, canonical]
     records_b = [record(2, ("ACME01",), Source.B)]
 
-    for mode in ReconciliationMode:
+    for mode in (ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY):
         before = reconcile(records_a, records_b, mode=mode)
         (collision,) = find_normalization_collisions(
             records_a, config(remove_punctuation=True), source=Source.A

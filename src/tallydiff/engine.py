@@ -9,7 +9,11 @@ from decimal import Decimal
 from tallydiff._decimal import sum_decimals
 from tallydiff.configuration import ComparisonFieldMapping
 from tallydiff.models import (
+    EXACT_UNIQUE_ONE_TO_MANY_POLICY,
     CompositeKey,
+    CorrespondenceAnalysis,
+    CorrespondenceReason,
+    CorrespondenceStatus,
     FieldComparison,
     FieldComparisonStatus,
     FindingCategory,
@@ -25,6 +29,7 @@ from tallydiff.normalization import (
     normalize_key,
 )
 from tallydiff.normalization_config import KeyNormalizationConfig
+from tallydiff.subset_matching import analyze_bounded_one_to_many
 
 
 class ReconciliationIntegrityError(RuntimeError):
@@ -63,7 +68,7 @@ def reconcile(
     applies explicit rules to matching keys only; findings retain original records.
     Source integrity and all key arities are validated before normalization.
     Blank components fail with source/row/component context. Same-source collisions
-    in either input block both modes, retaining evidence for both files in a
+    in either input block all modes, retaining evidence for both files in a
     NormalizationCollisionError before any findings or result are constructed.
     ``amount_tolerance`` must be a finite, nonnegative Decimal. Two-sided keys
     with a nonzero absolute delta at or below it are accepted as within tolerance
@@ -74,13 +79,20 @@ def reconcile(
     ``DUPLICATE_AMBIGUOUS`` finding, regardless of tolerance or absent rows.
     GROUPED_BY_KEY compares the exact totals of all rows for each key, with
     presence taking precedence over amounts. Every source row is retained in
-    both modes. Grouped results make no claim that individual rows correspond;
+    all modes. Grouped results make no claim that individual rows correspond;
     rows are never paired heuristically.
 
+    BOUNDED_ONE_TO_MANY uses the fixed canonical policy to find a physically unique
+    exact subset against a sole anchor in either direction. Accepted inferences
+    require review. Residual rows stay in the parent finding and always produce
+    AMOUNT_MISMATCH; tolerance applies only to ordinary one-row-per-side groups.
+    Every unresolved duplicate-shaped group remains DUPLICATE_AMBIGUOUS.
+
     Secondary fields compare distinct sets of original evidence strings, in
-    configuration order. One-sided and UNIQUE duplicate-ambiguous groups retain
-    their summaries as NOT_COMPARABLE. Secondary status does not change primary
-    categories or financial deltas. Any secondary MISMATCH additionally requires review.
+    configuration order. One-sided groups, UNIQUE duplicates, and all bounded
+    correspondence analyses retain their summaries as NOT_COMPARABLE.
+    Secondary status does not change primary categories or financial deltas.
+    Any secondary MISMATCH additionally requires review.
     """
 
     if not isinstance(amount_tolerance, Decimal):
@@ -120,13 +132,44 @@ def reconcile(
     grouped_a = _group_by_key(records_a, key_normalization=key_normalization)
     grouped_b = _group_by_key(records_b, key_normalization=key_normalization)
 
+    policy = (
+        EXACT_UNIQUE_ONE_TO_MANY_POLICY if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY else None
+    )
+    remaining_planned_budget = policy.max_planned_combinations_per_run if policy else 0
+    run_budget_exhausted = False
     findings: list[ReconciliationFinding] = []
     for key in sorted(grouped_a.keys() | grouped_b.keys()):
         rows_a = tuple(grouped_a.get(key, ()))
         rows_b = tuple(grouped_b.get(key, ()))
         amount_a = _sum_amounts(rows_a)
         amount_b = _sum_amounts(rows_b)
-        category = _classify(rows_a, rows_b, amount_a, amount_b, amount_tolerance, mode)
+        analysis = None
+        if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+            assert policy is not None
+            analysis = analyze_bounded_one_to_many(
+                rows_a,
+                rows_b,
+                policy=policy,
+                remaining_planned_budget=remaining_planned_budget,
+                run_budget_exhausted=run_budget_exhausted,
+            )
+            if analysis is not None:
+                if analysis.reason is CorrespondenceReason.RUN_BUDGET_EXHAUSTED:
+                    run_budget_exhausted = True
+                else:
+                    remaining_planned_budget -= analysis.reserved_combinations
+                if remaining_planned_budget < 0:
+                    raise ReconciliationIntegrityError("remaining planned budget became negative")
+        category = _classify(
+            rows_a, rows_b, amount_a, amount_b, amount_tolerance, mode, analysis=analysis
+        )
+        comparable = (
+            analysis is None
+            and bool(rows_a and rows_b)
+            and (
+                mode is ReconciliationMode.GROUPED_BY_KEY or (len(rows_a) == 1 and len(rows_b) == 1)
+            )
+        )
 
         findings.append(
             ReconciliationFinding(
@@ -136,7 +179,10 @@ def reconcile(
                 rows_b=rows_b,
                 amount_a=amount_a,
                 amount_b=amount_b,
-                field_comparisons=_compare_fields(rows_a, rows_b, comparison_fields, category),
+                field_comparisons=_compare_fields(
+                    rows_a, rows_b, comparison_fields, comparable=comparable
+                ),
+                correspondence_analysis=analysis,
             )
         )
 
@@ -148,6 +194,7 @@ def reconcile(
         mode=mode,
         key_normalization=key_normalization,
         comparison_fields=comparison_fields,
+        one_to_many_policy=policy,
     )
     _assert_integrity(result, records_a, records_b)
     return result
@@ -189,15 +236,11 @@ def _compare_fields(
     rows_a: tuple[SourceRecord, ...],
     rows_b: tuple[SourceRecord, ...],
     comparison_fields: tuple[ComparisonFieldMapping, ...],
-    category: FindingCategory,
+    *,
+    comparable: bool,
 ) -> tuple[FieldComparison, ...]:
     if not comparison_fields:
         return ()
-    comparable = category not in (
-        FindingCategory.A_ONLY,
-        FindingCategory.B_ONLY,
-        FindingCategory.DUPLICATE_AMBIGUOUS,
-    )
     comparisons = []
     for mapping in comparison_fields:
         values_a = tuple(sorted({record.raw_fields[mapping.file_a] for record in rows_a}))
@@ -258,9 +301,45 @@ def _classify(
     amount_b: Decimal,
     amount_tolerance: Decimal,
     mode: ReconciliationMode,
+    *,
+    analysis: CorrespondenceAnalysis | None = None,
 ) -> FindingCategory:
-    if mode is ReconciliationMode.UNIQUE and (len(rows_a) > 1 or len(rows_b) > 1):
-        return FindingCategory.DUPLICATE_AMBIGUOUS
+    if mode is ReconciliationMode.UNIQUE:
+        if len(rows_a) > 1 or len(rows_b) > 1:
+            return FindingCategory.DUPLICATE_AMBIGUOUS
+        return _classify_amounts(rows_a, rows_b, amount_a, amount_b, amount_tolerance)
+    if mode is ReconciliationMode.GROUPED_BY_KEY:
+        return _classify_amounts(rows_a, rows_b, amount_a, amount_b, amount_tolerance)
+    if mode is ReconciliationMode.BOUNDED_ONE_TO_MANY:
+        if analysis is None:
+            if len(rows_a) > 1 or len(rows_b) > 1:
+                raise ReconciliationIntegrityError("bounded duplicate group requires analysis")
+            return _classify_amounts(rows_a, rows_b, amount_a, amount_b, amount_tolerance)
+        if analysis.status is CorrespondenceStatus.UNIQUE_EXACT:
+            return (
+                FindingCategory.AMOUNT_MISMATCH
+                if analysis.unassigned_rows_a or analysis.unassigned_rows_b
+                else FindingCategory.EXACT_MATCH
+            )
+        if analysis.status in (
+            CorrespondenceStatus.AMBIGUOUS,
+            CorrespondenceStatus.NO_EXACT_SUBSET,
+            CorrespondenceStatus.SINGLETON_ONLY,
+            CorrespondenceStatus.BOUND_EXCEEDED,
+            CorrespondenceStatus.NOT_ELIGIBLE,
+        ):
+            return FindingCategory.DUPLICATE_AMBIGUOUS
+        raise ReconciliationIntegrityError("unsupported bounded correspondence status")
+    raise ReconciliationIntegrityError("unsupported reconciliation mode")
+
+
+def _classify_amounts(
+    rows_a: Sequence[SourceRecord],
+    rows_b: Sequence[SourceRecord],
+    amount_a: Decimal,
+    amount_b: Decimal,
+    amount_tolerance: Decimal,
+) -> FindingCategory:
     if rows_a and not rows_b:
         return FindingCategory.A_ONLY
     if rows_b and not rows_a:
@@ -282,6 +361,22 @@ def _assert_integrity(
         raise ReconciliationIntegrityError(
             "finding deltas do not explain the control-total difference"
         )
+
+    review_and_tolerance_delta = sum_decimals(
+        (sum_decimals(finding.delta for finding in result.exceptions), result.tolerated_delta_total)
+    )
+    if result.control_difference != review_and_tolerance_delta:
+        raise ReconciliationIntegrityError(
+            "review exceptions and tolerated deltas do not explain the control-total difference"
+        )
+    for finding in result.findings:
+        needs_analysis = result.mode is ReconciliationMode.BOUNDED_ONE_TO_MANY and (
+            len(finding.rows_a) > 1 or len(finding.rows_b) > 1
+        )
+        if (finding.correspondence_analysis is not None) != needs_analysis:
+            raise ReconciliationIntegrityError(
+                "correspondence analysis must appear exactly on bounded duplicate-shaped findings"
+            )
 
     expected_rows = Counter(
         (record.source, record.source_row) for record in (*records_a, *records_b)

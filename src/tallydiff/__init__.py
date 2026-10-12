@@ -6,14 +6,20 @@ from tallydiff.engine import NormalizationCollisionError, ReconciliationIntegrit
 from tallydiff.export import export_exceptions_csv
 from tallydiff.ingest import IngestionError, ingest_csv, inspect_csv_columns
 from tallydiff.models import (
+    EXACT_UNIQUE_ONE_TO_MANY_POLICY,
+    CorrespondenceAnalysis,
+    CorrespondenceReason,
+    CorrespondenceStatus,
     FieldComparison,
     FieldComparisonStatus,
     FindingCategory,
+    OneToManyPolicy,
     ReconciliationFinding,
     ReconciliationMode,
     ReconciliationResult,
     Source,
     SourceRecord,
+    SubsetSolution,
 )
 from tallydiff.normalization import (
     KeyNormalizationError,
@@ -30,9 +36,13 @@ from tallydiff.profiles import (
 from tallydiff.xlsx import ingest_xlsx, inspect_xlsx_columns, inspect_xlsx_sheets
 
 __all__ = [
+    "EXACT_UNIQUE_ONE_TO_MANY_POLICY",
     "AmountParseError",
     "ColumnMapping",
     "ComparisonFieldMapping",
+    "CorrespondenceAnalysis",
+    "CorrespondenceReason",
+    "CorrespondenceStatus",
     "FieldComparison",
     "FieldComparisonStatus",
     "FindingCategory",
@@ -44,6 +54,7 @@ __all__ = [
     "NormalizationCollision",
     "NormalizationCollisionError",
     "OriginalKeyEvidence",
+    "OneToManyPolicy",
     "ProfileError",
     "ReconciliationFinding",
     "ReconciliationIntegrityError",
@@ -51,6 +62,7 @@ __all__ = [
     "ReconciliationResult",
     "Source",
     "SourceRecord",
+    "SubsetSolution",
     "export_exceptions_csv",
     "export_mapping_profile",
     "ingest_csv",

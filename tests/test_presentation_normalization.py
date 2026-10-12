@@ -97,7 +97,8 @@ def test_profile_round_trip_and_manual_configuration_share_identity() -> None:
         reconciliation_mode=ReconciliationMode.GROUPED_BY_KEY,
     )
     profile = load_mapping_profile(profile_data)
-    assert json.loads(profile_data)["version"] == 4
+    assert json.loads(profile_data)["version"] == 5
+    assert json.loads(profile_data)["one_to_many_policy"] is None
     assert _identity(
         config,
         amount_tolerance=Decimal("0.01"),

@@ -1,17 +1,19 @@
 # TallyDiff
 
-**TallyDiff v0.5.0** compares two structured financial exports locally
+**TallyDiff v0.6.0** compares two structured financial exports locally
 and explains which matching key groups account for their difference. Pair key columns, such as
 vendor and invoice number, then compare unique records or explicitly aggregate
-all rows sharing each key. Optional normalization handles known differences in
+all rows sharing each key, or review bounded one-to-many correspondence.
+Optional normalization handles known differences in
 key representation while preserving every original source row as evidence.
 Optional secondary fields compare additional evidence after keys are matched.
 
 - **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
   worksheet per workbook; multiple worksheets require an explicit choice.
-- **Two reconciliation modes**: **Unique records** keeps duplicate keys ambiguous;
+- **Three reconciliation modes**: **Unique records** keeps duplicate keys ambiguous;
   **Group by matching key** compares key totals without inferring individual
-  row correspondence.
+  row correspondence; **Bounded one-to-many** searches exact physical-row subsets
+  under a fixed policy and requires review of every accepted inference.
 - **Absolute amount tolerance**, defaulting to zero. Accepted nonzero differences
   keep their primary **Within tolerance** category. Differences without a secondary
   mismatch are accepted in a separate review table.
@@ -20,10 +22,10 @@ Optional secondary fields compare additional evidence after keys are matched.
   groups whose financial delta is zero.
 - **Opt-in normalization per key component**: Unicode casefolding, whitespace
   collapse, punctuation removal, and ASCII leading-zero removal. Every rule starts
-  off; same-file normalization collisions block both reconciliation modes.
+  off; same-file normalization collisions block all three reconciliation modes.
 - **Reusable mapping profiles** for ordered key pairs, amount columns, tolerance,
-  mode, normalization, and secondary mappings. Current downloads use schema
-  version 4; valid versions 1–3 restore zero secondary comparisons.
+  mode, normalization, secondary mappings, and the bounded policy identifier.
+  Current downloads use schema version 5; valid versions 1–4 migrate explicitly.
 - **Exact Decimal arithmetic and original evidence**. XLSX numeric cells first
   convert through decimal text; Excel display formatting is not reconstructed.
   Formulas and Excel errors in selected key, amount, or secondary fields block ingestion.
@@ -36,6 +38,8 @@ Optional secondary fields compare additional evidence after keys are matched.
 Equal totals alone never imply a reconciliation. TallyDiff reports differences;
 it does not decide which source is authoritative. See [known limitations](#known-limitations)
 and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
+
+TallyDiff v0.6.0 includes bounded correspondence and profile schema v5.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
@@ -121,7 +125,48 @@ multiple source rows on at least one side and no secondary mismatch. The overall
 **Exact match** count still includes one-to-one exact findings. All counts
 represent key groups, not rows.
 
-Normalization and collision safety preflight apply before either mode matches
+**Bounded one-to-many** analyzes the entire matching-key group only when one side
+has exactly one row, the **sole anchor**, and the other has multiple candidate
+rows. Either File A or File B may be the anchor. It searches nonempty subsets
+with **exact Decimal equality**, preserving physical row identity: equal-valued
+rows are separate choices. Singleton solutions compete with multirow solutions;
+a unique singleton is reported as **SINGLETON_ONLY** and is never promoted to an
+accepted one-to-many inference. Ordinary one-versus-one groups retain the usual
+exact/tolerance/mismatch rules.
+
+An accepted solution must be unique and contain at least two candidate rows.
+All parent rows remain evidence. A full subset has primary **Exact match**;
+any residual row makes the parent **Amount mismatch**, even if the residual amount
+falls within tolerance. **Every accepted inference requires
+review**, including exact, signed-credit and zero-anchor solutions. Unresolved
+duplicates stay **Duplicate / ambiguous** with an explicit analysis status.
+Amount consistency does not establish accounting authority or business validity.
+
+| File A | File B | Bounded outcome |
+| --- | --- | --- |
+| `300` | `100, 200` | Unique full subset; Exact match; review required |
+| `300` | `100, 200, 50` | Unique subset with residual `50`; Amount mismatch; review required |
+| `300` | `100, 200, 150, 150` | Two exact physical subsets; ambiguous; no accepted allocation |
+| `300` | `300, 100, 200` | Singleton rival competes with a pair; ambiguous |
+| `300, 50` | `100, 200` | Both sides have multiple rows; not eligible |
+| `0` | `150, -150` | Unique signed pair; Exact match; review required |
+| `0` | `0, 0` | Two physical singleton rivals; ambiguous |
+
+The fixed **exact_unique_v1** policy permits **12 candidates** (at most **4,095**
+nonempty combinations per key), **1,000,000 planned combinations per run**, and
+**two retained ambiguity witnesses**. Groups are processed in sorted canonical-key
+order. Each eligible search reserves its entire planned cost before examination;
+early ambiguity still charges that full reservation. The first eligible group
+whose cost cannot fit records **RUN_BUDGET_EXHAUSTED**; all later searchable
+groups remain unsearched, even if individually cheaper. Structural exclusions
+and the **CANDIDATE_ROW_LIMIT** keep their own reason and reserve no work.
+Bounded or unsearched results preserve every row and explicitly disclose their
+limit; they do not prove that no exact subset exists. Two witnesses establish
+ambiguity; singleton-only analysis retains its sole one-row witness. Witnesses
+are never accepted allocations. Secondary fields cannot choose,
+rank or disambiguate monetary subsets.
+
+Normalization and collision safety preflight apply before any mode matches
 or groups rows. Distinct same-file original keys cannot be combined by normalization.
 
 ## Key normalization
@@ -205,6 +250,11 @@ text; Excel visual formatting does not supply missing characters or zeroes.
   versus `Sales, Marketing` differs. Occurrence counts are ignored. Credits, zero
   lines, offsets, and blank values all contribute evidence. Both sides must be
   present; one-sided groups report **NOT_COMPARABLE** in this mode too.
+- **Bounded one-to-many:** ordinary one-versus-one comparisons use normal exact
+  secondary equality. Every analyzed duplicate-shaped group reports
+  **NOT_COMPARABLE** for every configured field, even when whole-key distinct
+  sets agree or a monetary inference is accepted. Sets retain all parent rows,
+  including residuals. Secondary equality is not evidence of row correspondence.
 
 **Grouped secondary equality establishes no row pairing, cross-field association,
 secondary subtotal, or amount allocation.** If Department sets are both
@@ -239,7 +289,7 @@ normalization never rewrites secondary evidence.
 ## Absolute amount tolerance
 
 **Amount tolerance** accepts ordinary monetary text in the same units as the
-selected amount columns. It defaults to `0`, requiring exact equality in either mode.
+selected amount columns. It defaults to `0`, requiring exact amount equality.
 Negative, blank, malformed, and non-finite values block reconciliation. The
 existing monetary grammar is used directly to construct a Decimal; no float
 conversion or rounding occurs, and more than two decimal places are supported.
@@ -252,6 +302,8 @@ mismatch**. At tolerance `0.01`, `100.00` versus `100.01` is within tolerance wi
 a true delta of `-0.01`; `100.00` versus `100.02` remains an amount mismatch.
 One-sided groups always require review, including zero-net grouped keys. Duplicate
 / ambiguous groups in Unique records mode remain exceptions regardless of tolerance.
+In Bounded one-to-many, tolerance applies only to ordinary one-versus-one groups;
+subset equality is exact and residual parents remain mismatches regardless of tolerance.
 
 Within-tolerance findings **without a secondary mismatch** are accepted variances,
 excluded from exceptions and their CSV report. A secondary mismatch keeps the
@@ -277,7 +329,9 @@ secondary mappings are valid; you do not need to run reconciliation first. The d
 A profile remembers ordered File A ↔ File B key pairs, both amount columns,
 reconciliation mode, exact Decimal tolerance (including trailing zeroes such as
 `0.0100`), the four normalization flags for each key pair, and ordered secondary
-comparison mappings with exact directional column names.
+comparison mappings with exact directional column names, plus `one_to_many_policy`:
+`"exact_unique_v1"` for bounded mode and `null` for the two legacy modes.
+Limits and semantic switches are fixed by the application, not configurable in profiles.
 It contains column names and configuration only: no source rows or values,
 filenames or hashes, worksheet names, financial totals, findings, collision
 evidence, timestamps, or machine-specific paths. Profiles stay local; TallyDiff
@@ -309,13 +363,13 @@ columns; nothing is partially applied or guessed. A rejected profile leaves the
 current configuration and any completed result intact. Update mappings manually
 when schemas change, then save a new profile.
 
-Current profiles use UTF-8 JSON with schema version **4**. For an export with
+Current profiles use UTF-8 JSON with schema version **5**. For an export with
 these columns, a profile can include:
 
 ```json
 {
   "format": "tallydiff-mapping-profile",
-  "version": 4,
+  "version": 5,
   "key_pairs": [
     {"file_a": "Vendor ID", "file_b": "Supplier"},
     {"file_a": "Invoice Number", "file_b": "Invoice Ref"}
@@ -344,7 +398,8 @@ these columns, a profile can include:
     {"file_a": "Department", "file_b": "Cost Center"},
     {"file_a": "Currency", "file_b": "Currency Code"},
     {"file_a": "Posting Date", "file_b": "Document Date"}
-  ]
+  ],
+  "one_to_many_policy": null
 }
 ```
 
@@ -354,14 +409,19 @@ these columns, a profile can include:
 | Version 2 | Stored mode | All rules off | None |
 | Version 3 | Stored mode | Stored ordered per-component rules | None |
 | Version 4 | Stored mode | Stored ordered per-component rules | Stored ordered pairs |
+| Version 5 | Stored mode, including bounded | Stored ordered per-component rules | Stored ordered pairs |
 
-Current downloads always use version 4, including `comparison_fields: []` when
+Current downloads always use version 5, including `comparison_fields: []` when
 none are configured. Versions 1–3 explicitly clear existing secondary selections.
+Versions 1–4 load with no bounded policy and cannot select bounded mode; version 4
+retains comparisons. Version 5 requires the exact policy ID for bounded mode and
+`null` for legacy modes; unknown IDs, policy objects or custom limits are rejected.
 The `key_normalization` array has exactly
 one object per ordered key pair, each containing exactly the four documented
 boolean fields. All-false rules canonicalize to `None` on load and restore every
 checkbox to off. Version 1 has neither mode nor normalization fields; version 2
-has mode but no normalization field. Modes are `"unique"` or `"grouped_by_key"`.
+has mode but no normalization field. Current modes are `"unique"`,
+`"grouped_by_key"`, or `"bounded_one_to_many"`.
 Tolerance is a JSON string parsed directly with the monetary grammar; JSON
 numeric tolerances are rejected. Invalid JSON, duplicate or unknown fields,
 unsupported formats or versions, non-boolean flags, component-count mismatches,
@@ -369,7 +429,7 @@ blank or repeated key selections, invalid amount names, incomplete/repeated
 secondary selections, same-side amount/secondary overlap, and invalid or negative
 tolerance are rejected with a concise message. Key/secondary overlap is allowed.
 
-Package version **0.5.0** and profile schema version **4** are separate versions.
+Package version **0.6.0** and profile schema version **5** are separate versions.
 
 ## Supported inputs
 
@@ -453,25 +513,26 @@ Processing is local and in memory using openpyxl; Excel/LibreOffice are not
 required. Legacy `.xls`, macro-enabled `.xlsm`, templates, encrypted workbooks,
 formula calculation, table/pivot interpretation, named ranges, and reconciling
 multiple sheets at once are unsupported. The exception download remains CSV;
-TallyDiff does not write Excel workbooks. Schema version 4 profiles store mappings,
+TallyDiff does not write Excel workbooks. Schema version 5 profiles store mappings,
 tolerance, mode, per-component normalization, and ordered secondary pairs independently
-of input format, filename, or sheet; valid versions 1–3 load with zero comparisons.
+and the bounded policy ID independently of input format, filename, or sheet;
+valid versions 1–3 load with zero comparisons and version 4 retains comparisons.
 Versions 1/2 also load with normalization off.
 
 ## Correctness and traceability
 
-| Category | Unique records | Group by matching key |
-| --- | --- | --- |
-| Exact match | One row on each side with equal amounts. | Both sides present with equal key totals. |
-| Within tolerance | One row on each side with a nonzero absolute delta at or below tolerance. | Both sides present with a nonzero absolute key-total delta at or below tolerance. |
-| Amount mismatch | One row on each side with an absolute delta above tolerance. | Both sides present with an absolute key-total delta above tolerance. |
-| File A only | One File A row and no File B row. | One or more File A rows and no File B rows, even with a zero net amount. |
-| File B only | One File B row and no File A row. | One or more File B rows and no File A rows, even with a zero net amount. |
-| Duplicate / ambiguous | More than one row on either side; all rows need review. | Not emitted: after collision preflight, every matching-key group is compared by presence and totals. |
+| Category | Unique records | Group by matching key | Bounded one-to-many |
+| --- | --- | --- | --- |
+| Exact match | One row on each side with equal amounts. | Both sides present with equal key totals. | Ordinary exact pair, or unique full subset requiring review. |
+| Within tolerance | One row on each side with a nonzero absolute delta at or below tolerance. | Both sides present with a nonzero absolute key-total delta at or below tolerance. | Ordinary one-versus-one only. |
+| Amount mismatch | One row on each side with an absolute delta above tolerance. | Both sides present with an absolute key-total delta above tolerance. | Ordinary mismatch, or accepted subset with any residual rows. |
+| File A only | One File A row and no File B row. | One or more File A rows and no File B rows, even with a zero net amount. | One File A row and no File B row. |
+| File B only | One File B row and no File A row. | One or more File B rows and no File A rows, even with a zero net amount. | One File B row and no File A row. |
+| Duplicate / ambiguous | More than one row on either side; all rows need review. | Not emitted: every key group is compared by presence and totals after preflight. | Any unresolved analyzed group, including ineligible, singleton-only, no-exact and bounded searches. |
 
 In Unique records mode, duplicates take precedence over other categories, even
 when amounts agree or offset to zero. Grouped mode checks presence before totals.
-Neither mode silently pairs or discards source rows.
+No mode silently discards source rows. Bounded inference is explicit and review-required.
 Primary categories describe amount/presence/ambiguity independently of secondary
 status. Exact and within-tolerance groups may still require secondary review.
 Counts represent key groups, while the evidence panels retain every source row.
@@ -508,7 +569,7 @@ The exception table supports these display-only controls:
   fuzzy matching, or regular-expression interpretation.
 - **Exception categories** always offers amount mismatch, File A only, File B only,
   and duplicate / ambiguous groups. Exact match and Within tolerance are added
-  when such secondary exceptions exist. All displayed options start selected;
+  when such review-required groups exist, including accepted inference. All options start selected;
   selecting none shows no exceptions.
 - **Has secondary field mismatch** appears for configured comparisons and defaults
   to off. When enabled it hides primary-only and NOT_COMPARABLE-only exceptions.
@@ -525,6 +586,9 @@ with no matches leaves the completed result available. Selecting any visible row
 opens structured comparison details and every original source row for that
 finding, including multi-row groups. Changing a review view clears its row selection.
 Exact grouped totals and accepted variances retain separate evidence tables.
+Analyzed evidence also shows the parent anchor, selected subset, residual rows,
+ambiguity witnesses, reason, counters and completeness, while retaining both
+complete original source tables.
 
 Review controls and evidence selection do not change configuration identity,
 profiles, reconciliation metrics, control totals, or the exception download.
@@ -536,13 +600,14 @@ hidden by the current search or filters.
 **Download exception report** saves `tallydiff_exceptions.csv` for the complete
 reconciliation result, including exceptions hidden by review controls. There
 is one row per exception key group, including zero-delta ambiguous and one-sided
-groups and exact-amount secondary mismatches. Exact/within-tolerance groups are
-excluded only when they have no secondary mismatch; the UI offers no exception
+groups, exact-amount secondary mismatches and every accepted inference.
+Exact/within-tolerance groups are excluded only when they have no secondary
+mismatch or accepted inference; the UI offers no exception
 download when there are no exceptions.
 When accepted variance exists, exception-report deltas alone need not equal the
 control difference: add the net accepted variance shown in the UI.
 
-With zero comparisons, the unchanged seven columns, in order, are:
+The unchanged seven base columns, in order, are:
 `Category`, `Matching key`, `File A amount`, `File B amount`,
 `Delta (A - B)`, `File A records`, `File B records`. Matching key components use
 ` / `, as in the table. With normalization active, these are normalized matching
@@ -557,6 +622,20 @@ Values are exact UTF-8 JSON arrays of sorted distinct evidence strings, includin
 observed values for NOT_COMPARABLE findings. Status is `match`, `mismatch`, or
 `not_comparable`. The secondary summary identifies only mismatching pair numbers
 and names. Primary category labels and true financial deltas remain unchanged.
+
+When any exported exception contains stored analysis, append **Correspondence
+status** and **Correspondence evidence** after all secondary columns (or after
+the seven base columns with zero comparisons). Ordinary rows have blank cells;
+an export with no analyzed exceptions omits both columns. The status uses the
+machine value, such as `unique_exact` or `bound_exceeded`. Evidence is compact,
+versioned UTF-8 JSON: `schema_version: 1`, all eight policy fields, matching-key
+array, status, nullable reason and sole-parent anchor, nullable accepted solution,
+unassigned rows on each side, ordered ambiguity witnesses, planned/examined/reserved
+counters and `search_complete`. Each physical reference has source, original
+source-row ordinal, exact amount string and original key array; each solution
+has its amount and rows on both sides. Two witnesses prove ambiguity; a
+singleton-only witness records the sole one-row candidate. Neither is accepted
+correspondence. JSON object order and complete CSV bytes are deterministic.
 
 Each side lists **all** participating source record numbers, separated by `; `,
 including every duplicate. Keep the original input files, selected worksheet
@@ -590,6 +669,7 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `amounts.py` | Strict monetary text parsing directly to Decimal. |
 | `models.py` | Validated source records, immutable evidence, findings and totals. |
 | `engine.py` | Normalization/collision preflight, grouping, classification, ordering and integrity checks. |
+| `subset_matching.py` | Fixed bounded exact physical-row subset search and stored correspondence evidence. |
 | `normalization_config.py` | Immutable, stdlib-only per-component normalization configuration. |
 | `normalization.py` | Deterministic transformations and structured original-key collision evidence. |
 | `ingest.py` | Header discovery and atomic CSV validation with explicit mappings. |
@@ -597,7 +677,7 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `configuration.py` | Shared ordered column mappings and manual mapping validation. |
 | `profiles.py` | Validated JSON profile import/export and directional column compatibility. |
 | `presentation.py` | UTF-8 decoding, configuration identity, review filtering/sorting and display strings. |
-| `export.py` | Ordinary CSV bytes, reusing UI-independent labels and Decimal formatting. |
+| `export.py` | Complete exception CSV and structured stored correspondence evidence. |
 | `app.py` | Streamlit controls, error messages, results, download and source evidence. |
 
 Public Python APIs are exposed through `tallydiff`. The engine and export layer
@@ -606,7 +686,9 @@ Results carry a SHA-256 identity covering file contents, filenames, ordered key
 pairs, amount selections, selected worksheets, mode, effective Decimal tolerance,
 ordered per-component normalization flags, and ordered secondary selections;
 each rerun checks it before showing results or a download. Exact/all-false settings keep the existing exact
-identity. Completed-result disclosure uses the stored result configuration. Review
+identity. The bounded policy ID enters bounded configuration identity; existing
+legacy identities remain unchanged. Completed-result disclosure uses stored
+configuration and policy evidence. Review
 search, categories, minimum delta, sort order, secondary-mismatch filter, evidence
 selection, profile filenames, and JSON formatting do not enter this identity. Equivalent tolerance values share
 an identity while profile serialization preserves their fractional trailing zeroes.
@@ -650,7 +732,7 @@ canaries exercise packaging exclusions before the artifact guard inspects both
 archives. Actions are pinned to commits; uv is pinned to **0.12.23**.
 There is no deployment or publishing step.
 
-Tests cover both modes, grouped cardinalities and evidence, row accounting and
+Tests cover all three modes, grouped cardinalities and evidence, row accounting and
 control-total invariants, duplicate ambiguity in Unique records mode,
 Decimal precision and context isolation, invalid monetary text, CSV validation,
 encoding, mappings, missing versus zero amounts, evidence and export read-back.
@@ -662,12 +744,12 @@ precedence, accepted variance totals, separate review, and export exclusion.
 Review tests cover display-only filtering/sorting, correct filtered-row evidence,
 and complete exports. Artifact tests cover archive contamination, omissions,
 metadata, and source mismatches. Normalization tests cover Unicode rules and
-fixed order, collision blocking in both modes, blank outputs, immutable evidence,
+fixed order, collision blocking in all modes, blank outputs, immutable evidence,
 configuration identity, and app/profile state. Secondary tests cover exact original
 evidence, independent grouped sets, review partition, structured export/details,
 normalization interactions, ordered mappings, and atomic reset/profile state.
 Profile tests cover strict version
-1/2/3/4 schema validation, backward compatibility, mode/tolerance/normalization/secondary
+1/2/3/4/5 schema validation, backward compatibility, mode/tolerance/normalization/secondary/policy
 round trips, exact Decimal values, key order,
 directional compatibility, atomic application, editable controls, download
 validity, configuration privacy, and stale-result clearing. XLSX tests cover
@@ -832,6 +914,139 @@ The optional same-data comparison-disabled overhead measurement was not added;
 the table measures the complete configured comparison workload. Raw benchmark
 output stays under ignored `benchmark_output/`, without entering release artifacts.
 
+### Bounded-correspondence acceptance
+
+The dedicated `scripts/subset_oracle.py` workload leaves all four historical
+`scripts/synthetic_data.py` recipes and their frozen hashes unchanged. It uses
+the asymmetric Amount/Gross Amount schema and the three directional secondary
+mappings above. A 32-scenario cycle covers ordinary pairs and missing singletons,
+full and residual subsets in both directions, signed credits, zero anchors,
+physical duplicates, singleton rivals, offsets, singleton-only and no-exact
+solutions, both-multiple and missing duplicated groups, secondary case/whitespace/
+blank/Unicode differences, subcent values, and large-value cancellation. Positions
+98 and 99 in each 257-group block replace their normal recipe with 12-candidate
+and 13-candidate boundary cases. Seeds change exact integer amounts; optional
+physical shuffling assigns source ordinals from the final construction plan.
+
+Expected truth uses only the standard library: integer ten-thousandths, signed
+dynamic-programming sum states with physical-row bitmasks and multiplicity
+saturated at two. It retains the first two witnesses in cardinality then source-row
+order; independent `math.comb` ranks determine examined counts. It never calls
+the product's subset enumeration, Decimal summation, classification, normalization,
+models or serializers. Known raw/canonical keys support normalization without
+using the product normalizer. AST/import/no-float guards enforce this separation.
+Four new frozen scale/seed/shuffle configurations preserve CSV SHA-256, full
+summaries and complete ordered-truth hashes alongside the historical checks.
+
+`scripts/subset_benchmark.py` runs the product and checks every parent finding,
+original source object, row ordinal/key/raw evidence, policy field, status/reason,
+selected subset, residual, ordered witness, counter, completeness flag and
+secondary comparison. Construction-derived CSV/JSON checks compare the entire
+byte sequence, including key order, exact amounts and every nested reference.
+Corruption tests attack financial and evidence changes, missing or reordered
+witnesses/residuals, incorrect counters, false completeness, omitted inference
+review, secondary status, and CSV/JSON fields and ordering.
+
+Normal pytest uses **20,000 groups**, **23,101 File A rows**, **35,428 File B rows**,
+seed **42**, shuffle seed **77**, tolerance **0.01**, and all three comparisons.
+It verifies **13,795 analyzed groups**, **7,516 inferences**, **377,034 planned and
+reserved combinations**, and **370,624 examined combinations**. Separate 257-group
+tests cover all four CSV/XLSX combinations with equivalent text evidence, with
+normalization both disabled and enabled. Existing numeric/date XLSX conversion,
+collision-before-search, profile/UI and package-artifact checks remain active;
+selected formulas and Excel errors still block ingestion. Feature-disabled Unique
+and Grouped runs have no analysis, no policy and no subset-search calls.
+
+```bash
+uv run pytest tests/test_subset_oracle.py tests/test_subset_benchmark.py tests/test_realistic_one_to_many.py
+uv run python -m scripts.subset_oracle --groups 1000 --seed 42 --shuffle-seed 77 --normalized --write
+uv run python -m scripts.benchmark --workload subset --groups 10000 50000 100000 --seed 42 --tolerances 0.01 --modes bounded_one_to_many --memory
+uv run python -m scripts.benchmark --workload subset_exhaustive --groups 354 --seed 42 --tolerances 0.01 --modes bounded_one_to_many --memory
+uv run python -m scripts.benchmark --workload subset_early_ambiguity --groups 354 --seed 42 --tolerances 0.01 --modes bounded_one_to_many --memory
+```
+
+The benchmark reports generation, ingestion, reconciliation, export and full
+independent verification separately. Each bounded run also measures and verifies
+Unique records on the **same ingested objects**; those baseline times are separate
+from the bounded total and share its generation/ingestion. Peak Python allocations
+come from a separate full-pipeline `tracemalloc` pass, including verification and
+the subsequent same-input baseline; they do not measure process RSS, native
+allocations, XLSX ingestion or browser rendering. Calibration workloads have
+354 fixed construction groups regardless of the `--groups` argument. They reserve
+exactly `244 × 4095 + 511 + 103 × 3 = 1,000,000` combinations, then verify first
+failure, sticky exhaustion, candidate-cap/structural precedence and ordinary pairs.
+The exhaustive workload completes every reserved examination; the zero-candidate
+ambiguity variant reserves the same amount and examines only **696** combinations.
+
+Measured on **CPython 3.14.7, 64-bit AMD64, Windows 10 build 19045**, seed **42**,
+tolerance **0.01**, normalization disabled, with all **three comparisons** active.
+Every run passed the complete independent verifier and byte-exact export check.
+These are untraced single-run observations, not capacity guarantees, SLAs or CI
+timing thresholds. All times are seconds; peak is MiB in the separate Python
+allocation pass described above.
+
+| Groups | A / B rows | Generate | Ingest | Reconcile | Export | Verify | Total | Peak MiB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 11,548 / 17,725 | 0.236 | 0.452 | 3.571 | 0.887 | 3.801 | 8.947 | 165.9 |
+| 50,000 | 57,754 / 88,599 | 1.245 | 2.435 | 18.614 | 4.526 | 19.743 | 46.563 | 830.6 |
+| 100,000 | 115,505 / 177,167 | 2.666 | 4.990 | 26.411 | 8.722 | 33.962 | 76.751 | 1,603.9 |
+
+| Groups | Analyzed | Inferred | Planned | Reserved | Examined |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 6,900 | 3,757 | 188,553 | 188,553 | 186,065 |
+| 50,000 | 34,500 | 18,801 | 942,733 | 942,733 | 930,325 |
+| 100,000 | 68,995 | 19,939 | 1,881,329 | 996,487 | 983,335 |
+
+| Analysis status | 10,000 groups | 50,000 groups | 100,000 groups |
+| --- | ---: | ---: | ---: |
+| unique_exact | 3,757 | 18,801 | 19,939 |
+| ambiguous | 1,554 | 7,754 | 8,220 |
+| no_exact_subset | 310 | 1,550 | 1,645 |
+| singleton_only | 310 | 1,550 | 1,645 |
+| bound_exceeded | 39 | 195 | 28,243 |
+| not_eligible | 930 | 4,650 | 9,303 |
+
+The 100,000-group workload reaches the fixed budget. Its remaining 3,513
+combinations cannot reserve the next 4,095-cost search, so exhaustion becomes
+sticky even for later cheaper groups. Unsearched groups retain explicit bounds
+and every physical row; the lower inference count is expected policy behavior.
+
+Same-ingested-data **Unique records** baseline, with identical tolerance and
+secondary mappings, no policy, no analysis and zero planned/reserved/examined work:
+
+| Groups | Reconcile | Export | Independent verify |
+| ---: | ---: | ---: | ---: |
+| 10,000 | 0.812 | 0.454 | 1.969 |
+| 50,000 | 4.490 | 2.254 | 9.551 |
+| 100,000 | 8.987 | 4.392 | 18.503 |
+
+Raw developer output is retained under ignored `benchmark_output/v06-task6-subset-*.txt`;
+it is excluded from package artifacts. These timings include configured secondary
+comparisons and all source retention, and do not isolate subset arithmetic alone.
+
+Isolated calibration, on the same platform/Python with seed **42**, tolerance
+**0.01**, three comparisons, **354 groups**, **356 A rows** and **3,163 B rows**:
+
+| Workload | Generate | Ingest | Reconcile | Export | Independent verify | Total | Peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Completed exhaustive searches | 0.021 | 0.052 | 12.215 | 0.048 | 4.057 | 16.393 | 12.3 |
+| Early ambiguity | 0.018 | 0.048 | 0.079 | 0.058 | 0.231 | 0.434 | 13.9 |
+
+Both plan **1,000,006** combinations, reserve **1,000,000**, analyze **353** groups,
+and retain three bounded and two structurally ineligible groups. Exhaustive
+search examines **1,000,000** combinations: 174 unique inferences and 174 completed
+no-exact searches. Early ambiguity examines **696** combinations and retains
+348 ambiguous groups, with no accepted inference. Their same-input Unique
+baselines respectively measured reconcile/export/verify **0.034/0.017/0.092** and
+**0.037/0.019/0.089** seconds, with zero subset work. These observations demonstrate
+why reserved work and examined work must be reported separately.
+
+The validation recommendation is to **keep the current 12-candidate /
+1,000,000-planned policy**. These measurements establish deterministic bounded
+behavior and expose the cost of completed searches; they do not guarantee latency
+or large-file capacity. No constants, runtime behavior, package version or release
+artifacts were changed for this validation.
+
 ## Python API contracts
 
 ### Reconciliation kernel
@@ -839,7 +1054,8 @@ output stays under ignored `benchmark_output/`, without entering release artifac
 `reconcile(records_a, records_b, *, amount_tolerance=Decimal("0"),
 mode=ReconciliationMode.UNIQUE, key_normalization=None, comparison_fields=())` defaults to Unique
 records, exact key matching, and exact amount equality.
-`mode` must be a `ReconciliationMode` enum member (`UNIQUE` or `GROUPED_BY_KEY`);
+`mode` must be a `ReconciliationMode` enum member (`UNIQUE`, `GROUPED_BY_KEY`,
+or `BOUNDED_ONE_TO_MANY`);
 strings and other types raise `TypeError` before inputs are consumed. Tolerance must be a
 finite, nonnegative `Decimal`; other types raise `TypeError`, and non-finite or
 negative Decimals raise `ValueError`. No numeric coercion is performed.
@@ -848,9 +1064,14 @@ negative Decimals raise `ValueError`. No numeric coercion is performed.
 `.comparison_fields` record the configured values.
 `result.tolerated_findings` contains accepted nonzero differences without a
 secondary mismatch, and `result.tolerated_delta_total` is their exact signed net delta.
-`finding.is_exception` and `result.exceptions` include primary exceptions or any
-secondary mismatch; exact/within-tolerance groups are accepted only without a
-mismatch. `result.secondary_mismatch_findings` is the ordered mismatch subset.
+`finding.is_exception` and `result.exceptions` include primary exceptions, any
+secondary mismatch, or accepted inference; exact/within-tolerance groups are accepted only without a
+mismatch or accepted correspondence. `result.secondary_mismatch_findings` is the ordered mismatch subset.
+Bounded results carry `.one_to_many_policy`; legacy results carry `None`.
+`.correspondence_analysis_findings` and `.inferred_correspondence_findings`
+are ordered subsets. Each analyzed finding has `.correspondence_analysis`,
+`.correspondence_status`, `.inferred_solution`, and `.has_inferred_correspondence`.
+The public `reconcile` API has no custom-policy or custom-limit parameter.
 `result.findings`, control totals, and the integrity invariant include
 every group, including accepted variances.
 
@@ -899,7 +1120,7 @@ rule sets for exact components. Types and component counts are validated;
 `None` preserves exact engine matching.
 
 `reconcile(..., key_normalization=config)` performs normalization and same-source
-collision preflight before classification in either mode. `KeyNormalizationError`
+collision preflight before classification or search in all modes. `KeyNormalizationError`
 reports a blank normalized component with source/row/component/original context.
 `NormalizationCollisionError.collisions_a` and `.collisions_b` provide structured
 `NormalizationCollision` objects with the normalized key and
@@ -920,7 +1141,9 @@ available for compatibility, and public profile APIs are exposed via `tallydiff`
   `key_normalization` fields. Version 1 loads as Unique with no normalization;
   version 2 preserves its mode with no normalization. Version 3 preserves all four
   settings with zero comparisons. Version 4 also restores ordered comparison
-  mappings; all-false rules canonicalize to `None`. Current exports use version 4.
+  mappings; all-false rules canonicalize to `None`. Version 5 validates the fixed
+  bounded policy ID, exposed as `profile.one_to_many_policy`; legacy profiles have
+  no policy. Current exports use version 5.
   It accepts a UTF-8 BOM on byte input and raises `ProfileError` for invalid contents.
 - `profile.validate_columns(columns_a, columns_b)` raises `ProfileError` listing
   missing directional key, amount, or secondary columns; extra columns are allowed.
@@ -1044,6 +1267,11 @@ when ingesting CSV). No malformed amount is converted to zero.
   beyond those explicit grouped key totals. Tolerance is one global **absolute**
   amount, with no percentage or per-row tolerance. TallyDiff does not determine
   accounting authority, make accounting decisions, or automate journal entries.
+- Bounded one-to-many searches only a whole-key sole anchor against at most twelve
+  physical candidates. It does not infer many-to-many matches, select anchors
+  inside multirow sides, cross matching keys, use approximate subset equality,
+  rank candidates with secondary evidence, or allocate residual amounts. Bounds
+  disclose unsearched work; limits are fixed and inference always needs review.
 - Ordinary `.xlsx` is supported; legacy `.xls`, macro-enabled `.xlsm`, templates,
   and encrypted workbooks are not. XLSX uses one ordinary worksheet with text
   headers in row 1. Selected key/amount/secondary formulas are rejected; formulas are never
@@ -1058,8 +1286,8 @@ when ingesting CSV). No malformed amount is converted to zero.
 - Secondary comparisons use exact original evidence only. There is no secondary
   normalization, fuzzy/date-smart equivalence, occurrence-count checking, row
   pairing, cross-field association check, or secondary subtotal/allocation validation.
-- Configuration reuse uses explicit schema-version-4 JSON profile downloads,
-  with valid versions 1–3 supported and restoring zero comparisons. Profiles require
+- Configuration reuse uses explicit schema-version-5 JSON profile downloads,
+  with valid versions 1–4 supported; versions 1–3 restore zero comparisons. Profiles require
   compatible columns and contain configuration only. There is no managed profile library, database,
   reconciliation history, accounting-system integration, authentication, or cloud
   collaboration/service. Run locally from the repository root.

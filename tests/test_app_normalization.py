@@ -108,7 +108,7 @@ def test_defaults_pass_canonical_none_to_engine_identity_and_profile(monkeypatch
     assert "Key normalization: Exact — no transformations" in _texts(app)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize(
     ("field", "key_a", "key_b", "normalized"),
     [
@@ -257,7 +257,8 @@ def test_normalized_profile_download_apply_and_filename_identity(review_download
     _simple_mapping(app)
     _set_flags(app, casefold=True)
     manual_profile = json.loads(review_downloads["Download mapping profile"])
-    assert manual_profile["version"] == 4
+    assert manual_profile["version"] == 5
+    assert manual_profile["one_to_many_policy"] is None
     assert manual_profile["comparison_fields"] == []
     assert manual_profile["key_normalization"] == [
         dict(zip(FIELDS, (True, False, False, False), strict=True))
@@ -335,6 +336,7 @@ def test_legacy_and_exact_v3_profiles_explicitly_clear_every_rule(version, mode)
         )
     )
     profile["version"] = version
+    profile.pop("one_to_many_policy")
     profile.pop("comparison_fields")
     if version < 3:
         profile.pop("key_normalization")
@@ -384,7 +386,7 @@ def test_failed_profile_application_keeps_configuration_and_completed_result(fai
     assert app.metric and _exception_downloads(app)
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 def test_normalized_table_evidence_review_and_complete_export(
     review_downloads, monkeypatch, mode
 ) -> None:
@@ -438,7 +440,7 @@ def test_normalized_table_evidence_review_and_complete_export(
     assert review_downloads["Download mapping profile"] == full_profile
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("source", ["A", "B"])
 def test_blank_normalized_key_blocks_with_original_source_context(mode, source) -> None:
     bad, good = b"id,amount\n---,10\n", b"id,amount\nX,9\n"
@@ -458,7 +460,7 @@ def test_blank_normalized_key_blocks_with_original_source_context(mode, source) 
     assert "original value: '---'" in message
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("sources", [("A",), ("B",), ("A", "B")])
 def test_collision_blocks_both_modes_and_shows_structured_original_evidence(mode, sources) -> None:
     colliding = b"id,amount\nACME-01,10\nACME01,20\nACME-01,30\n"

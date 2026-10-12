@@ -197,7 +197,7 @@ def test_comparison_identity_uses_no_display_labels_or_dataclass_repr(monkeypatc
     )
 
 
-@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("mode", [ReconciliationMode.UNIQUE, ReconciliationMode.GROUPED_BY_KEY])
 @pytest.mark.parametrize("normalization", [None, EXACT, ACTIVE])
 def test_profile_manual_identity_matches_with_files_worksheets_and_json_formatting(
     mode, normalization
