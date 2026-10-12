@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from io import StringIO
 
+from scripts.subset_benchmark import measure_subset
+from scripts.subset_oracle import POLICY as SUBSET_POLICY
 from scripts.synthetic_data import (
     AMOUNT_A,
     AMOUNT_B,
@@ -82,6 +84,11 @@ def measure(
 ) -> Measurement:
     """Time the full path; independent verification is reported as its own phase."""
 
+    if workload.startswith("subset"):
+        times, summary = measure_subset(groups, seed, tolerance, mode=mode, workload=workload)
+        return Measurement(
+            summary["records_a"], summary["records_b"], summary["exceptions"], *times, summary
+        )
     started = time.perf_counter()
     pair = generate_pair(groups, seed=seed, workload=workload)
     generated = time.perf_counter()
@@ -522,8 +529,20 @@ def main() -> None:
     parser.add_argument("--groups", nargs="+", type=int, default=[1_000, 10_000, 50_000])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tolerances", nargs="+", default=["0", "0.01"])
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
-    parser.add_argument("--workload", choices=WORKLOADS, default="grouped")
+    parser.add_argument(
+        "--modes", nargs="+", choices=(*MODES, "bounded_one_to_many"), default=list(MODES)
+    )
+    parser.add_argument(
+        "--workload",
+        choices=(
+            *WORKLOADS,
+            "subset",
+            "subset_normalization",
+            "subset_exhaustive",
+            "subset_early_ambiguity",
+        ),
+        default="grouped",
+    )
     parser.add_argument(
         "--memory", action="store_true", help="Separate slower tracemalloc pass per scale/mode"
     )
@@ -544,13 +563,31 @@ def main() -> None:
     )
     print(
         "Normalization config: "
-        + json.dumps(NORMALIZATION_RULES if args.workload == "normalization" else None)
+        + json.dumps(
+            NORMALIZATION_RULES
+            if args.workload in ("normalization", "subset_normalization")
+            else None
+        )
     )
     print(
         "Comparison config: "
-        + json.dumps(COMPARISON_MAPPINGS if args.workload == "comparison" else ())
+        + json.dumps(
+            COMPARISON_MAPPINGS
+            if args.workload == "comparison" or args.workload.startswith("subset")
+            else ()
+        )
     )
     print("Times: seconds, untraced single passes; total includes independent verification.")
+    if args.workload.startswith("subset"):
+        print("Subset policy: " + json.dumps(SUBSET_POLICY))
+        print(
+            "Subset truth: independent integer DP; status counts and "
+            "planned/reserved/examined work follow each row."
+        )
+        print(
+            "Bounded runs also verify a UNIQUE baseline using the same ingested objects; "
+            "baseline times are separate from total."
+        )
     if args.workload == "normalization":
         print("reconcile_s includes normalization and collision preflight; no artificial split.")
     print(
