@@ -1189,7 +1189,7 @@ def test_review_changes_leave_all_reconciliation_evidence_and_original_csv_uncha
         )
 
 
-def test_stage_two_public_api_is_additive_and_package_version_is_unchanged():
+def test_stage_two_public_api_is_additive_and_package_release_version_matches():
     for name in (
         "ReviewDisposition",
         "FindingReview",
@@ -1200,7 +1200,7 @@ def test_stage_two_public_api_is_additive_and_package_version_is_unchanged():
     ):
         assert name in tallydiff.__all__
         assert getattr(tallydiff, name) is getattr(domain, name)
-    assert version("tallydiff") == "0.6.0"
+    assert version("tallydiff") == "0.7.0"
     assert (
-        'version = "0.6.0"' in (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        'version = "0.7.0"' in (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     )

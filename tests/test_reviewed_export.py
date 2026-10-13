@@ -800,4 +800,4 @@ def test_public_exporter_signature_legacy_api_and_package_version():
     assert all(hasattr(tallydiff, name) for name in LEGACY_PUBLIC_API)
     assert tallydiff.export_review_session is export_review_session
     assert tallydiff.load_review_session is load_review_session
-    assert version("tallydiff") == "0.6.0"
+    assert version("tallydiff") == "0.7.0"

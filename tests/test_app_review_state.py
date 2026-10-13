@@ -336,14 +336,14 @@ def test_ordinary_rerun_reuses_runtime_and_binding_without_rebinding(monkeypatch
     assert len(calls) == 1
 
 
-def test_review_state_is_app_only_and_public_contracts_and_version_are_unchanged():
+def test_review_state_is_app_only_and_public_contracts_and_release_version_match():
     assert "_ReviewRuntimeState" not in tallydiff.__all__
     assert not hasattr(tallydiff, "_ReviewRuntimeState")
     for model in (ReconciliationResult, ReconciliationFinding):
         assert not any(
             "review" in field.name or "annotation" in field.name for field in fields(model)
         )
-    assert version("tallydiff") == "0.6.0"
+    assert version("tallydiff") == "0.7.0"
 
 
 @pytest.mark.parametrize("mode", list(ReconciliationMode))

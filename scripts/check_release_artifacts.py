@@ -53,6 +53,7 @@ LOCAL_PARTS = frozenset(
         "benchmark_output",
         "__pycache__",
         ".pytest_cache",
+        ".pytest-tmp",
         ".ruff_cache",
         ".uv-cache",
         ".venv",
@@ -85,6 +86,7 @@ def _safe_name(name: str) -> str:
         or PureWindowsPath(value).drive
         or "\\" in value
         or ".." in path.parts
+        or any(PureWindowsPath(part).drive for part in path.parts)
         or path.as_posix() != value
     ):
         raise ArtifactContentError(f"Invalid archive path: {name!r}")
@@ -92,6 +94,9 @@ def _safe_name(name: str) -> str:
         lower = part.casefold()
         if (
             lower in LOCAL_PARTS
+            or lower == "review_v07.json"
+            or lower == "license"
+            or lower.startswith("license.")
             or lower == ".env"
             or lower.startswith(".env.")
             or lower.startswith(".coverage")

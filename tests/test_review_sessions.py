@@ -708,4 +708,4 @@ def test_public_exports_and_package_version_remain_compatible():
         assert getattr(tallydiff, name) is getattr(domain, name)
     assert export_review_session is domain.export_review_session
     assert load_review_session is domain.load_review_session
-    assert version("tallydiff") == "0.6.0"
+    assert version("tallydiff") == "0.7.0"
