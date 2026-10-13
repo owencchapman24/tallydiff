@@ -221,6 +221,13 @@ def test_no_exception_download_for_empty_or_exact_results(
     assert not app.exception
     assert app.metric
     assert not _exception_downloads(app)
+    assert not any(widget.label == "Review session JSON" for widget in app.file_uploader)
+    assert not {
+        "Apply review session",
+        "Prepare review downloads",
+        "Download reviewed exception report",
+        "Download review session",
+    }.intersection(widget.label for widget in (*app.button, *app.download_button))
 
 
 def test_tolerance_default_summary_separate_evidence_and_stale_download() -> None:

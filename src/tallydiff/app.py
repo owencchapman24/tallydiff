@@ -37,12 +37,15 @@ from tallydiff import (
     bind_review_result,
     export_exceptions_csv,
     export_mapping_profile,
+    export_review_session,
+    export_reviewed_exceptions_csv,
     ingest_csv,
     ingest_xlsx,
     inspect_csv_columns,
     inspect_xlsx_columns,
     inspect_xlsx_sheets,
     load_mapping_profile,
+    load_review_session,
     parse_amount,
     reconcile,
 )
@@ -78,6 +81,26 @@ _REVIEW_BINDING_KEY = "_review_binding"
 _REVIEW_NOTE_DRAFTS_KEY = "_review_note_drafts"
 _REVIEW_NOTE_ERRORS_KEY = "_review_note_errors"
 _REVIEW_EDITOR_SELECTION_KEY = "_review_editor_selection"
+_REVIEW_UPLOAD_KEY = "review_session_upload"
+_REVIEW_APPLY_KEY = "review_apply_session"
+_REVIEW_PREPARE_KEY = "review_prepare_downloads"
+_REVIEW_PREPARED_KEY = "_review_prepared_downloads"
+_REVIEW_PREPARE_REQUEST_KEY = "_review_prepare_requested"
+_REVIEW_PREPARE_ERROR_KEY = "_review_prepare_error"
+_REVIEW_IMPORT_ERROR_KEY = "_review_import_error"
+_REVIEW_APPLY_NOTICE_KEY = "_review_apply_notice"
+_REVIEW_DOWNLOAD_CSV_KEY = "review_download_csv"
+_REVIEW_DOWNLOAD_SESSION_KEY = "review_download_session"
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedReviewDownloads:
+    """Stable complete committed artifacts, scoped by binding and annotation revision."""
+
+    result_fingerprint: str
+    annotation_revision: int
+    session_json: bytes
+    reviewed_csv: bytes
 
 
 @dataclass(slots=True)
@@ -155,6 +178,188 @@ def _clear_review_state() -> None:
 def _clear_result() -> None:
     st.session_state.pop("completed", None)
     _clear_review_state()
+
+
+def _invalidate_review_downloads() -> None:
+    st.session_state.pop(_REVIEW_PREPARED_KEY, None)
+
+
+def _clear_review_editor_state() -> None:
+    """Discard editors and exception selections while retaining ownership and filters."""
+
+    for key in list(st.session_state):
+        if key.startswith(("review_disposition_", "review_note_", "exceptions_")) or key in (
+            _REVIEW_NOTE_DRAFTS_KEY,
+            _REVIEW_NOTE_ERRORS_KEY,
+            _REVIEW_EDITOR_SELECTION_KEY,
+        ):
+            del st.session_state[key]
+
+
+def _apply_review_session(runtime: _ReviewRuntimeState, data: bytes) -> None:
+    """Validate a complete candidate, then replace all annotations in one installation."""
+
+    _ReviewRuntimeState.snapshot(runtime)
+    loaded = load_review_session(data, binding=runtime.binding)
+    if loaded.binding is not runtime.binding:
+        raise ReviewSessionError("loaded review session must use the active binding")
+    validated = ReviewSession(runtime.binding, loaded.reviews)
+    replacements = {review.matching_key: review for review in validated.reviews}
+    revision = runtime.annotation_revision + 1
+    generation = runtime.editor_generation + 1
+    runtime.reviews_by_key = replacements
+    runtime.annotation_revision = revision
+    runtime.editor_generation = generation
+    _clear_review_editor_state()
+    _invalidate_review_downloads()
+    st.session_state.pop(_REVIEW_PREPARE_ERROR_KEY, None)
+
+
+def _prepare_review_downloads(runtime: _ReviewRuntimeState) -> _PreparedReviewDownloads:
+    """Build both complete artifacts only from a validated committed snapshot."""
+
+    session = _ReviewRuntimeState.snapshot(runtime)
+    session_json = export_review_session(session)
+    reviewed_csv = export_reviewed_exceptions_csv(runtime.binding, session)
+    return _PreparedReviewDownloads(
+        runtime.binding.result_fingerprint,
+        runtime.annotation_revision,
+        session_json,
+        reviewed_csv,
+    )
+
+
+def _current_prepared_review_downloads(
+    runtime: _ReviewRuntimeState,
+) -> _PreparedReviewDownloads | None:
+    prepared = st.session_state.get(_REVIEW_PREPARED_KEY)
+    if prepared is not None and (
+        prepared.result_fingerprint != runtime.binding.result_fingerprint
+        or prepared.annotation_revision != runtime.annotation_revision
+    ):
+        _invalidate_review_downloads()
+        return None
+    return prepared
+
+
+def _active_review_runtime() -> _ReviewRuntimeState:
+    runtime = st.session_state.get(_REVIEW_STATE_KEY)
+    completed = st.session_state.get("completed")
+    if runtime is None or completed is None:
+        raise ReviewSessionError("there is no active completed review")
+    _ReviewRuntimeState.snapshot(runtime)
+    if runtime.binding.result is not completed[1]:
+        raise ReviewSessionError("active review binding does not own the completed result")
+    return runtime
+
+
+def _retain_active_editor_selection() -> None:
+    """Candidate uploads and persistence actions do not change the represented row."""
+
+    selection = st.session_state.get(_REVIEW_EDITOR_SELECTION_KEY)
+    runtime = st.session_state.get(_REVIEW_STATE_KEY)
+    if (
+        selection is not None
+        and runtime is not None
+        and isinstance(runtime.binding, ReviewBinding)
+        and isinstance(runtime.reviews_by_key, dict)
+    ):
+        if (
+            selection[0] == runtime.binding.result_fingerprint
+            and selection[2] == runtime.editor_generation
+            and selection[1] in runtime.reviews_by_key
+        ):
+            _retain_editor_selection(*selection[:3])
+
+
+def _apply_uploaded_review_session() -> None:
+    upload = st.session_state.get(_REVIEW_UPLOAD_KEY)
+    if upload is None:
+        return
+    _retain_active_editor_selection()
+    try:
+        _apply_review_session(_active_review_runtime(), upload.getvalue())
+    except ReviewSessionError as exc:
+        st.session_state[_REVIEW_IMPORT_ERROR_KEY] = f"Review session: {exc}"
+    else:
+        st.session_state.pop(_REVIEW_IMPORT_ERROR_KEY, None)
+        st.session_state[_REVIEW_APPLY_NOTICE_KEY] = True
+
+
+def _request_review_downloads() -> None:
+    # Defer exports until ALL widget callbacks have committed their fields. No
+    # frontend draft values are read; the resulting snapshot is authoritative.
+    _retain_active_editor_selection()
+    st.session_state[_REVIEW_PREPARE_REQUEST_KEY] = True
+
+
+def _prepare_requested_review_downloads() -> None:
+    if not st.session_state.pop(_REVIEW_PREPARE_REQUEST_KEY, False):
+        return
+    try:
+        prepared = _prepare_review_downloads(_active_review_runtime())
+    except ReviewSessionError as exc:
+        _invalidate_review_downloads()
+        st.session_state[_REVIEW_PREPARE_ERROR_KEY] = f"Review state: {exc}"
+    else:
+        st.session_state[_REVIEW_PREPARED_KEY] = prepared
+        st.session_state.pop(_REVIEW_PREPARE_ERROR_KEY, None)
+
+
+def _show_review_persistence(runtime: _ReviewRuntimeState) -> None:
+    st.subheader("Review session")
+    st.caption(
+        "Review changes are kept in this session. Notes are saved when you leave the "
+        "field or commit the widget. Prepare review downloads before downloading the "
+        "reviewed report or resumable session file."
+    )
+    upload = st.file_uploader(
+        "Review session JSON",
+        type=["json"],
+        key=_REVIEW_UPLOAD_KEY,
+        on_change=_retain_active_editor_selection,
+    )
+    st.button(
+        "Apply review session",
+        key=_REVIEW_APPLY_KEY,
+        disabled=upload is None,
+        on_click=_apply_uploaded_review_session,
+    )
+    if st.session_state.pop(_REVIEW_APPLY_NOTICE_KEY, False):
+        st.success("Review session applied.")
+    error = st.session_state.pop(_REVIEW_IMPORT_ERROR_KEY, None)
+    if error is not None:
+        st.error(error)
+    st.button(
+        "Prepare review downloads", key=_REVIEW_PREPARE_KEY, on_click=_request_review_downloads
+    )
+    error = st.session_state.pop(_REVIEW_PREPARE_ERROR_KEY, None)
+    if error is not None:
+        st.error(error)
+    prepared = _current_prepared_review_downloads(runtime)
+    if prepared is not None:
+        # Native download clicks ignore reruns. AppTest may still request one;
+        # keep its existing selection without invoking editors or regenerating bytes.
+        if st.session_state.get(_REVIEW_DOWNLOAD_CSV_KEY) or st.session_state.get(
+            _REVIEW_DOWNLOAD_SESSION_KEY
+        ):
+            _retain_active_editor_selection()
+        st.download_button(
+            "Download reviewed exception report",
+            data=prepared.reviewed_csv,
+            file_name="tallydiff_reviewed_exceptions.csv",
+            mime="text/csv; charset=utf-8",
+            key=_REVIEW_DOWNLOAD_CSV_KEY,
+            on_click="ignore",
+        )
+        st.download_button(
+            "Download review session",
+            data=prepared.session_json,
+            file_name="tallydiff_review_session.json",
+            mime="application/json",
+            key=_REVIEW_DOWNLOAD_SESSION_KEY,
+            on_click="ignore",
+        )
 
 
 def _ensure_review_state(result: ReconciliationResult) -> bool:
@@ -236,6 +441,7 @@ def _commit_review_disposition(
     if replacement != current:
         runtime.reviews_by_key[matching_key] = replacement
         runtime.annotation_revision += 1
+        _invalidate_review_downloads()
 
 
 def _commit_review_note(fingerprint: str, matching_key: tuple[str, ...], generation: int) -> None:
@@ -263,6 +469,7 @@ def _commit_review_note(fingerprint: str, matching_key: tuple[str, ...], generat
     if replacement != current:
         runtime.reviews_by_key[matching_key] = replacement
         runtime.annotation_revision += 1
+        _invalidate_review_downloads()
 
 
 def _retain_editor_selection(
@@ -1079,6 +1286,7 @@ def _show_results(
     if exceptions:
         if session is not None:
             _show_review_progress(session)
+            _show_review_persistence(review_state)
         st.subheader("Exceptions")
         st.caption(
             "Review filters affect the displayed table only. The exception export remains complete."
@@ -1314,8 +1522,24 @@ def main() -> None:
                     st.session_state[_REVIEW_BINDING_KEY] = binding
                     st.session_state[_REVIEW_STATE_KEY] = runtime
                     st.session_state.completed = (identity, result)
+    _prepare_requested_review_downloads()
     completed = st.session_state.get("completed")
-    if completed is not None and completed[0] == identity and _ensure_review_state(completed[1]):
+    if completed is not None and completed[0] == identity:
+        persistence_error = st.session_state.get(_REVIEW_IMPORT_ERROR_KEY) or st.session_state.get(
+            _REVIEW_PREPARE_ERROR_KEY
+        )
+        if persistence_error is not None:
+            try:
+                _active_review_runtime()
+            except ReviewSessionError:
+                # Do not let ordinary Stage-5 recovery replace corrupt annotations
+                # after an explicit persistence failure. Keep the error visible until
+                # a valid explicit Run or repair; financial evidence stays available.
+                st.error(persistence_error)
+                _show_results(completed[1], mapping, identity, file_a.label, file_b.label)
+                return
+        if not _ensure_review_state(completed[1]):
+            return
         _show_results(
             completed[1],
             mapping,

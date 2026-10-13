@@ -855,18 +855,26 @@ def test_many_edits_leave_complete_result_binding_source_and_original_csv_unchan
     assert runtime.annotation_revision == 2 * len(exceptions)
 
 
-def test_stage_six_has_only_original_exception_download_and_no_session_import():
+def test_review_persistence_is_explicit_and_only_original_download_precedes_prepare():
     app = _run_app()
     _select(app)
-    prohibited = {
+    controls = {
         "Review session JSON",
         "Apply review session",
         "Prepare review downloads",
+    }
+    prohibited = {
         "Download review session",
         "Download reviewed exception report",
+        "Save",
+        "Autosave",
+        "Merge review session",
+        "Download reviewed XLSX",
     }
     labels = {widget.label for widget in (*app.file_uploader, *app.button, *app.download_button)}
+    assert controls.issubset(labels)
     assert not labels.intersection(prohibited)
+    assert next(widget for widget in app.button if widget.label == "Apply review session").disabled
     assert len(_exception_downloads(app)) == 1
     assert _exception_downloads(app)[0].label == "Download exception report"
 

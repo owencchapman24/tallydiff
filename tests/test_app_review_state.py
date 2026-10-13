@@ -864,7 +864,7 @@ def test_central_cleanup_clears_only_result_scoped_review_and_selection_keys(mon
     assert state == retained
 
 
-def test_stage_six_adds_review_progress_filter_but_no_import_or_download_ui():
+def test_review_progress_filter_and_persistence_controls_precede_prepared_downloads():
     app = _run_app()
     _assert_active(app)
     assert {widget.label for widget in app.button} == {
@@ -874,16 +874,20 @@ def test_stage_six_adds_review_progress_filter_but_no_import_or_download_ui():
         "+ Add comparison field",
         "Remove last comparison field",
         "Run reconciliation",
+        "Apply review session",
+        "Prepare review downloads",
     }
     assert {widget.label for widget in app.file_uploader} == {
         "File A CSV or XLSX",
         "File B CSV or XLSX",
         "Mapping profile JSON",
+        "Review session JSON",
     }
     assert {widget.label for widget in app.download_button} == {
         "Download mapping profile",
         "Download exception report",
     }
+    assert next(widget for widget in app.button if widget.label == "Apply review session").disabled
     assert {widget.label for widget in app.text_input} == {
         "Amount tolerance",
         "Search matching keys",
