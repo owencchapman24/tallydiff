@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
 import streamlit as st
 
@@ -15,6 +16,7 @@ from tallydiff import (
     CorrespondenceReason,
     CorrespondenceStatus,
     FindingCategory,
+    FindingReview,
     IngestionError,
     KeyNormalizationConfig,
     KeyNormalizationError,
@@ -26,8 +28,12 @@ from tallydiff import (
     ReconciliationIntegrityError,
     ReconciliationMode,
     ReconciliationResult,
+    ReviewBinding,
+    ReviewSession,
+    ReviewSessionError,
     Source,
     SourceRecord,
+    bind_review_result,
     export_exceptions_csv,
     export_mapping_profile,
     ingest_csv,
@@ -63,11 +69,121 @@ _NORMALIZATION_HELP = {
     "strip_leading_zeros": "Strip zeros only from ASCII digit-only values at this stage. "
     "All-zero identifiers become 0.",
 }
+_REVIEW_STATE_KEY = "_review_state"
+_REVIEW_BINDING_KEY = "_review_binding"
+
+
+@dataclass(slots=True)
+class _ReviewRuntimeState:
+    """App-owned annotations; immutable domain snapshots remain the export boundary."""
+
+    binding: ReviewBinding
+    reviews_by_key: dict[tuple[str, ...], FindingReview]
+    annotation_revision: int = 0
+    editor_generation: int = 0
+
+    def snapshot(self) -> ReviewSession:
+        """Validate exact dictionary identity/order, then use the public session model."""
+
+        if not isinstance(self.binding, ReviewBinding):
+            raise ReviewSessionError("runtime binding must be a ReviewBinding")
+        if not isinstance(self.reviews_by_key, dict):
+            raise ReviewSessionError("runtime reviews must be a dictionary")
+        if tuple(self.reviews_by_key) != self.binding.exception_keys:
+            raise ReviewSessionError(
+                "runtime reviews must cover the binding exception keys in order"
+            )
+        for key, review in self.reviews_by_key.items():
+            if not isinstance(review, FindingReview) or review.matching_key != key:
+                raise ReviewSessionError(
+                    "runtime review must be a FindingReview for its dictionary key"
+                )
+        for counter in (self.annotation_revision, self.editor_generation):
+            if type(counter) is not int or counter < 0:
+                raise ReviewSessionError(
+                    "runtime revisions and generations must be nonnegative integers"
+                )
+        return ReviewSession(self.binding, tuple(self.reviews_by_key.values()))
+
+
+def _adopt_review_binding(
+    new_binding: ReviewBinding, previous_state: _ReviewRuntimeState | None = None
+) -> _ReviewRuntimeState:
+    """Transfer complete validated annotations to a new binding, or start fresh.
+
+    Corrupted previous app state is discarded so a valid reconciliation can still
+    complete. Errors in a newly constructed binding are handled by the run path.
+    """
+
+    if previous_state is not None:
+        try:
+            previous = _ReviewRuntimeState.snapshot(previous_state)
+            if (
+                previous.binding.result_fingerprint == new_binding.result_fingerprint
+                and previous.binding.exception_keys == new_binding.exception_keys
+            ):
+                preserved = ReviewSession(new_binding, previous.reviews)
+                return _ReviewRuntimeState(
+                    new_binding,
+                    {review.matching_key: review for review in preserved.reviews},
+                    previous_state.annotation_revision,
+                    previous_state.editor_generation,
+                )
+        except (ReviewSessionError, TypeError, AttributeError):
+            pass
+    initial = ReviewSession.unreviewed(new_binding)
+    return _ReviewRuntimeState(
+        new_binding, {review.matching_key: review for review in initial.reviews}
+    )
+
+
+def _clear_review_state() -> None:
+    """Clear result-scoped ownership, filters, selections, and future review widgets."""
+
+    for key in list(st.session_state):
+        if key.startswith(("_review_", "review_", "exceptions_", "tolerated_", "exact_")):
+            del st.session_state[key]
+
+
+def _clear_result() -> None:
+    st.session_state.pop("completed", None)
+    _clear_review_state()
+
+
+def _ensure_review_state(result: ReconciliationResult) -> bool:
+    """Reuse the successful-run binding and recover missing/corrupted annotations.
+
+    The separate cached binding retains successful-run identity even if the
+    mutable holder is lost. Ordinary reruns never recompute it. A completed
+    result without any matching successful-run binding cannot be displayed.
+    """
+
+    binding = st.session_state.get(_REVIEW_BINDING_KEY)
+    runtime = st.session_state.get(_REVIEW_STATE_KEY)
+    if not isinstance(binding, ReviewBinding) or binding.result is not result:
+        candidate = getattr(runtime, "binding", None)
+        if isinstance(candidate, ReviewBinding) and candidate.result is result:
+            binding = candidate
+            st.session_state[_REVIEW_BINDING_KEY] = binding
+        else:
+            _clear_result()
+            st.error(
+                "Review binding integrity check failed: completed run has no matching binding."
+            )
+            return False
+    try:
+        snapshot = _ReviewRuntimeState.snapshot(runtime)
+    except (ReviewSessionError, TypeError, AttributeError):
+        snapshot = None
+    if snapshot is None or snapshot.binding is not binding:
+        st.session_state[_REVIEW_STATE_KEY] = _adopt_review_binding(binding)
+    return True
 
 
 def _reset_mapping() -> None:
+    _clear_result()
     for key in list(st.session_state):
-        if key.startswith(("map_", "norm_")) or key == "completed":
+        if key.startswith(("map_", "norm_")):
             del st.session_state[key]
     st.session_state.key_count = 1
     st.session_state.comparison_count = 0
@@ -81,7 +197,7 @@ def _change_key_count(change: int) -> None:
     index = st.session_state.key_count if change < 0 else st.session_state.key_count - 1
     for name in NORMALIZATION_LABELS:
         st.session_state.pop(f"norm_{name}_{index}", None)
-    st.session_state.pop("completed", None)
+    _clear_result()
 
 
 def _change_comparison_count(change: int) -> None:
@@ -92,7 +208,7 @@ def _change_comparison_count(change: int) -> None:
     for index in range(min(previous, count), max(previous, count)):
         for side in ("a", "b"):
             st.session_state.pop(f"map_comparison_{side}_{index}", None)
-    st.session_state.pop("completed", None)
+    _clear_result()
 
 
 @dataclass(frozen=True)
@@ -100,6 +216,7 @@ class _Input:
     name: str
     data: bytes
     columns: tuple[str, ...]
+    input_format: Literal["csv", "xlsx"]
     worksheet: str | None = None
     text: str | None = None
 
@@ -127,10 +244,12 @@ def _choose_file(source: Source) -> _Input | None:
     text = None
     try:
         if suffix == ".csv":
+            input_format = "csv"
             st.caption("Detected file type: CSV")
             text = decode_upload(data, source=source)
             columns = inspect_csv_columns(text, source=source)
         elif suffix == ".xlsx":
+            input_format = "xlsx"
             st.caption("Detected file type: XLSX")
             sheets = inspect_xlsx_sheets(data, source=source)
             sheet_key = sha256(upload.name.encode("utf-8") + b"\0" + data).hexdigest()
@@ -156,7 +275,7 @@ def _choose_file(source: Source) -> _Input | None:
         return None
     st.caption("Detected columns")
     st.text(" | ".join(columns))
-    return _Input(upload.name, data, columns, worksheet, text)
+    return _Input(upload.name, data, columns, input_format, worksheet, text)
 
 
 def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
@@ -794,10 +913,6 @@ def _show_results(
             _show_finding_table(exact, table_key=f"exact_{identity}")
 
 
-def _clear_result() -> None:
-    st.session_state.pop("completed", None)
-
-
 def main() -> None:
     st.set_page_config(page_title="TallyDiff", layout="wide")
     st.title("TallyDiff")
@@ -815,7 +930,7 @@ def main() -> None:
     with right:
         file_b = _choose_file(Source.B)
     if file_a is None or file_b is None:
-        st.session_state.pop("completed", None)
+        _clear_result()
         st.info("Upload both files and select any required worksheets to map their columns.")
         return
     columns_a, columns_b = file_a.columns, file_b.columns
@@ -897,9 +1012,9 @@ def main() -> None:
         else None
     )
     completed = st.session_state.get("completed")
-    if completed is not None and completed[0] != identity:
-        st.session_state.pop("completed")
     problem = mapping.problem(columns_a, columns_b)
+    if problem or identity is None or completed is None or completed[0] != identity:
+        _clear_result()
     if problem:
         st.info(problem)
     elif amount_tolerance is not None:
@@ -922,14 +1037,17 @@ def main() -> None:
         key="run",
         disabled=problem is not None or amount_tolerance is None,
     ):
-        st.session_state.pop("completed", None)
+        # Preserve only a local reference while removing active ownership. A new
+        # successful binding must verify equivalence before these reviews return.
+        previous_review_state = st.session_state.get(_REVIEW_STATE_KEY)
+        _clear_result()
         records = []
         for source, input_file, keys, amount, comparisons in (
             (Source.A, file_a, mapping.keys_a, mapping.amount_a, mapping.comparisons_a),
             (Source.B, file_b, mapping.keys_b, mapping.amount_b, mapping.comparisons_b),
         ):
             try:
-                if input_file.worksheet is None:
+                if input_file.input_format == "csv":
                     parsed = ingest_csv(
                         input_file.text,
                         source=source,
@@ -966,9 +1084,26 @@ def main() -> None:
             except ReconciliationIntegrityError as exc:
                 st.error(f"Reconciliation integrity check failed: {exc}")
             else:
-                st.session_state.completed = (identity, result)
+                try:
+                    binding = bind_review_result(
+                        result,
+                        data_a=file_a.data,
+                        data_b=file_b.data,
+                        mapping=mapping,
+                        format_a=file_a.input_format,
+                        format_b=file_b.input_format,
+                        worksheet_a=file_a.worksheet,
+                        worksheet_b=file_b.worksheet,
+                    )
+                except ReviewSessionError as exc:
+                    st.error(f"Review binding integrity check failed: {exc}")
+                else:
+                    runtime = _adopt_review_binding(binding, previous_review_state)
+                    st.session_state[_REVIEW_BINDING_KEY] = binding
+                    st.session_state[_REVIEW_STATE_KEY] = runtime
+                    st.session_state.completed = (identity, result)
     completed = st.session_state.get("completed")
-    if completed is not None and completed[0] == identity:
+    if completed is not None and completed[0] == identity and _ensure_review_state(completed[1]):
         _show_results(completed[1], mapping, identity, file_a.label, file_b.label)
 
 
