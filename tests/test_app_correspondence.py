@@ -111,7 +111,7 @@ def test_bounded_mode_captions_disclose_exact_search_tolerance_and_secondary_sco
     app.radio(key="reconciliation_mode").set_value(MODE).run()
     text = _texts(app)
     assert "uniquely determined exact subset" in text and "within fixed search limits" in text
-    assert "Inferred correspondence always requires review." in text
+    assert "Inferred correspondence is always treated as a reconciliation exception." in text
     assert disclosure in text and "Subset inference requires exact Decimal equality." in text
     assert "remain Amount mismatch even when their residual delta is within tolerance" in text
     assert (
@@ -158,7 +158,7 @@ def test_inferred_exact_and_residual_groups_are_exceptions_with_structural_detai
         assert "Exact match" in _review_widget(app, "Exception categories").options
         assert any("Control totals agree" in item.value for item in app.warning)
     _select(app)
-    assert "Inferred exact correspondence — review required" in _texts(app)
+    assert "Inferred exact correspondence — reconciliation exception" in _texts(app)
     references = _references(app)
     assert references[0].to_dict("records") == [
         {
@@ -281,7 +281,7 @@ def test_unresolved_selected_details_preserve_witnesses_parent_direction_and_raw
             assert "At least two exact solutions" in text
     if status is S.SINGLETON_ONLY:
         assert "Singleton candidate witness" in text
-        assert "Inferred exact correspondence — review required" not in text
+        assert "Inferred exact correspondence — reconciliation exception" not in text
         if source is Source.B:
             assert analysis.ambiguity_witnesses[0].anchor.source is Source.A
             assert references[0]["Source"].tolist() == ["File B"]
@@ -383,7 +383,11 @@ def test_mixed_table_and_secondary_details_preserve_comparison_semantics():
         "Unique exact subset",
         "",
     ]
-    assert list(table)[-2:] == ["Secondary differences", "Correspondence status"]
+    assert list(table)[-3:] == [
+        "Secondary differences",
+        "Correspondence status",
+        "Review disposition",
+    ]
     assert (
         _metrics(app)["Analyzed duplicate groups"]
         == _metrics(app)["Inferred correspondences"]

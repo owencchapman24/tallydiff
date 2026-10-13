@@ -457,9 +457,9 @@ def test_views_selection_and_downloads_preserve_annotations_without_rebinding(
     saved = export_review_session(runtime.snapshot())
     original_csv = review_downloads["Download exception report"]
     original_profile = review_downloads["Download mapping profile"]
-    metrics = {metric.label: metric.value for metric in app.metric}
     app.run()
     _assert_preserved(app, runtime, annotation)
+    metrics = {metric.label: metric.value for metric in app.metric}
     for label, value in (
         ("Search matching keys", "B"),
         ("Search matching keys", ""),
@@ -864,7 +864,7 @@ def test_central_cleanup_clears_only_result_scoped_review_and_selection_keys(mon
     assert state == retained
 
 
-def test_stage_five_adds_no_review_editor_progress_import_or_download_ui():
+def test_stage_six_adds_review_progress_filter_but_no_import_or_download_ui():
     app = _run_app()
     _assert_active(app)
     assert {widget.label for widget in app.button} == {
@@ -890,10 +890,11 @@ def test_stage_five_adds_no_review_editor_progress_import_or_download_ui():
         "Minimum absolute delta",
     }
     assert not app.text_area
-    assert not any(
-        "disposition" in widget.label.lower()
+    assert {
+        widget.label
         for widget in (*app.radio, *app.selectbox, *app.multiselect)
-    )
+        if "disposition" in widget.label.lower()
+    } == {"Review disposition"}
     assert {metric.label for metric in app.metric} == {
         "File A control total",
         "File B control total",
@@ -905,8 +906,17 @@ def test_stage_five_adds_no_review_editor_progress_import_or_download_ui():
         "File B only",
         "Duplicate / ambiguous",
         "Net accepted variance (A - B)",
+        "Review items",
+        "Unreviewed",
+        "Needs follow-up",
+        "Review complete",
     }
+    exception_table = _exception_table(app)
+    assert exception_table.value.columns[-1] == "Review disposition"
+    assert exception_table.value["Review disposition"].tolist() == ["Unreviewed", "Unreviewed"]
+    assert not any("Review note" in frame.value.columns for frame in app.dataframe)
     assert not any(
-        "Review disposition" in frame.value.columns or "Review note" in frame.value.columns
+        "Review disposition" in frame.value.columns
         for frame in app.dataframe
+        if frame.key != exception_table.key
     )

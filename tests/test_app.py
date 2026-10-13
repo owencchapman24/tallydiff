@@ -121,6 +121,10 @@ def test_sample_workflow_evidence_and_stale_result_invalidation() -> None:
         "File A only": "1",
         "File B only": "1",
         "Duplicate / ambiguous": "0",
+        "Review items": "3",
+        "Unreviewed": "3",
+        "Needs follow-up": "0",
+        "Review complete": "0",
     }
     assert len(_exception_downloads(app)) == 1
     assert _exception_downloads(app)[0].label == "Download exception report"
@@ -128,7 +132,7 @@ def test_sample_workflow_evidence_and_stale_result_invalidation() -> None:
     assert table["Matching key"].tolist() == ["V001 / 1042", "V003 / 1044", "V004 / 1045"]
     assert table["Delta (A - B)"].tolist() == ["+45", "+500", "-300"]
     _select_first_finding(app)
-    assert len(app.metric) == 9  # Evidence reruns retain the current result.
+    assert len(app.metric) == 13  # Evidence reruns retain financial and review metrics.
     assert len(_exception_downloads(app)) == 1
     assert app.dataframe[1].value["Original value"].tolist() == ["V001", "1042", "1250"]
     assert app.dataframe[2].value["Original value"].tolist() == ["V001", "1042", "1205"]

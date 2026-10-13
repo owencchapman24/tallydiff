@@ -29,6 +29,7 @@ from tallydiff import (
     ReconciliationMode,
     ReconciliationResult,
     ReviewBinding,
+    ReviewDisposition,
     ReviewSession,
     ReviewSessionError,
     Source,
@@ -53,12 +54,15 @@ from tallydiff.presentation import (
     EXCEPTION_SORT_LABELS,
     MODE_LABELS,
     NORMALIZATION_LABELS,
+    REVIEW_DISPOSITION_LABELS,
     configuration_id,
     decode_upload,
     display_amount,
     evidence_rows,
+    filter_review_dispositions,
     finding_rows,
     review_exceptions,
+    review_finding_rows,
 )
 
 _NORMALIZATION_HELP = {
@@ -71,6 +75,9 @@ _NORMALIZATION_HELP = {
 }
 _REVIEW_STATE_KEY = "_review_state"
 _REVIEW_BINDING_KEY = "_review_binding"
+_REVIEW_NOTE_DRAFTS_KEY = "_review_note_drafts"
+_REVIEW_NOTE_ERRORS_KEY = "_review_note_errors"
+_REVIEW_EDITOR_SELECTION_KEY = "_review_editor_selection"
 
 
 @dataclass(slots=True)
@@ -178,6 +185,155 @@ def _ensure_review_state(result: ReconciliationResult) -> bool:
     if snapshot is None or snapshot.binding is not binding:
         st.session_state[_REVIEW_STATE_KEY] = _adopt_review_binding(binding)
     return True
+
+
+def _review_widget_key(
+    field: Literal["disposition", "note"],
+    fingerprint: str,
+    matching_key: tuple[str, ...],
+    generation: int,
+) -> str:
+    """Scope compact editor identity to a completed run, canonical key, and generation."""
+
+    key_json = json.dumps(matching_key, ensure_ascii=False, separators=(",", ":"))
+    key_digest = sha256(key_json.encode("utf-8")).hexdigest()
+    return f"review_{field}_{fingerprint}_{generation}_{key_digest}"
+
+
+def _callback_review_state(
+    fingerprint: str, matching_key: tuple[str, ...], generation: int
+) -> _ReviewRuntimeState | None:
+    """Ignore obsolete callbacks; validate complete current ownership before edits."""
+
+    runtime = st.session_state.get(_REVIEW_STATE_KEY)
+    completed = st.session_state.get("completed")
+    if runtime is None or completed is None:
+        return None
+    if not isinstance(runtime.binding, ReviewBinding):
+        raise ReviewSessionError("active runtime has an invalid review binding")
+    if runtime.binding.result_fingerprint != fingerprint or runtime.editor_generation != generation:
+        return None
+    _ReviewRuntimeState.snapshot(runtime)
+    if runtime.binding.result is not completed[1]:
+        raise ReviewSessionError("active review binding does not own the completed result")
+    if matching_key not in runtime.reviews_by_key:
+        return None
+    return runtime
+
+
+def _commit_review_disposition(
+    fingerprint: str, matching_key: tuple[str, ...], generation: int
+) -> None:
+    """Commit only this field, retaining the authoritative note rather than a draft."""
+
+    runtime = _callback_review_state(fingerprint, matching_key, generation)
+    if runtime is None:
+        return
+    _retain_editor_selection(fingerprint, matching_key, generation)
+    widget_key = _review_widget_key("disposition", fingerprint, matching_key, generation)
+    current = runtime.reviews_by_key[matching_key]
+    replacement = FindingReview(matching_key, st.session_state[widget_key], current.note)
+    if replacement != current:
+        runtime.reviews_by_key[matching_key] = replacement
+        runtime.annotation_revision += 1
+
+
+def _commit_review_note(fingerprint: str, matching_key: tuple[str, ...], generation: int) -> None:
+    """Validate a note draft without reading or committing a disposition widget."""
+
+    runtime = _callback_review_state(fingerprint, matching_key, generation)
+    if runtime is None:
+        return
+    _retain_editor_selection(fingerprint, matching_key, generation)
+    widget_key = _review_widget_key("note", fingerprint, matching_key, generation)
+    candidate = st.session_state[widget_key]
+    current = runtime.reviews_by_key[matching_key]
+    try:
+        replacement = FindingReview(matching_key, current.disposition, candidate)
+    except (TypeError, ValueError) as exc:
+        # Widget keys are cleaned up when their row is no longer rendered. Keep
+        # invalid drafts separately so navigating away cannot erase corrections.
+        st.session_state.setdefault(_REVIEW_NOTE_DRAFTS_KEY, {})[widget_key] = candidate
+        st.session_state.setdefault(_REVIEW_NOTE_ERRORS_KEY, {})[widget_key] = (
+            f"Analyst note: {exc}"
+        )
+        return
+    st.session_state.get(_REVIEW_NOTE_DRAFTS_KEY, {}).pop(widget_key, None)
+    st.session_state.get(_REVIEW_NOTE_ERRORS_KEY, {}).pop(widget_key, None)
+    if replacement != current:
+        runtime.reviews_by_key[matching_key] = replacement
+        runtime.annotation_revision += 1
+
+
+def _retain_editor_selection(
+    fingerprint: str, matching_key: tuple[str, ...], generation: int
+) -> None:
+    """Carry the represented row through a commit only in its existing table scope.
+
+    A changed ordered visible population produces a different table key, so this
+    cannot restore a positional selection onto a successor after disposition filtering.
+    """
+
+    selection = st.session_state.get(_REVIEW_EDITOR_SELECTION_KEY)
+    if selection is not None and selection[:3] == (fingerprint, matching_key, generation):
+        table_key, row_index = selection[3:]
+        st.session_state[table_key] = {
+            "selection": {"rows": [row_index], "columns": [], "cells": []}
+        }
+
+
+def _show_analyst_review(finding: ReconciliationFinding, runtime: _ReviewRuntimeState) -> None:
+    """Display scoped editors before long evidence, preserving uncommitted invalid drafts."""
+
+    review = runtime.reviews_by_key[finding.key]
+    fingerprint = runtime.binding.result_fingerprint
+    generation = runtime.editor_generation
+    scope = (fingerprint, finding.key, generation)
+    disposition_key = _review_widget_key("disposition", *scope)
+    note_key = _review_widget_key("note", *scope)
+    # Populate from committed state on each render. Only a saved invalid draft
+    # overrides the note; another field's widget is never authoritative.
+    st.session_state[disposition_key] = review.disposition
+    st.session_state[note_key] = st.session_state.get(_REVIEW_NOTE_DRAFTS_KEY, {}).get(
+        note_key, review.note
+    )
+    st.subheader("Analyst review")
+    st.caption(
+        "Analyst review does not change the reconciliation category, financial delta, "
+        "secondary evidence, or inferred-correspondence status."
+    )
+    st.selectbox(
+        "Analyst disposition",
+        tuple(ReviewDisposition),
+        index=None,
+        format_func=REVIEW_DISPOSITION_LABELS.__getitem__,
+        key=disposition_key,
+        on_change=_commit_review_disposition,
+        args=scope,
+    )
+    st.text_area(
+        "Analyst note",
+        value=None,
+        key=note_key,
+        on_change=_commit_review_note,
+        args=scope,
+    )
+    error = st.session_state.get(_REVIEW_NOTE_ERRORS_KEY, {}).get(note_key)
+    if error is not None:
+        st.error(error)
+
+
+def _show_review_progress(session: ReviewSession) -> None:
+    st.subheader("Review progress")
+    metrics = (
+        ("Review items", session.total),
+        ("Unreviewed", session.unreviewed_count),
+        ("Needs follow-up", session.needs_follow_up_count),
+        ("Review complete", session.complete_count),
+    )
+    for column, (label, count) in zip(st.columns(4), metrics, strict=True):
+        column.metric(label, str(count))
+    st.caption(f"Reviewed: {session.reviewed_count} · Open review items: {session.open_count}")
 
 
 def _reset_mapping() -> None:
@@ -553,7 +709,7 @@ def _show_correspondence(finding: ReconciliationFinding, policy: OneToManyPolicy
         _show_references("Search anchor", (anchor,))
 
     if analysis.status is CorrespondenceStatus.UNIQUE_EXACT:
-        st.markdown("**Inferred exact correspondence — review required**")
+        st.markdown("**Inferred exact correspondence — reconciliation exception**")
         solution = analysis.accepted_solution
         selected = solution.rows_b if anchor.source is Source.A else solution.rows_a
         _show_references("Selected subset records", selected)
@@ -615,10 +771,13 @@ def _show_finding_table(
     *,
     table_key: str,
     one_to_many_policy: OneToManyPolicy | None = None,
+    review_state: _ReviewRuntimeState | None = None,
 ) -> None:
     st.caption("Select a row to inspect its original source records below.")
     event = st.dataframe(
-        finding_rows(findings),
+        finding_rows(findings)
+        if review_state is None
+        else review_finding_rows(findings, review_state.reviews_by_key),
         hide_index=True,
         width="stretch",
         key=table_key,
@@ -628,8 +787,20 @@ def _show_finding_table(
         height=min(440, 35 * (len(findings) + 1) + 3),
     )
     if event.selection.rows:
-        finding = findings[event.selection.rows[0]]
+        selected_index = event.selection.rows[0]
+        if type(selected_index) is not int or not 0 <= selected_index < len(findings):
+            return
+        finding = findings[selected_index]
         st.text(f"Selected key: {' / '.join(finding.key)}")
+        if review_state is not None:
+            st.session_state[_REVIEW_EDITOR_SELECTION_KEY] = (
+                review_state.binding.result_fingerprint,
+                finding.key,
+                review_state.editor_generation,
+                table_key,
+                selected_index,
+            )
+            _show_analyst_review(finding, review_state)
         if finding.correspondence_analysis is not None:
             _show_correspondence(finding, one_to_many_policy)
         if finding.field_comparisons:
@@ -675,6 +846,7 @@ def _show_exception_review(
     *,
     identity: str,
     one_to_many_policy: OneToManyPolicy | None = None,
+    review_state: _ReviewRuntimeState | None = None,
 ) -> None:
     query = st.text_input(
         "Search matching keys",
@@ -692,6 +864,17 @@ def _show_exception_review(
         default=category_options,
         format_func=CATEGORY_LABELS.__getitem__,
         key=f"review_categories_{identity}",
+    )
+    dispositions = (
+        st.multiselect(
+            "Review disposition",
+            tuple(ReviewDisposition),
+            default=tuple(ReviewDisposition),
+            format_func=REVIEW_DISPOSITION_LABELS.__getitem__,
+            key=f"review_dispositions_{identity}",
+        )
+        if review_state is not None
+        else None
     )
     has_comparisons = any(finding.field_comparisons for finding in findings)
     secondary_only = (
@@ -732,6 +915,8 @@ def _show_exception_review(
         sort_order=sort_order,
         secondary_mismatches_only=secondary_only,
     )
+    if review_state is not None:
+        visible = filter_review_dispositions(visible, review_state.reviews_by_key, dispositions)
     st.caption(f"Showing {len(visible):,} of {len(findings):,} exception groups.")
     if not visible:
         st.info("No exception groups match the current review filters.")
@@ -740,17 +925,39 @@ def _show_exception_review(
     view_state = [query, [category.value for category in categories], minimum_text, sort_order]
     if has_comparisons:
         view_state.append(secondary_only)
+    if review_state is not None:
+        view_state.extend(
+            (
+                review_state.binding.result_fingerprint,
+                review_state.editor_generation,
+                [disposition.value for disposition in dispositions],
+            )
+        )
+    # Annotation changes can alter membership without changing filter widgets.
+    # Hash exact ordered canonical keys, never notes or displayed key strings.
+    view_state.append([finding.key for finding in visible])
     view_id = sha256(json.dumps(view_state).encode("utf-8")).hexdigest()
     _show_finding_table(
         visible,
         table_key=f"exceptions_{identity}_{view_id}",
         one_to_many_policy=one_to_many_policy,
+        review_state=review_state,
     )
 
 
 def _show_results(
-    result: ReconciliationResult, mapping: ColumnMapping, identity: str, name_a: str, name_b: str
+    result: ReconciliationResult,
+    mapping: ColumnMapping,
+    identity: str,
+    name_a: str,
+    name_b: str,
+    review_state: _ReviewRuntimeState | None = None,
 ) -> None:
+    session = None
+    if review_state is not None:
+        if review_state.binding.result is not result:
+            raise ReviewSessionError("review runtime must own the displayed result")
+        session = _ReviewRuntimeState.snapshot(review_state)
     st.header("4. Review results")
     st.caption("Configuration used for this reconciliation")
     st.text(f"File A: {name_a}\nFile B: {name_b}")
@@ -870,6 +1077,8 @@ def _show_results(
     else:
         st.warning(f"{len(exceptions)} key groups require review.")
     if exceptions:
+        if session is not None:
+            _show_review_progress(session)
         st.subheader("Exceptions")
         st.caption(
             "Review filters affect the displayed table only. The exception export remains complete."
@@ -883,7 +1092,10 @@ def _show_results(
             on_click="ignore",
         )
         _show_exception_review(
-            exceptions, identity=identity, one_to_many_policy=result.one_to_many_policy
+            exceptions,
+            identity=identity,
+            one_to_many_policy=result.one_to_many_policy,
+            review_state=review_state,
         )
     if tolerated:
         st.subheader("Within tolerance")
@@ -964,7 +1176,7 @@ def main() -> None:
         st.caption(
             "TallyDiff may explain one source row using one uniquely determined exact subset "
             "of rows on the opposite side, within fixed search limits. "
-            "Inferred correspondence always requires review."
+            "Inferred correspondence is always treated as a reconciliation exception."
         )
         st.caption(
             "Ordinary deterministic one-row-per-side groups retain normal secondary comparison. "
@@ -1104,7 +1316,14 @@ def main() -> None:
                     st.session_state.completed = (identity, result)
     completed = st.session_state.get("completed")
     if completed is not None and completed[0] == identity and _ensure_review_state(completed[1]):
-        _show_results(completed[1], mapping, identity, file_a.label, file_b.label)
+        _show_results(
+            completed[1],
+            mapping,
+            identity,
+            file_a.label,
+            file_b.label,
+            review_state=st.session_state[_REVIEW_STATE_KEY],
+        )
 
 
 if __name__ == "__main__":
