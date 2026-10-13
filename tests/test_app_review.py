@@ -58,6 +58,13 @@ def _widget(app, label):
     )
 
 
+def _save_note(app, note):
+    """Submit the native note-only form; setting its widget alone is not a save."""
+    _widget(app, "Analyst note").set_value(note)
+    next(button for button in app.button if button.label == "Save note").click().run()
+    return app
+
+
 def _select(app, index=0):
     table = _exception_table(app)
     app.session_state[table.key] = {"selection": {"rows": [index], "columns": [], "cells": []}}
@@ -331,7 +338,8 @@ def test_progress_and_table_defaults_preserve_financial_cells_in_all_modes(mode)
     assert _widget(app, "Analyst note").key == _editor_key(runtime, "note")
     assert any(header.value == "Analyst review" for header in app.subheader)
     assert any("Analyst review does not change" in item.value for item in app.caption)
-    assert not any(button.label == "Save" for button in app.button)
+    save = next(button for button in app.button if button.label == "Save note")
+    assert not save.disabled
 
 
 def test_disposition_edits_each_transition_and_noop_keep_canonical_ownership():
@@ -341,7 +349,7 @@ def test_disposition_edits_each_transition_and_noop_keep_canonical_ownership():
     first, second = binding.exception_keys
     untouched = runtime.reviews_by_key[second]
     _select(app)
-    _widget(app, "Analyst note").set_value(" exact\t🧾\n ").run()
+    _save_note(app, " exact\t🧾\n ")
     revision = 1
     old = ReviewDisposition.UNREVIEWED
     for new in (*DISPOSITIONS, *reversed(DISPOSITIONS), *DISPOSITIONS):
@@ -361,7 +369,7 @@ def test_disposition_edits_each_transition_and_noop_keep_canonical_ownership():
     assert app.session_state["completed"][1] is binding.result
 
 
-def test_note_editor_commits_exact_valid_text_including_empty_and_formula_text():
+def test_note_form_submission_commits_exact_valid_text_including_empty_and_formula_text():
     app = _run_app()
     runtime = _assert_active(app)
     key = runtime.binding.exception_keys[0]
@@ -376,14 +384,14 @@ def test_note_editor_commits_exact_valid_text_including_empty_and_formula_text()
         "",
     )
     for revision, note in enumerate(notes, 2):
-        _widget(app, "Analyst note").set_value(note).run()
+        _save_note(app, note)
         assert not app.exception and not app.error
         assert _widget(app, "Analyst note").value == note
         assert runtime.reviews_by_key[key] == FindingReview(
             key, ReviewDisposition.NEEDS_FOLLOW_UP, note
         )
         assert runtime.annotation_revision == revision
-    _widget(app, "Analyst note").set_value("").run()
+    _save_note(app, "")
     assert runtime.annotation_revision == 1 + len(notes)
 
 
@@ -400,12 +408,12 @@ def test_invalid_editor_draft_survives_navigation_and_disposition_then_correctio
     runtime = _assert_active(app)
     first = runtime.binding.exception_keys[0]
     _select(app)
-    _widget(app, "Analyst note").set_value("committed note").run()
+    _save_note(app, "committed note")
     committed = runtime.reviews_by_key[first]
     before_json = export_review_session(runtime.snapshot())
     before_csv = export_reviewed_exceptions_csv(runtime.binding, runtime.snapshot())
     note_key = _widget(app, "Analyst note").key
-    _widget(app, "Analyst note").set_value(draft).run()
+    _save_note(app, draft)
     assert not app.exception and app.error
     assert runtime.reviews_by_key[first] is committed and runtime.annotation_revision == 1
     assert _widget(app, "Analyst note").value == draft
@@ -422,7 +430,7 @@ def test_invalid_editor_draft_survives_navigation_and_disposition_then_correctio
         first, ReviewDisposition.REVIEW_COMPLETE, "committed note"
     )
     assert runtime.annotation_revision == 2 and _widget(app, "Analyst note").value == draft
-    _widget(app, "Analyst note").set_value("corrected\t🧾").run()
+    _save_note(app, "corrected\t🧾")
     assert not app.exception and not app.error
     assert runtime.reviews_by_key[first] == FindingReview(
         first, ReviewDisposition.REVIEW_COMPLETE, "corrected\t🧾"
@@ -449,7 +457,7 @@ def test_progress_filters_and_navigation_preserve_full_authoritative_population(
     result = runtime.binding.result
     first = runtime.binding.exception_keys[0]
     _select(app)
-    _widget(app, "Analyst note").set_value("preserved note").run()
+    _save_note(app, "preserved note")
     _widget(app, "Analyst disposition").set_value(ReviewDisposition.NEEDS_FOLLOW_UP).run()
     committed = runtime.reviews_by_key[first]
     revision = runtime.annotation_revision
@@ -500,8 +508,8 @@ def test_invalid_draft_survives_filter_navigation_and_is_cleared_with_the_result
     runtime = _assert_active(app)
     first = runtime.binding.exception_keys[0]
     _select(app)
-    _widget(app, "Analyst note").set_value("authoritative note").run()
-    _widget(app, "Analyst note").set_value("uncommitted\0draft").run()
+    _save_note(app, "authoritative note")
+    _save_note(app, "uncommitted\0draft")
     note_key = _widget(app, "Analyst note").key
     _widget(app, "Search matching keys").set_value("missing").run()
     assert not app.exception and _exception_table(app) is None
@@ -625,7 +633,7 @@ def test_note_and_disposition_remaining_visible_preserve_table_identity_and_sele
     app = _run_app()
     runtime = _assert_active(app)
     key = _select(app)
-    _widget(app, "Analyst note").set_value("table identity excludes note contents").run()
+    _save_note(app, "table identity excludes note contents")
     assert _exception_table(app).key == key
     assert any(text.value == "Selected key: A" for text in app.text)
     _widget(app, "Analyst disposition").set_value(ReviewDisposition.REVIEW_COMPLETE).run()
@@ -662,12 +670,12 @@ def test_colliding_display_keys_have_distinct_editors_and_canonical_annotations(
     assert _exception_table(app).value["Matching key"].tolist() == ["A / B / C"] * 2
     _select(app, 0)
     first_editor = _widget(app, "Analyst note").key
-    _widget(app, "Analyst note").set_value("first canonical key").run()
+    _save_note(app, "first canonical key")
     _widget(app, "Analyst disposition").set_value(ReviewDisposition.REVIEW_COMPLETE).run()
     _select(app, 1)
     assert _widget(app, "Analyst note").key != first_editor
     assert _widget(app, "Analyst note").value == ""
-    _widget(app, "Analyst note").set_value("second canonical key").run()
+    _save_note(app, "second canonical key")
     assert runtime.reviews_by_key[first] == FindingReview(
         first, ReviewDisposition.REVIEW_COMPLETE, "first canonical key"
     )
@@ -774,6 +782,7 @@ def test_zero_exceptions_have_no_review_ui_but_valid_empty_runtime(mode, kind):
         widget.label in ("Review disposition", "Analyst disposition", "Analyst note")
         for widget in (*app.multiselect, *app.selectbox, *app.text_area)
     )
+    assert not any(button.label == "Save note" for button in app.button)
 
 
 def test_many_edits_leave_complete_result_binding_source_and_original_csv_unchanged(
@@ -814,7 +823,7 @@ def test_many_edits_leave_complete_result_binding_source_and_original_csv_unchan
     old_json = export_review_session(old_session)
     for index in range(len(exceptions)):
         _select(app, index)
-        _widget(app, "Analyst note").set_value(f" note {index}\t🧾\r\n=1+2 ").run()
+        _save_note(app, f" note {index}\t🧾\r\n=1+2 ")
         _widget(app, "Analyst disposition").set_value(ReviewDisposition.REVIEW_COMPLETE).run()
     assert not app.exception
     assert runtime.binding is binding and app.session_state["completed"][1] is result
@@ -862,6 +871,7 @@ def test_review_persistence_is_explicit_and_only_original_download_precedes_prep
         "Review session JSON",
         "Apply review session",
         "Prepare review downloads",
+        "Save note",
     }
     prohibited = {
         "Download review session",

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 import streamlit as st
+from streamlit.delta_generator import DeltaGenerator
 
 from tallydiff import (
     AmountParseError,
@@ -287,8 +288,8 @@ def _apply_uploaded_review_session() -> None:
 
 
 def _request_review_downloads() -> None:
-    # Defer exports until ALL widget callbacks have committed their fields. No
-    # frontend draft values are read; the resulting snapshot is authoritative.
+    # Defer exports until widget callbacks finish. A selected note is explicitly
+    # submitted and validated by its form before this request is made.
     _retain_active_editor_selection()
     st.session_state[_REVIEW_PREPARE_REQUEST_KEY] = True
 
@@ -306,12 +307,12 @@ def _prepare_requested_review_downloads() -> None:
         st.session_state.pop(_REVIEW_PREPARE_ERROR_KEY, None)
 
 
-def _show_review_persistence(runtime: _ReviewRuntimeState) -> None:
+def _show_review_persistence(runtime: _ReviewRuntimeState) -> DeltaGenerator:
     st.subheader("Review session")
     st.caption(
-        "Review changes are kept in this session. Notes are saved when you leave the "
-        "field or commit the widget. Prepare review downloads before downloading the "
-        "reviewed report or resumable session file."
+        "Review changes are kept in this session. Save note saves a note without preparing "
+        "downloads. Prepare review downloads saves the selected note and captures the "
+        "complete saved review state."
     )
     upload = st.file_uploader(
         "Review session JSON",
@@ -330,9 +331,7 @@ def _show_review_persistence(runtime: _ReviewRuntimeState) -> None:
     error = st.session_state.pop(_REVIEW_IMPORT_ERROR_KEY, None)
     if error is not None:
         st.error(error)
-    st.button(
-        "Prepare review downloads", key=_REVIEW_PREPARE_KEY, on_click=_request_review_downloads
-    )
+    prepare_control = st.empty()
     error = st.session_state.pop(_REVIEW_PREPARE_ERROR_KEY, None)
     if error is not None:
         st.error(error)
@@ -360,6 +359,7 @@ def _show_review_persistence(runtime: _ReviewRuntimeState) -> None:
             key=_REVIEW_DOWNLOAD_SESSION_KEY,
             on_click="ignore",
         )
+    return prepare_control
 
 
 def _ensure_review_state(result: ReconciliationResult) -> bool:
@@ -393,7 +393,7 @@ def _ensure_review_state(result: ReconciliationResult) -> bool:
 
 
 def _review_widget_key(
-    field: Literal["disposition", "note"],
+    field: Literal["disposition", "note", "note_form", "note_save", "note_prepare"],
     fingerprint: str,
     matching_key: tuple[str, ...],
     generation: int,
@@ -444,12 +444,12 @@ def _commit_review_disposition(
         _invalidate_review_downloads()
 
 
-def _commit_review_note(fingerprint: str, matching_key: tuple[str, ...], generation: int) -> None:
+def _commit_review_note(fingerprint: str, matching_key: tuple[str, ...], generation: int) -> bool:
     """Validate a note draft without reading or committing a disposition widget."""
 
     runtime = _callback_review_state(fingerprint, matching_key, generation)
     if runtime is None:
-        return
+        return False
     _retain_editor_selection(fingerprint, matching_key, generation)
     widget_key = _review_widget_key("note", fingerprint, matching_key, generation)
     candidate = st.session_state[widget_key]
@@ -463,13 +463,29 @@ def _commit_review_note(fingerprint: str, matching_key: tuple[str, ...], generat
         st.session_state.setdefault(_REVIEW_NOTE_ERRORS_KEY, {})[widget_key] = (
             f"Analyst note: {exc}"
         )
-        return
+        return False
     st.session_state.get(_REVIEW_NOTE_DRAFTS_KEY, {}).pop(widget_key, None)
     st.session_state.get(_REVIEW_NOTE_ERRORS_KEY, {}).pop(widget_key, None)
     if replacement != current:
         runtime.reviews_by_key[matching_key] = replacement
         runtime.annotation_revision += 1
         _invalidate_review_downloads()
+    return True
+
+
+def _commit_review_note_and_prepare(
+    fingerprint: str, matching_key: tuple[str, ...], generation: int
+) -> None:
+    """Commit the form's submitted note before requesting a complete snapshot."""
+
+    try:
+        valid = _commit_review_note(fingerprint, matching_key, generation)
+    except ReviewSessionError as exc:
+        _invalidate_review_downloads()
+        st.session_state[_REVIEW_PREPARE_ERROR_KEY] = f"Review state: {exc}"
+        return
+    if valid:
+        _request_review_downloads()
 
 
 def _retain_editor_selection(
@@ -498,12 +514,13 @@ def _show_analyst_review(finding: ReconciliationFinding, runtime: _ReviewRuntime
     scope = (fingerprint, finding.key, generation)
     disposition_key = _review_widget_key("disposition", *scope)
     note_key = _review_widget_key("note", *scope)
-    # Populate from committed state on each render. Only a saved invalid draft
-    # overrides the note; another field's widget is never authoritative.
+    # Disposition follows committed state. Initialize the note only when absent:
+    # unrelated reruns must not reset the form's still-unsubmitted frontend text.
     st.session_state[disposition_key] = review.disposition
-    st.session_state[note_key] = st.session_state.get(_REVIEW_NOTE_DRAFTS_KEY, {}).get(
-        note_key, review.note
-    )
+    if note_key not in st.session_state:
+        st.session_state[note_key] = st.session_state.get(_REVIEW_NOTE_DRAFTS_KEY, {}).get(
+            note_key, review.note
+        )
     st.subheader("Analyst review")
     st.caption(
         "Analyst review does not change the reconciliation category, financial delta, "
@@ -518,16 +535,37 @@ def _show_analyst_review(finding: ReconciliationFinding, runtime: _ReviewRuntime
         on_change=_commit_review_disposition,
         args=scope,
     )
-    st.text_area(
-        "Analyst note",
-        value=None,
-        key=note_key,
-        on_change=_commit_review_note,
-        args=scope,
-    )
+    with st.form(
+        _review_widget_key("note_form", *scope), clear_on_submit=False, enter_to_submit=False
+    ):
+        st.caption(
+            "Notes are saved only with Save note or Prepare review downloads. "
+            "Submit the note before changing rows; unsubmitted edits are not saved."
+        )
+        st.text_area("Analyst note", value=None, key=note_key)
+        save, prepare = st.columns(2)
+        with save:
+            saved = st.form_submit_button(
+                "Save note",
+                key=_review_widget_key("note_save", *scope),
+                on_click=_commit_review_note,
+                args=scope,
+            )
+        with prepare:
+            prepared = st.form_submit_button(
+                "Prepare review downloads",
+                key=_review_widget_key("note_prepare", *scope),
+                on_click=_commit_review_note_and_prepare,
+                args=scope,
+            )
     error = st.session_state.get(_REVIEW_NOTE_ERRORS_KEY, {}).get(note_key)
     if error is not None:
         st.error(error)
+        st.caption(
+            "This note was not saved. Existing prepared downloads still contain saved notes."
+        )
+    elif saved or prepared:
+        st.caption("Note saved.")
 
 
 def _show_review_progress(session: ReviewSession) -> None:
@@ -979,7 +1017,7 @@ def _show_finding_table(
     table_key: str,
     one_to_many_policy: OneToManyPolicy | None = None,
     review_state: _ReviewRuntimeState | None = None,
-) -> None:
+) -> bool:
     st.caption("Select a row to inspect its original source records below.")
     event = st.dataframe(
         finding_rows(findings)
@@ -996,7 +1034,7 @@ def _show_finding_table(
     if event.selection.rows:
         selected_index = event.selection.rows[0]
         if type(selected_index) is not int or not 0 <= selected_index < len(findings):
-            return
+            return False
         finding = findings[selected_index]
         st.text(f"Selected key: {' / '.join(finding.key)}")
         if review_state is not None:
@@ -1046,6 +1084,8 @@ def _show_finding_table(
             _show_evidence(finding.rows_a, Source.A)
         with right:
             _show_evidence(finding.rows_b, Source.B)
+        return review_state is not None
+    return False
 
 
 def _show_exception_review(
@@ -1054,7 +1094,7 @@ def _show_exception_review(
     identity: str,
     one_to_many_policy: OneToManyPolicy | None = None,
     review_state: _ReviewRuntimeState | None = None,
-) -> None:
+) -> bool:
     query = st.text_input(
         "Search matching keys",
         key=f"review_search_{identity}",
@@ -1113,7 +1153,7 @@ def _show_exception_review(
         st.error(f"Minimum absolute delta: {exc}.")
         st.caption(f"Showing 0 of {len(findings):,} exception groups.")
         st.info("Enter a valid minimum absolute delta to display exception groups.")
-        return
+        return False
     visible = review_exceptions(
         findings,
         query=query,
@@ -1127,7 +1167,7 @@ def _show_exception_review(
     st.caption(f"Showing {len(visible):,} of {len(findings):,} exception groups.")
     if not visible:
         st.info("No exception groups match the current review filters.")
-        return
+        return False
     # A different view must not reuse a selection index from another row order.
     view_state = [query, [category.value for category in categories], minimum_text, sort_order]
     if has_comparisons:
@@ -1144,7 +1184,7 @@ def _show_exception_review(
     # Hash exact ordered canonical keys, never notes or displayed key strings.
     view_state.append([finding.key for finding in visible])
     view_id = sha256(json.dumps(view_state).encode("utf-8")).hexdigest()
-    _show_finding_table(
+    return _show_finding_table(
         visible,
         table_key=f"exceptions_{identity}_{view_id}",
         one_to_many_policy=one_to_many_policy,
@@ -1284,9 +1324,10 @@ def _show_results(
     else:
         st.warning(f"{len(exceptions)} key groups require review.")
     if exceptions:
+        prepare_control = None
         if session is not None:
             _show_review_progress(session)
-            _show_review_persistence(review_state)
+            prepare_control = _show_review_persistence(review_state)
         st.subheader("Exceptions")
         st.caption(
             "Review filters affect the displayed table only. The exception export remains complete."
@@ -1299,12 +1340,19 @@ def _show_results(
             key=f"download_{identity}",
             on_click="ignore",
         )
-        _show_exception_review(
+        has_note_editor = _show_exception_review(
             exceptions,
             identity=identity,
             one_to_many_policy=result.one_to_many_policy,
             review_state=review_state,
         )
+        if prepare_control is not None and not has_note_editor:
+            with prepare_control:
+                st.button(
+                    "Prepare review downloads",
+                    key=_REVIEW_PREPARE_KEY,
+                    on_click=_request_review_downloads,
+                )
     if tolerated:
         st.subheader("Within tolerance")
         st.metric(

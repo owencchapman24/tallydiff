@@ -894,6 +894,7 @@ def test_review_progress_filter_and_persistence_controls_precede_prepared_downlo
         "Minimum absolute delta",
     }
     assert not app.text_area
+    assert not any(button.label == "Save note" for button in app.button)
     assert {
         widget.label
         for widget in (*app.radio, *app.selectbox, *app.multiselect)

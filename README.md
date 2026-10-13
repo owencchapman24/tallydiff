@@ -97,7 +97,8 @@ The files in `sample_data/` contain only synthetic records.
 4. Select **V001 / 1042** in the exception table. Both evidence panels show
    source record **2**, including the original amounts **1250** and **1205**.
    Set **Analyst disposition** to **Needs follow-up** and optionally enter an
-   **Analyst note**. Leave the note field or commit its widget to save the edit.
+   **Analyst note**. Click **Save note** to commit it, or **Prepare review downloads**
+   to commit the current valid note and prepare both review files in one action.
 5. Click **Download exception report**. The CSV contains exactly the three
    exception groups above, with blank amounts for the missing sides.
 6. Click **Prepare review downloads**, then **Download reviewed exception report**
@@ -622,12 +623,17 @@ or approval. Notes do not determine reconciliation truth. Progress covers the
 complete exception population; the disposition filter is separate from financial
 category filters.
 
-Edits are held in local session state. Notes are saved when you leave the field
-or commit its widget. Each note permits up to **16,384 UTF-8 bytes**; invalid
-drafts show an error and leave the committed note unchanged. **Prepare review
-downloads** captures the committed complete review state. Both downloads include
-all exceptions, independently of current filters. Commit later edits and prepare
-again to refresh the downloads.
+Edits are held in local session state. The **Analyst note** uses a note-only
+form: **Save note** commits the current valid note, and **Prepare review downloads**
+commits that note before capturing the complete review state. Leaving the field
+does not save it; submit the note before changing rows. Disposition changes save
+independently and retain the committed note. Each note permits up to **16,384
+UTF-8 bytes**. Invalid submitted notes show
+an error, remain editable, and leave the committed annotation unchanged; Prepare
+refuses to create a new snapshot from an invalid note. Existing current downloads
+remain the prior prepared committed state. Both downloads include all exceptions,
+independently of current filters. A later committed edit clears prepared downloads;
+prepare again to refresh them.
 
 The original **Download exception report** remains the deterministic
 reconciliation artifact. **Download reviewed exception report** saves
@@ -831,26 +837,46 @@ corrupt inputs, resource closure, mixed-format results, and stale worksheet chan
 
 ### Manual browser release acceptance
 
-The two v0.7.0 browser-specific checks were **NOT EXECUTED / BLOCKED** during
-release preparation because an actual browser automation surface was unavailable.
-AppTest coverage does not substitute for these checks. Run the app locally and
-use the CSV uploads and mappings in the [sample workflow](#sample-workflow).
+Both v0.7.0 checks below passed in a manual real-browser test. AppTest coverage
+does not substitute for these observations. To repeat the checks, run the app
+locally and use the CSV uploads and mappings in the
+[sample workflow](#sample-workflow).
 
-**Pending note and Prepare:**
+**Focused note -> Prepare review downloads: PASS**
+
+For **V001 / 1042**, clicking the note form's Prepare button directly while the
+textarea remained focused, without clicking Save note first, exported the exact
+two-line note `=1+2\nFollow-up café` in JSON. The reviewed CSV preserved every
+original reconciliation cell and appended the review fields; its note was
+`Note: ` followed by that exact multiline text in one logical CSV cell. The
+previously discovered focused-textarea/Prepare defect is fixed.
 
 1. Run reconciliation, select **V001 / 1042**, enter a baseline Analyst note,
-   commit it, and prepare downloads.
-2. Replace the note with two lines, `=1+2` and `Follow-up café`. While the textarea
-   retains focus, click **Prepare review downloads** directly, using the normal
-   browser interaction rather than explicitly committing the widget first.
+   click **Save note**, and prepare downloads.
+2. Replace the note with exactly two lines, `=1+2` and `Follow-up café`. While the
+   textarea retains focus, click the **Prepare review downloads** submit control
+   in its note form directly. Do not click Save note or deliberately blur first.
 3. Download and parse both artifacts. For matching key `['V001', '1042']`, JSON
-   must contain the newly committed note exactly, including its line break; the
-   reviewed CSV note must be the same text preceded by `Note: `. Record the
-   focus/commit behavior and confirm that the caption correctly explains saving
-   on leaving the field or committing the widget. A committed new note exporting
+   must contain `=1+2\nFollow-up café` exactly; the reviewed CSV must contain one
+   logical note cell with `Note: ` followed by that same multiline text. Exporting
    the baseline value is a failure.
+4. Confirm the caption explains that Save note or Prepare commits the note and
+   that disposition saves independently. Enter a note over 16,384 UTF-8 bytes and
+   submit Prepare: it must show a concise error, retain editable text and the
+   committed valid note, and avoid preparing a new snapshot. Prior current
+   downloads, if present, must still contain the previously prepared valid note.
+   Record the browser result; automated tests alone do not mark this check PASS.
 
-**Native dataframe sorting and editor alignment:**
+**Native dataframe sorting/editor alignment: PASS**
+
+Native frontend sorting on **Delta (A - B)** displayed **V004 / 1045 (-300)**,
+**V001 / 1042 (+45)**, then **V003 / 1044 (+500)**. Selecting V004 / 1045 showed
+the correct key, **File B only** category, no File A records, and File B evidence
+with Supplier **V004**, Invoice Ref **1045**, and Gross Amount **300**. After
+setting **Review complete**, saving `native-sort-test-V004`, and excluding
+Review complete in the disposition filter, V004 disappeared. Only V001 and V003
+remained; neither became selected, and the Analyst review editor did not transfer
+to another row.
 
 1. Sort the exception dataframe using its frontend column header, including
    descending **Matching key** order. Select a visually identified row after the
@@ -858,8 +884,9 @@ use the CSV uploads and mappings in the [sample workflow](#sample-workflow).
 2. Confirm that its editor and original evidence belong to that exact key. For
    example, **V004 / 1045** must show the File B-only evidence and delta **-300**,
    not another row's values.
-3. Change that row's disposition and note, commit, prepare, and inspect the
-   session JSON. Only the recorded key's annotation may change.
+3. Change that row's disposition and note, then submit **Prepare review downloads**
+   to commit the note and prepare the files. Inspect the session JSON. Only the
+   recorded key's annotation may change.
 4. Set the disposition filter to exclude the edited row's new disposition.
    Confirm the row disappears and its selection/editor does not transfer to a
    different row. Correct alignment and isolation throughout are required to

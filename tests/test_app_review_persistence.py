@@ -15,10 +15,12 @@ from test_app import (
     _uploaded_app,
 )
 from test_app_review import (
+    INVALID_NOTES,
     _editor_key,
     _fake_active,
     _invoke,
     _progress,
+    _save_note,
     _select,
     _widget,
 )
@@ -53,6 +55,7 @@ from tallydiff.presentation import REVIEW_DISPOSITION_LABELS
 REVIEWED_LABEL = "Download reviewed exception report"
 SESSION_LABEL = "Download review session"
 PREPARE_LABEL = "Prepare review downloads"
+SAVE_LABEL = "Save note"
 APPLY_LABEL = "Apply review session"
 UPLOAD_LABEL = "Review session JSON"
 
@@ -370,7 +373,7 @@ def test_upload_candidate_changes_nothing_and_never_calls_parser(monkeypatch, re
     app = _run_app()
     runtime = _assert_active(app)
     _select(app)
-    _widget(app, "Analyst note").set_value("committed note").run()
+    _save_note(app, "committed note")
     prepared = _prepare(app)
     before = _committed(runtime)
     selected = _exception_table(app).key
@@ -405,15 +408,15 @@ def test_valid_apply_replaces_complete_population_progress_and_editor_ownership(
     runtime = _assert_active(app)
     result, binding = runtime.binding.result, runtime.binding
     _select(app)
-    _widget(app, "Analyst note").set_value("old committed").run()
-    _widget(app, "Analyst note").set_value("old invalid\0draft").run()
+    _save_note(app, "old committed")
+    _prepare(app)
+    _save_note(app, "old invalid\0draft")
     old_note_key = _widget(app, "Analyst note").key
     old_disposition_key = _widget(app, "Analyst disposition").key
     old_table_key = _exception_table(app).key
     filters = _filters(app)
     revision, generation = runtime.annotation_revision, runtime.editor_generation
     imported = _mixed_session(runtime)
-    _prepare(app)
     _apply(app, export_review_session(imported))
     assert runtime.binding is binding and runtime.binding.result is result
     assert app.session_state["completed"][1] is result
@@ -447,7 +450,7 @@ def test_valid_apply_replaces_complete_population_progress_and_editor_ownership(
     assert _widget(app, "Analyst note").value == imported.reviews[0].note
     assert _widget(app, "Analyst disposition").value is imported.reviews[0].disposition
     assert _widget(app, "Analyst note").key != old_note_key
-    _widget(app, "Analyst note").set_value("post-import note").run()
+    _save_note(app, "post-import note")
     assert runtime.reviews_by_key[imported.reviews[0].matching_key] == FindingReview(
         imported.reviews[0].matching_key, imported.reviews[0].disposition, "post-import note"
     )
@@ -513,7 +516,7 @@ def test_invalid_apply_is_atomic_preserves_filters_editor_progress_and_prepared_
     runtime = _assert_active(app)
     _select(app)
     _widget(app, "Analyst disposition").set_value(ReviewDisposition.NEEDS_FOLLOW_UP).run()
-    _widget(app, "Analyst note").set_value("private authoritative note").run()
+    _save_note(app, "private authoritative note")
     _widget(app, "Exception sort order").set_value("absolute_delta_desc").run()
     _select(app)
     prepared = _prepare(app)
@@ -552,7 +555,7 @@ def test_renamed_identical_uploads_require_rerun_then_accept_saved_session():
     app = _run_app()
     original = _assert_active(app)
     _select(app)
-    _widget(app, "Analyst note").set_value("resumable renamed files 🧾").run()
+    _save_note(app, "resumable renamed files 🧾")
     _widget(app, "Analyst disposition").set_value(ReviewDisposition.REVIEW_COMPLETE).run()
     saved = export_review_session(original.snapshot())
     original_fingerprint = original.binding.result_fingerprint
@@ -584,7 +587,7 @@ def test_prepare_installs_exact_stable_bytes_filename_mime_and_ignore_download_c
     runtime = _assert_active(app)
     _assert_downloads(app, prepared=False)
     _select(app)
-    _widget(app, "Analyst note").set_value('=SUM(A1:A2)\n"exact",🧾').run()
+    _save_note(app, '=SUM(A1:A2)\n"exact",🧾')
     before = _committed(runtime)
     prepared = _prepare(app)
     _assert_committed(runtime, before)
@@ -611,23 +614,244 @@ def test_prepare_installs_exact_stable_bytes_filename_mime_and_ignore_download_c
     )
 
 
-def test_prepare_uses_note_committed_in_the_same_widget_rerun():
+def test_native_form_prepare_commits_submitted_note_before_snapshot():
+    """AppTest models the submitted server batch, not browser focus/event ordering."""
+
     app = _run_app()
     runtime = _assert_active(app)
     _select(app)
-    _widget(app, "Analyst note").set_value("latest committed via same rerun 🧾")
+    _save_note(app, "baseline committed note")
+    previous = _prepare(app)
+    key = runtime.binding.exception_keys[0]
+    prior_review = runtime.reviews_by_key[key]
+    revision, generation = runtime.annotation_revision, runtime.editor_generation
+    _widget(app, "Analyst note").set_value("=1+2\nFollow-up café")
     _button(app, PREPARE_LABEL).click().run()
     assert not app.exception
-    assert runtime.annotation_revision == 1 and runtime.editor_generation == 0
+    assert runtime.annotation_revision == revision + 1
+    assert runtime.editor_generation == generation
+    assert runtime.reviews_by_key[key] is not prior_review
+    assert runtime.reviews_by_key[key].disposition is prior_review.disposition
     prepared = app.session_state[ui._REVIEW_PREPARED_KEY]
-    assert (
-        json.loads(prepared.session_json)["reviews"][0]["note"]
-        == "latest committed via same rerun 🧾"
-    )
+    assert prepared is not previous
+    assert prepared.annotation_revision == runtime.annotation_revision
+    assert json.loads(prepared.session_json)["reviews"][0]["note"] == "=1+2\nFollow-up café"
     assert prepared.session_json == export_review_session(runtime.snapshot())
     assert prepared.reviewed_csv == export_reviewed_exceptions_csv(
         runtime.binding, runtime.snapshot()
     )
+    assert _rows(prepared.reviewed_csv)[1][-1] == "Note: =1+2\nFollow-up café"
+
+
+def test_note_save_invalidates_old_artifacts_then_prepare_captures_exact_note(downloads):
+    app = _run_app()
+    runtime = _assert_active(app)
+    _select(app)
+    _widget(app, "Analyst disposition").set_value(ReviewDisposition.NEEDS_FOLLOW_UP).run()
+    _save_note(app, "baseline committed note")
+    previous = _prepare(app)
+    key = runtime.binding.exception_keys[0]
+    binding, result = runtime.binding, runtime.binding.result
+    findings = result.findings
+    original_csv = export_exceptions_csv(result)
+    revision, generation = runtime.annotation_revision, runtime.editor_generation
+    prior_review = runtime.reviews_by_key[key]
+    note = "=1+2\nFollow-up café"
+
+    _save_note(app, note)
+    assert not app.exception and not app.error
+    assert any(caption.value == "Note saved." for caption in app.caption)
+    assert runtime.reviews_by_key[key] == FindingReview(key, prior_review.disposition, note)
+    assert runtime.reviews_by_key[key] is not prior_review
+    assert runtime.annotation_revision == revision + 1
+    assert runtime.editor_generation == generation
+    assert ui._REVIEW_PREPARED_KEY not in app.session_state
+    _assert_downloads(app, prepared=False)
+
+    prepared = _prepare(app)
+    assert prepared is not previous
+    assert prepared.result_fingerprint == binding.result_fingerprint
+    assert prepared.annotation_revision == runtime.annotation_revision == revision + 1
+    assert runtime.editor_generation == generation
+    assert prepared.session_json == export_review_session(runtime.snapshot())
+    assert prepared.reviewed_csv == export_reviewed_exceptions_csv(binding, runtime.snapshot())
+    saved = json.loads(prepared.session_json)
+    assert saved["version"] == 1
+    assert saved.keys() == json.loads(previous.session_json).keys()
+    assert saved["reviews"][0] == {
+        "matching_key": list(key),
+        "disposition": prior_review.disposition.value,
+        "note": note,
+    }
+    original_rows, reviewed_rows = _rows(original_csv), _rows(prepared.reviewed_csv)
+    assert [row[:-2] for row in reviewed_rows] == original_rows
+    assert reviewed_rows[1][-2:] == ["Needs follow-up", "Note: " + note]
+    assert runtime.binding is binding and binding.result is result
+    assert app.session_state["completed"][1] is result and result.findings is findings
+    assert export_exceptions_csv(result) == original_csv
+    assert downloads["Download exception report"]["data"] == original_csv
+
+
+def test_selected_note_and_prepare_share_native_form_with_independent_disposition():
+    app = _run_app()
+    assert not any(button.label == SAVE_LABEL for button in app.button)
+    assert _button(app, PREPARE_LABEL).key == ui._REVIEW_PREPARE_KEY
+    assert not _button(app, PREPARE_LABEL).proto.form_id
+    _select(app)
+    note = _widget(app, "Analyst note")
+    save, prepare = _button(app, SAVE_LABEL), _button(app, PREPARE_LABEL)
+    assert note.proto.form_id
+    assert save.proto.form_id == prepare.proto.form_id == note.proto.form_id
+    assert save.proto.is_form_submitter and prepare.proto.is_form_submitter
+    assert not save.disabled and not prepare.disabled
+    assert len([button for button in app.button if button.label == PREPARE_LABEL]) == 1
+    assert not _widget(app, "Analyst disposition").proto.form_id
+    assert any(
+        "Save note" in caption.value and "Prepare review downloads" in caption.value
+        for caption in app.caption
+    )
+
+
+def test_identical_selected_form_prepare_preserves_committed_scope_and_equivalent_bytes():
+    app = _run_app()
+    runtime = _assert_active(app)
+    _select(app)
+    _save_note(app, "=1+2\nFollow-up café")
+    previous = _prepare(app)
+    before = _committed(runtime)
+    current = _prepare(app)
+    _assert_committed(runtime, before)
+    assert current.result_fingerprint == previous.result_fingerprint
+    assert (
+        current.annotation_revision == previous.annotation_revision == runtime.annotation_revision
+    )
+    assert current.session_json == previous.session_json
+    assert current.reviewed_csv == previous.reviewed_csv
+    _assert_downloads(app, prepared=True)
+
+
+def test_unsubmitted_note_does_not_commit_on_disposition_change():
+    """A server-side form candidate is not authoritative until a form submit."""
+
+    app = _run_app()
+    runtime = _assert_active(app)
+    _select(app)
+    _save_note(app, "authoritative committed note")
+    prepared = _prepare(app)
+    before = runtime.annotation_revision
+    key = runtime.binding.exception_keys[0]
+    _widget(app, "Analyst note").set_value("pending different note").run()
+    assert not app.exception
+    assert runtime.reviews_by_key[key].note == "authoritative committed note"
+    assert runtime.annotation_revision == before
+    assert app.session_state[ui._REVIEW_PREPARED_KEY] is prepared
+    _widget(app, "Analyst disposition").set_value(ReviewDisposition.REVIEW_COMPLETE).run()
+    assert not app.exception
+    assert runtime.reviews_by_key[key] == FindingReview(
+        key, ReviewDisposition.REVIEW_COMPLETE, "authoritative committed note"
+    )
+    assert runtime.annotation_revision == before + 1
+    assert runtime.editor_generation == 0
+    assert ui._REVIEW_PREPARED_KEY not in app.session_state
+
+
+def test_form_prepare_uses_authoritative_disposition_instead_of_stale_widget(monkeypatch):
+    runtime, state = _fake_active(monkeypatch)
+    key = runtime.binding.exception_keys[0]
+    committed = FindingReview(key, ReviewDisposition.REVIEW_COMPLETE, "baseline")
+    runtime.reviews_by_key[key] = committed
+    original_csv = export_exceptions_csv(runtime.binding.result)
+    _prepared_in_state(state, runtime)
+    state[_editor_key(runtime, "note")] = "=1+2\nFollow-up café"
+    state[_editor_key(runtime, "disposition")] = ReviewDisposition.UNREVIEWED
+    _invoke(ui._commit_review_note_and_prepare, runtime)
+    assert runtime.reviews_by_key[key] == FindingReview(
+        key, committed.disposition, "=1+2\nFollow-up café"
+    )
+    assert runtime.annotation_revision == 1 and runtime.editor_generation == 0
+    assert ui._REVIEW_PREPARED_KEY not in state
+    ui._prepare_requested_review_downloads()
+    prepared = state[ui._REVIEW_PREPARED_KEY]
+    assert prepared.annotation_revision == runtime.annotation_revision == 1
+    assert prepared.session_json == export_review_session(runtime.snapshot())
+    assert prepared.reviewed_csv == export_reviewed_exceptions_csv(
+        runtime.binding, runtime.snapshot()
+    )
+    assert export_exceptions_csv(runtime.binding.result) == original_csv
+
+
+@pytest.mark.parametrize("note", INVALID_NOTES)
+@pytest.mark.parametrize("prior_prepared", (False, True), ids=("unprepared", "prepared"))
+def test_invalid_form_prepare_preserves_committed_state_and_draft_without_new_snapshot(
+    monkeypatch, note, prior_prepared
+):
+    runtime, state = _fake_active(monkeypatch)
+    key = runtime.binding.exception_keys[0]
+    runtime.reviews_by_key[key] = FindingReview(
+        key, ReviewDisposition.NEEDS_FOLLOW_UP, "valid authoritative baseline"
+    )
+    previous = _prepared_in_state(state, runtime) if prior_prepared else None
+    before = _committed(runtime)
+    widget_key = _editor_key(runtime, "note")
+    state[widget_key] = note
+    _invoke(ui._commit_review_note_and_prepare, runtime)
+    ui._prepare_requested_review_downloads()
+    _assert_committed(runtime, before)
+    assert state.get(ui._REVIEW_PREPARED_KEY) is previous
+    assert ui._REVIEW_PREPARE_REQUEST_KEY not in state
+    assert state[widget_key] == state[ui._REVIEW_NOTE_DRAFTS_KEY][widget_key] == note
+    error = state[ui._REVIEW_NOTE_ERRORS_KEY][widget_key]
+    assert error.startswith("Analyst note: ") and len(error) < 350 and note not in error
+    if previous is not None:
+        assert previous.session_json == export_review_session(runtime.snapshot())
+        assert previous.reviewed_csv == export_reviewed_exceptions_csv(
+            runtime.binding, runtime.snapshot()
+        )
+
+
+def test_invalid_native_form_prepare_stays_editable_and_preserves_current_downloads():
+    app = _run_app()
+    runtime = _assert_active(app)
+    _select(app)
+    _save_note(app, "committed baseline")
+    previous = _prepare(app)
+    before = _committed(runtime)
+    draft = "invalid\0pending note"
+    _widget(app, "Analyst note").set_value(draft)
+    _button(app, PREPARE_LABEL).click().run()
+    assert not app.exception and app.error
+    _assert_committed(runtime, before)
+    assert app.session_state[ui._REVIEW_PREPARED_KEY] is previous
+    assert _widget(app, "Analyst note").value == draft
+    assert not any(caption.value == "Note saved." for caption in app.caption)
+    assert all(len(error.value) < 350 and draft not in error.value for error in app.error)
+    _assert_downloads(app, prepared=True)
+    _save_note(app, "corrected note")
+    assert not app.exception and not app.error
+    assert runtime.annotation_revision == before[2] + 1
+    assert runtime.editor_generation == before[3]
+    assert ui._REVIEW_PREPARED_KEY not in app.session_state
+
+
+@pytest.mark.parametrize("scope", ("fingerprint", "generation"))
+def test_stale_form_prepare_cannot_commit_or_request_a_new_snapshot(monkeypatch, scope):
+    runtime, state = _fake_active(monkeypatch)
+    previous = _prepared_in_state(state, runtime)
+    before = _committed(runtime)
+    fingerprint = "f" * 64 if scope == "fingerprint" else runtime.binding.result_fingerprint
+    generation = 1 if scope == "generation" else runtime.editor_generation
+    key = runtime.binding.exception_keys[0]
+    state[ui._review_widget_key("note", fingerprint, key, generation)] = "stale note"
+    _invoke(
+        ui._commit_review_note_and_prepare,
+        runtime,
+        fingerprint=fingerprint,
+        generation=generation,
+    )
+    ui._prepare_requested_review_downloads()
+    _assert_committed(runtime, before)
+    assert state[ui._REVIEW_PREPARED_KEY] is previous
+    assert ui._REVIEW_PREPARE_REQUEST_KEY not in state
 
 
 @pytest.mark.parametrize("visible", ("one", "zero"))
@@ -663,7 +887,7 @@ def test_filters_navigation_and_downloads_preserve_prepared_object_without_regen
     app = _run_app()
     runtime = _assert_active(app)
     _select(app)
-    _widget(app, "Analyst note").set_value("stable note").run()
+    _save_note(app, "stable note")
     prepared = _prepare(app)
     before = _committed(runtime)
 
@@ -708,9 +932,10 @@ def test_committed_edit_removes_artifacts_and_next_prepare_captures_the_change(f
     _select(app)
     before = _prepare(app)
     value = "changed committed note" if field == "note" else ReviewDisposition.REVIEW_COMPLETE
-    _widget(app, "Analyst note" if field == "note" else "Analyst disposition").set_value(
-        value
-    ).run()
+    if field == "note":
+        _save_note(app, value)
+    else:
+        _widget(app, "Analyst disposition").set_value(value).run()
     assert not app.exception
     assert runtime.annotation_revision == 1 and runtime.editor_generation == 0
     assert ui._REVIEW_PREPARED_KEY not in app.session_state
@@ -732,7 +957,10 @@ def test_noop_edit_keeps_prepared_downloads_and_revision(field):
     _select(app)
     prepared = _prepare(app)
     widget = _widget(app, "Analyst note" if field == "note" else "Analyst disposition")
-    widget.set_value(widget.value).run()
+    if field == "note":
+        _save_note(app, widget.value)
+    else:
+        widget.set_value(widget.value).run()
     assert not app.exception
     assert runtime.annotation_revision == runtime.editor_generation == 0
     assert app.session_state[ui._REVIEW_PREPARED_KEY] is prepared
@@ -743,17 +971,17 @@ def test_invalid_draft_keeps_committed_artifacts_until_valid_correction(download
     app = _run_app()
     runtime = _assert_active(app)
     _select(app)
-    _widget(app, "Analyst note").set_value("valid authoritative").run()
+    _save_note(app, "valid authoritative")
     prepared = _prepare(app)
     before = _committed(runtime)
-    _widget(app, "Analyst note").set_value("bad\0uncommitted draft").run()
+    _save_note(app, "bad\0uncommitted draft")
     assert not app.exception and app.error
     _assert_committed(runtime, before)
     assert app.session_state[ui._REVIEW_PREPARED_KEY] is prepared
     assert downloads[REVIEWED_LABEL]["data"] is prepared.reviewed_csv
     assert downloads[SESSION_LABEL]["data"] is prepared.session_json
     _assert_downloads(app, prepared=True)
-    _widget(app, "Analyst note").set_value("valid correction").run()
+    _save_note(app, "valid correction")
     assert not app.exception and not app.error
     assert runtime.annotation_revision == before[2] + 1
     assert ui._REVIEW_PREPARED_KEY not in app.session_state
@@ -779,7 +1007,7 @@ def test_run_click_always_clears_prepared_artifacts_but_preserves_equivalent_ann
     app = _run_app()
     runtime = _assert_active(app)
     _select(app)
-    _widget(app, "Analyst note").set_value("preserve annotations on equivalent Run").run()
+    _save_note(app, "preserve annotations on equivalent Run")
     prepared = _prepare(app)
     before = _committed(runtime)
     app.button(key="run").click().run()
@@ -883,7 +1111,7 @@ def test_failed_apply_preserves_corrupt_runtime_without_stage5_repair_on_later_r
     completed = app.session_state["completed"]
     original_csv = export_exceptions_csv(result)
     _select(app)
-    _widget(app, "Analyst note").set_value("committed before corruption").run()
+    _save_note(app, "committed before corruption")
     _upload(app, export_review_session(_mixed_session(runtime)))
     prepared = _prepare(app)
     selection = app.session_state[ui._REVIEW_EDITOR_SELECTION_KEY]
@@ -956,7 +1184,9 @@ def test_clean_completed_runs_omit_all_new_persistence_controls(mode):
     runtime = _assert_active(app)
     assert runtime.binding.exception_keys == () and runtime.snapshot().reviews == ()
     assert not any(widget.label == UPLOAD_LABEL for widget in app.file_uploader)
-    assert not any(button.label in (APPLY_LABEL, PREPARE_LABEL) for button in app.button)
+    assert not any(
+        button.label in (APPLY_LABEL, PREPARE_LABEL, SAVE_LABEL) for button in app.button
+    )
     assert not any(
         button.label in (REVIEWED_LABEL, SESSION_LABEL) for button in app.download_button
     )
