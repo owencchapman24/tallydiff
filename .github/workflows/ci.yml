@@ -42,6 +42,7 @@ jobs:
           canaries = (
               "%SystemDrive%/cache/release-canary.txt",
               "benchmark_output/release-canary.csv",
+              "benchmark_output/review_v07.json",
               "local-review.patch",
               "untracked-local-note.txt",
               ".vscode/release-canary.json",
@@ -65,3 +66,27 @@ jobs:
           PY
           uv build
           uv run python -m scripts.check_release_artifacts
+      - name: Smoke the exact installed wheel outside checkout
+        run: |
+          smoke_dir="$(mktemp -d "$RUNNER_TEMP/tallydiff-wheel-smoke.XXXXXX")"
+          trap 'rm -rf -- "$smoke_dir"' EXIT
+          uv export --locked --no-dev --no-emit-project --format requirements.txt --output-file "$smoke_dir/runtime-requirements.txt"
+          uv venv --python "${{ matrix.python-version }}" "$smoke_dir/venv"
+          smoke_python="$smoke_dir/venv/bin/python"
+          uv pip sync --python "$smoke_python" --require-hashes "$smoke_dir/runtime-requirements.txt"
+          wheel="$GITHUB_WORKSPACE/dist/tallydiff-0.7.0-py3-none-any.whl"
+          "$smoke_python" -I - "$wheel" "$smoke_dir/wheel-requirements.txt" <<'PY'
+          import hashlib
+          import sys
+          from pathlib import Path
+          wheel = Path(sys.argv[1]).resolve(strict=True)
+          digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+          Path(sys.argv[2]).write_text(
+              f"tallydiff @ {wheel.as_uri()} --hash=sha256:{digest}\n", encoding="utf-8"
+          )
+          PY
+          uv pip install --python "$smoke_python" --require-hashes --no-deps --requirements "$smoke_dir/wheel-requirements.txt"
+          uv pip check --python "$smoke_python"
+          cp scripts/review_smoke.py "$smoke_dir/review_smoke.py"
+          cd "$smoke_dir"
+          "$smoke_python" -I review_smoke.py --wheel "$wheel" --checkout-root "$GITHUB_WORKSPACE"

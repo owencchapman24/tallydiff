@@ -7,6 +7,7 @@ from decimal import Decimal
 from io import StringIO
 
 import pytest
+from streamlit.testing.v1 import AppTest
 from test_app import (
     _assert_result_cleared,
     _exception_downloads,
@@ -110,7 +111,7 @@ def test_bounded_mode_captions_disclose_exact_search_tolerance_and_secondary_sco
     app.radio(key="reconciliation_mode").set_value(MODE).run()
     text = _texts(app)
     assert "uniquely determined exact subset" in text and "within fixed search limits" in text
-    assert "Inferred correspondence always requires review." in text
+    assert "Inferred correspondence is always treated as a reconciliation exception." in text
     assert disclosure in text and "Subset inference requires exact Decimal equality." in text
     assert "remain Amount mismatch even when their residual delta is within tolerance" in text
     assert (
@@ -157,7 +158,7 @@ def test_inferred_exact_and_residual_groups_are_exceptions_with_structural_detai
         assert "Exact match" in _review_widget(app, "Exception categories").options
         assert any("Control totals agree" in item.value for item in app.warning)
     _select(app)
-    assert "Inferred exact correspondence — review required" in _texts(app)
+    assert "Inferred exact correspondence — reconciliation exception" in _texts(app)
     references = _references(app)
     assert references[0].to_dict("records") == [
         {
@@ -280,7 +281,7 @@ def test_unresolved_selected_details_preserve_witnesses_parent_direction_and_raw
             assert "At least two exact solutions" in text
     if status is S.SINGLETON_ONLY:
         assert "Singleton candidate witness" in text
-        assert "Inferred exact correspondence — review required" not in text
+        assert "Inferred exact correspondence — reconciliation exception" not in text
         if source is Source.B:
             assert analysis.ambiguity_witnesses[0].anchor.source is Source.A
             assert references[0]["Source"].tolist() == ["File B"]
@@ -382,7 +383,11 @@ def test_mixed_table_and_secondary_details_preserve_comparison_semantics():
         "Unique exact subset",
         "",
     ]
-    assert list(table)[-2:] == ["Secondary differences", "Correspondence status"]
+    assert list(table)[-3:] == [
+        "Secondary differences",
+        "Correspondence status",
+        "Review disposition",
+    ]
     assert (
         _metrics(app)["Analyzed duplicate groups"]
         == _metrics(app)["Inferred correspondences"]
@@ -537,7 +542,7 @@ def test_invalid_bounded_profiles_leave_completed_configuration_atomic(failure):
     assert app.session_state["completed"][1] is completed[1]
 
 
-def test_displayed_policy_limits_and_flags_come_from_completed_result(monkeypatch):
+def test_displayed_policy_limits_and_flags_come_from_completed_result():
     class PolicyView:
         """A renderer test double; the engine's actual canonical result stays intact."""
 
@@ -556,11 +561,26 @@ def test_displayed_policy_limits_and_flags_come_from_completed_result(monkeypatc
         def __getattr__(self, name):
             return getattr(self.result, name)
 
-    def rendered_result(*args, **kwargs):
-        return PolicyView(reconcile(*args, **kwargs))
-
-    monkeypatch.setattr(tallydiff, "reconcile", rendered_result)
-    app = _group(("13",), ("1",) * 13)
+    records = tuple(
+        tallydiff.ingest_csv(
+            _data(amounts).decode(), source=source, key_columns=("id",), amount_column="amount"
+        )
+        for source, amounts in ((Source.A, ("13",)), (Source.B, ("1",) * 13))
+    )
+    # This proxy deliberately has a noncanonical display policy. Exercise only
+    # the renderer; successful-run binding must receive a real engine result.
+    app = AppTest.from_string(
+        "from tallydiff import ColumnMapping\n"
+        "from tallydiff.app import _show_results\n"
+        "import streamlit as st\n"
+        "_show_results(st.session_state['policy_view'], "
+        "ColumnMapping((('id', 'id'),), 'amount', 'amount'), "
+        "'renderer', 'file_a.csv', 'file_b.csv')\n",
+        default_timeout=15,
+    )
+    app.session_state["policy_view"] = PolicyView(reconcile(*records, mode=MODE))
+    app.run()
+    assert not app.exception
     text = _texts(app)
     assert "Inferred correspondence policy: display_snapshot" in text
     assert (

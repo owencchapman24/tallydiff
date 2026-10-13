@@ -1,6 +1,6 @@
 # TallyDiff
 
-**TallyDiff v0.6.0** compares two structured financial exports locally
+**TallyDiff v0.7.0** compares two structured financial exports locally
 and explains which matching key groups account for their difference. Pair key columns, such as
 vendor and invoice number, then compare unique records or explicitly aggregate
 all rows sharing each key, or review bounded one-to-many correspondence.
@@ -29,8 +29,9 @@ Optional secondary fields compare additional evidence after keys are matched.
 - **Exact Decimal arithmetic and original evidence**. XLSX numeric cells first
   convert through decimal text; Excel display formatting is not reconstructed.
   Formulas and Excel errors in selected key, amount, or secondary fields block ingestion.
-- **Display-only exception review** with key search, category and minimum-delta
-  filters, a secondary-mismatch checkbox, and deterministic sorting.
+- **Analyst review workflow** with dispositions, optional plain-text notes,
+  progress counts, and explicitly saved resumable review sessions. Key search,
+  category, minimum-delta, secondary-mismatch, and disposition filters support review.
 - **Complete exception CSV export**, independent of review filters, with every
   review-required group and its complete source references. Accepted variance
   remains outside this report.
@@ -39,7 +40,8 @@ Equal totals alone never imply a reconciliation. TallyDiff reports differences;
 it does not decide which source is authoritative. See [known limitations](#known-limitations)
 and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
 
-TallyDiff v0.6.0 includes bounded correspondence and profile schema v5.
+TallyDiff v0.7.0 adds analyst review while retaining bounded correspondence and
+mapping-profile schema v5. Review-session JSON uses its independent schema v1.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
 
@@ -94,8 +96,15 @@ The files in `sample_data/` contain only synthetic records.
 
 4. Select **V001 / 1042** in the exception table. Both evidence panels show
    source record **2**, including the original amounts **1250** and **1205**.
+   Set **Analyst disposition** to **Needs follow-up** and optionally enter an
+   **Analyst note**. Click **Save note** to commit it, or **Prepare review downloads**
+   to commit the current valid note and prepare both review files in one action.
 5. Click **Download exception report**. The CSV contains exactly the three
    exception groups above, with blank amounts for the missing sides.
+6. Click **Prepare review downloads**, then **Download reviewed exception report**
+   or **Download review session**. To resume later, rerun the equivalent
+   reconciliation, upload the JSON under **Review session JSON**, and click
+   **Apply review session**.
 
 The pair order defines the composite key. Incomplete mappings or repeated key
 column selections disable reconciliation. A changed file or worksheet resets
@@ -580,6 +589,9 @@ The exception table supports these display-only controls:
 - **Exception sort order** defaults to ascending matching key, with absolute delta
   options largest or smallest first. Equal absolute deltas use the key as a
   deterministic tie-breaker.
+- **Review disposition** separately filters Unreviewed, Needs follow-up, and
+  Review complete items. Workflow progress counts always cover all exceptions,
+  independently of this filter and the financial category filters.
 
 **Showing X of Y exception groups** distinguishes displayed and total counts. A view
 with no matches leaves the completed result available. Selecting any visible row
@@ -594,6 +606,59 @@ Review controls and evidence selection do not change configuration identity,
 profiles, reconciliation metrics, control totals, or the exception download.
 **Download exception report always contains all exceptions**, including those
 hidden by the current search or filters.
+
+## Analyst review workflow
+
+Review items are exactly the completed reconciliation's **exceptions**, in all
+three modes. Clean exact matches and accepted tolerance findings without a
+secondary mismatch or accepted inference are outside review scope. Inferred
+Exact matches and secondary-only exceptions are included, even with zero delta.
+Each item starts **Unreviewed**; an analyst can mark it **Needs follow-up** or
+**Review complete** and attach an optional plain-text note.
+
+Disposition and notes never change category, delta, source evidence,
+correspondence analysis, exception membership, tolerance treatment, or control
+totals. **Review complete** means workflow completion, not accounting authority
+or approval. Notes do not determine reconciliation truth. Progress covers the
+complete exception population; the disposition filter is separate from financial
+category filters.
+
+Edits are held in local session state. The **Analyst note** uses a note-only
+form: **Save note** commits the current valid note, and **Prepare review downloads**
+commits that note before capturing the complete review state. Leaving the field
+does not save it; submit the note before changing rows. Disposition changes save
+independently and retain the committed note. Each note permits up to **16,384
+UTF-8 bytes**. Invalid submitted notes show
+an error, remain editable, and leave the committed annotation unchanged; Prepare
+refuses to create a new snapshot from an invalid note. Existing current downloads
+remain the prior prepared committed state. Both downloads include all exceptions,
+independently of current filters. A later committed edit clears prepared downloads;
+prepare again to refresh them.
+
+The original **Download exception report** remains the deterministic
+reconciliation artifact. **Download reviewed exception report** saves
+`tallydiff_reviewed_exceptions.csv`, preserving the original columns and appending
+**Review disposition** and **Review note**. Every nonempty note receives the
+literal `Note: ` prefix in CSV; JSON retains the exact note. Existing
+source-evidence cells are **not spreadsheet-sanitized**, and reviewed CSV is not
+a universal spreadsheet-safety guarantee. Follow the [CSV import guidance](#exception-report).
+
+**Download review session** saves `tallydiff_review_session.json`, format
+`tallydiff-review-session`, **version 1**, with the full exception population.
+To resume, rerun the equivalent reconciliation, upload that JSON, then explicitly
+click **Apply review session**. Upload alone applies nothing. Apply validates the
+whole document before replacing all annotations; it does not merge partial
+reviews. The deterministic binding covers exact source bytes, input formats and
+worksheets, configuration, and completed result evidence. Byte-identical renamed
+inputs can restore after the equivalent rerun; changed source bytes,
+configuration, or result evidence are rejected. Review-session documents are
+limited to **64 MiB**.
+
+There is no automatic database, cloud, browser, or disk persistence: uploaded
+files and review state are not automatically written to disk or external
+services. Explicit downloads go where you choose. Saved sessions contain matching
+keys and analyst notes and may contain sensitive business information. The
+workflow provides no timestamps, history, authentication, or multi-user approvals.
 
 ## Exception report
 
@@ -677,8 +742,9 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `configuration.py` | Shared ordered column mappings and manual mapping validation. |
 | `profiles.py` | Validated JSON profile import/export and directional column compatibility. |
 | `presentation.py` | UTF-8 decoding, configuration identity, review filtering/sorting and display strings. |
-| `export.py` | Complete exception CSV and structured stored correspondence evidence. |
-| `app.py` | Streamlit controls, error messages, results, download and source evidence. |
+| `review.py` | Immutable analyst annotations, deterministic result binding, and validated review-session JSON. |
+| `export.py` | Complete original/reviewed exception CSV and structured stored correspondence evidence. |
+| `app.py` | Streamlit controls, review lifecycle, error messages, results, downloads and source evidence. |
 
 Public Python APIs are exposed through `tallydiff`. The engine and export layer
 have no Streamlit dependency. The UI performs no financial calculations.
@@ -694,6 +760,11 @@ selection, profile filenames, and JSON formatting do not enter this identity. Eq
 an identity while profile serialization preserves their fractional trailing zeroes.
 Expected validation failures are shown explicitly; unexpected errors are not
 broadly swallowed.
+
+Review persistence uses a separate deterministic binding that excludes filenames
+and includes exact input bytes, configuration, and completed result evidence.
+Annotations and review-view controls do not enter that binding; the financial
+result remains immutable.
 
 ## Development and verification
 
@@ -730,6 +801,13 @@ installs locked dependencies without restoring an environment cache, and normall
 builds both package formats with isolation. Deliberately seeded local-artifact
 canaries exercise packaging exclusions before the artifact guard inspects both
 archives. Actions are pinned to commits; uv is pinned to **0.12.23**.
+After artifact checks, CI exports hashed locked runtime requirements, creates a
+fresh virtual environment outside the checkout, installs those exact dependencies
+and that run's wheel with `--no-deps`, then executes a copied
+`scripts/review_smoke.py` with Python's `-I` isolation flag from outside the
+checkout. The smoke checks installed-package provenance and version, review
+round trips/exports, bounded correspondence, and mapping-profile v5 using only
+public APIs.
 There is no deployment or publishing step.
 
 Tests cover all three modes, grouped cardinalities and evidence, row accounting and
@@ -741,9 +819,10 @@ exercises uploads, mappings, the sample workflow, source evidence, error states,
 download visibility, and stale-result invalidation. Tolerance tests cover inclusive
 boundaries, high precision, invalid types and values, duplicate and one-sided
 precedence, accepted variance totals, separate review, and export exclusion.
-Review tests cover display-only filtering/sorting, correct filtered-row evidence,
-and complete exports. Artifact tests cover archive contamination, omissions,
-metadata, and source mismatches. Normalization tests cover Unicode rules and
+Review tests cover filtering/sorting, correct filtered-row evidence, dispositions,
+notes and invalid drafts, atomic session restore, prepared-download lifecycle,
+renamed inputs, and complete original/reviewed exports. Artifact tests cover
+archive contamination, omissions, metadata, and source mismatches. Normalization tests cover Unicode rules and
 fixed order, collision blocking in all modes, blank outputs, immutable evidence,
 configuration identity, and app/profile state. Secondary tests cover exact original
 evidence, independent grouped sets, review partition, structured export/details,
@@ -755,6 +834,63 @@ directional compatibility, atomic application, editable controls, download
 validity, configuration privacy, and stale-result clearing. XLSX tests cover
 worksheet selection, cell conversion, formula/error rejection, row references,
 corrupt inputs, resource closure, mixed-format results, and stale worksheet changes.
+
+### Manual browser release acceptance
+
+Both v0.7.0 checks below passed in a manual real-browser test. AppTest coverage
+does not substitute for these observations. To repeat the checks, run the app
+locally and use the CSV uploads and mappings in the
+[sample workflow](#sample-workflow).
+
+**Focused note -> Prepare review downloads: PASS**
+
+For **V001 / 1042**, clicking the note form's Prepare button directly while the
+textarea remained focused, without clicking Save note first, exported the exact
+two-line note `=1+2\nFollow-up café` in JSON. The reviewed CSV preserved every
+original reconciliation cell and appended the review fields; its note was
+`Note: ` followed by that exact multiline text in one logical CSV cell. The
+previously discovered focused-textarea/Prepare defect is fixed.
+
+1. Run reconciliation, select **V001 / 1042**, enter a baseline Analyst note,
+   click **Save note**, and prepare downloads.
+2. Replace the note with exactly two lines, `=1+2` and `Follow-up café`. While the
+   textarea retains focus, click the **Prepare review downloads** submit control
+   in its note form directly. Do not click Save note or deliberately blur first.
+3. Download and parse both artifacts. For matching key `['V001', '1042']`, JSON
+   must contain `=1+2\nFollow-up café` exactly; the reviewed CSV must contain one
+   logical note cell with `Note: ` followed by that same multiline text. Exporting
+   the baseline value is a failure.
+4. Confirm the caption explains that Save note or Prepare commits the note and
+   that disposition saves independently. Enter a note over 16,384 UTF-8 bytes and
+   submit Prepare: it must show a concise error, retain editable text and the
+   committed valid note, and avoid preparing a new snapshot. Prior current
+   downloads, if present, must still contain the previously prepared valid note.
+   Record the browser result; automated tests alone do not mark this check PASS.
+
+**Native dataframe sorting/editor alignment: PASS**
+
+Native frontend sorting on **Delta (A - B)** displayed **V004 / 1045 (-300)**,
+**V001 / 1042 (+45)**, then **V003 / 1044 (+500)**. Selecting V004 / 1045 showed
+the correct key, **File B only** category, no File A records, and File B evidence
+with Supplier **V004**, Invoice Ref **1045**, and Gross Amount **300**. After
+setting **Review complete**, saving `native-sort-test-V004`, and excluding
+Review complete in the disposition filter, V004 disappeared. Only V001 and V003
+remained; neither became selected, and the Analyst review editor did not transfer
+to another row.
+
+1. Sort the exception dataframe using its frontend column header, including
+   descending **Matching key** order. Select a visually identified row after the
+   sort, and record its canonical key.
+2. Confirm that its editor and original evidence belong to that exact key. For
+   example, **V004 / 1045** must show the File B-only evidence and delta **-300**,
+   not another row's values.
+3. Change that row's disposition and note, then submit **Prepare review downloads**
+   to commit the note and prepare the files. Inspect the session JSON. Only the
+   recorded key's annotation may change.
+4. Set the disposition filter to exclude the edited row's new disposition.
+   Confirm the row disappears and its selection/editor does not transfer to a
+   different row. Correct alignment and isolation throughout are required to
+   pass; any mismatch is a release blocker.
 
 ## Realistic-data validation (developer tooling)
 
@@ -1047,7 +1183,67 @@ behavior and expose the cost of completed searches; they do not guarantee latenc
 or large-file capacity. No constants, runtime behavior, package version or release
 artifacts were changed for this validation.
 
+### Analyst review scale acceptance
+
+The independent review oracle validates **20,000 deterministic exceptions in
+Unique records mode**, one amount-mismatch row per side, with different physical row
+orders, all three dispositions, and Unicode/multiline/formula-looking notes.
+It checks complete JSON round trips and reviewed CSV against independently
+computed keys, annotations, counts, financial cells, and source ordinals; original
+reconciliation evidence and exception CSV bytes remain unchanged.
+
+```bash
+uv run --locked pytest tests/test_review_scale.py
+uv run --locked python -m scripts.review_benchmark --groups 1000 5000 20000
+```
+
+Recorded on **CPython 3.14.7 / Windows 10.0.19045**, each size in a fresh process
+with separate untraced timing and `tracemalloc` passes. The 20,000-exception
+observations were:
+
+| Phase or artifact | Observation |
+| --- | ---: |
+| Total measured workflow | 16.209 s |
+| Result binding | 4.837 s |
+| Review-session JSON export | 0.293 s |
+| Review-session JSON load | 0.566 s |
+| Reviewed CSV export | 0.368 s |
+| Independent verification | 7.079 s |
+| Review-session JSON | 1,783,807 bytes |
+| Reviewed CSV | 1,929,001 bytes |
+| Python allocations observed by tracemalloc, peak | 133.38 MiB |
+
+Timings are observations, not guarantees. Independent verification, including
+repeated binding/export and integrity checks, contributes substantially to the
+total; process startup and the separate memory pass are excluded. Memory measures
+**Python allocations observed by tracemalloc**, not RSS, native allocations, or
+general machine capacity. No performance threshold is part of CI. Optional raw
+output under ignored `benchmark_output/review_v07.json` is excluded from package
+artifacts.
+
 ## Python API contracts
+
+### Analyst review
+
+The additive root exports are `ReviewDisposition`, `FindingReview`,
+`ReviewBinding`, `ReviewSession`, `ReviewSessionError`, `bind_review_result`,
+`export_review_session`, `load_review_session`, and
+`export_reviewed_exceptions_csv`. Existing reconciliation exports remain available.
+
+`bind_review_result(result, *, data_a, data_b, mapping, format_a, format_b,
+worksheet_a=None, worksheet_b=None)` binds the already completed result to the
+same run's input bytes and configuration without rerunning reconciliation.
+Formats are `"csv"` or `"xlsx"`; XLSX requires the selected worksheet. Filenames
+are deliberately absent. `ReviewSession.unreviewed(binding)` creates a complete
+immutable snapshot; `session.with_review(FindingReview(key, disposition, note))`
+returns its replacement with other annotations retained.
+
+`export_review_session(session)` returns deterministic UTF-8 JSON bytes.
+`load_review_session(data, *, binding)` validates a complete matching document
+and raises `ReviewSessionError` for expected admission failures.
+`export_reviewed_exceptions_csv(binding, session)` appends annotations to the
+complete original exception evidence. These APIs do not access the filesystem
+or alter reconciliation results.
 
 ### Reconciliation kernel
 

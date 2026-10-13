@@ -19,7 +19,7 @@ from scripts.check_release_artifacts import (
     check_release_artifacts,
 )
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PACKAGE = f"tallydiff-{VERSION}"
 INFO = f"{PACKAGE}.dist-info"
 METADATA = (
@@ -40,6 +40,7 @@ def release(tmp_path):
     files.update({f"src/{name}": b"# runtime source\n" for name in PACKAGE_MODULES})
     files.update({"scripts/guard.py": b"# script\n", "tests/test_example.py": b"# test\n"})
     files.update({name: b"# subset developer source\n" for name in SUBSET_DEVELOPER_FILES})
+    files.update({name: b"# review developer source\n" for name in REVIEW_DEVELOPER_FILES})
     for name, data in files.items():
         target = project / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +58,31 @@ SUBSET_DEVELOPER_FILES = (
     "tests/test_subset_oracle.py",
     "tests/test_subset_benchmark.py",
     "tests/test_realistic_one_to_many.py",
+)
+REVIEW_DEVELOPER_FILES = (
+    "scripts/review_oracle.py",
+    "scripts/review_benchmark.py",
+    "tests/test_review_scale.py",
+)
+EXPECTED_RUNTIME_MODULES = frozenset(
+    {
+        "tallydiff/__init__.py",
+        "tallydiff/_decimal.py",
+        "tallydiff/amounts.py",
+        "tallydiff/app.py",
+        "tallydiff/configuration.py",
+        "tallydiff/engine.py",
+        "tallydiff/export.py",
+        "tallydiff/ingest.py",
+        "tallydiff/models.py",
+        "tallydiff/normalization.py",
+        "tallydiff/normalization_config.py",
+        "tallydiff/presentation.py",
+        "tallydiff/profiles.py",
+        "tallydiff/review.py",
+        "tallydiff/subset_matching.py",
+        "tallydiff/xlsx.py",
+    }
 )
 
 
@@ -131,6 +157,34 @@ def test_subset_matching_is_in_each_runtime_allowlist_exactly_once():
     assert "tallydiff/subset_matching.py" in PACKAGE_MODULES
 
 
+def test_release_freezes_exact_complete_runtime_module_allowlists():
+    project = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+    targets = config["tool"]["hatch"]["build"]["targets"]
+    wheel_modules = targets["wheel"]["only-include"]
+    source_modules = [name for name in targets["sdist"]["include"] if name.startswith("/src/")]
+    assert PACKAGE_MODULES == EXPECTED_RUNTIME_MODULES
+    assert set(wheel_modules) == {f"src/{name}" for name in EXPECTED_RUNTIME_MODULES}
+    assert set(source_modules) == {f"/src/{name}" for name in EXPECTED_RUNTIME_MODULES}
+    assert len(wheel_modules) == len(source_modules) == len(EXPECTED_RUNTIME_MODULES) == 16
+
+
+def test_review_scale_developer_sources_follow_existing_sdist_only_policy(release):
+    project = Path(__file__).resolve().parents[1]
+    targets = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))["tool"][
+        "hatch"
+    ]["build"]["targets"]
+    assert "/scripts/*.py" in targets["sdist"]["include"]
+    assert "/tests/*.py" in targets["sdist"]["include"]
+    assert all((project / name).is_file() for name in REVIEW_DEVELOPER_FILES)
+    _, dist, _, _ = release
+    check(release)
+    with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl") as archive:
+        assert not set(REVIEW_DEVELOPER_FILES) & set(archive.namelist())
+    with tarfile.open(dist / f"{PACKAGE}.tar.gz", "r:gz") as archive:
+        assert {f"{PACKAGE}/{name}" for name in REVIEW_DEVELOPER_FILES} <= set(archive.getnames())
+
+
 def test_subset_matching_ships_exactly_once_in_both_archives(release):
     _, dist, _, _ = release
     check(release)
@@ -151,13 +205,74 @@ def test_subset_matching_source_bytes_must_match_checkout(release, artifact):
         check(release)
 
 
+def test_review_is_in_each_runtime_allowlist_exactly_once():
+    project = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+    targets = config["tool"]["hatch"]["build"]["targets"]
+    assert targets["wheel"]["only-include"].count("src/tallydiff/review.py") == 1
+    assert targets["sdist"]["include"].count("/src/tallydiff/review.py") == 1
+    assert "tallydiff/review.py" in PACKAGE_MODULES
+
+
+def test_review_ships_exactly_once_in_both_archives(release):
+    project, dist, _, _ = release
+    checkout = Path(__file__).resolve().parents[1] / "src/tallydiff/review.py"
+    data = checkout.read_bytes()
+    (project / "src/tallydiff/review.py").write_bytes(data)
+    release[2]["tallydiff/review.py"] = data
+    release[3][f"{PACKAGE}/src/tallydiff/review.py"] = data
+    check(release)
+    with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl") as archive:
+        assert archive.namelist().count("tallydiff/review.py") == 1
+        assert archive.read("tallydiff/review.py") == data
+    with tarfile.open(dist / f"{PACKAGE}.tar.gz", "r:gz") as archive:
+        name = f"{PACKAGE}/src/tallydiff/review.py"
+        assert archive.getnames().count(name) == 1
+        assert archive.extractfile(name).read() == data
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "sdist"])
+@pytest.mark.parametrize("change", ["content", "line_endings"])
+def test_review_source_bytes_must_match_checkout(release, artifact, change):
+    changed = b"# stale review domain\n" if change == "content" else b"# runtime source\r\n"
+    if artifact == "wheel":
+        release[2]["tallydiff/review.py"] = changed
+    else:
+        release[3][f"{PACKAGE}/src/tallydiff/review.py"] = changed
+    with pytest.raises(ArtifactContentError, match="differs from current project"):
+        check(release)
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "sdist"])
+def test_review_duplicate_archive_members_are_rejected(release, artifact):
+    project, dist, _, _ = release
+    write_archives(release)
+    if artifact == "wheel":
+        with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl", "a") as archive:
+            with pytest.warns(UserWarning, match="Duplicate name"):
+                archive.writestr("tallydiff/review.py", b"# duplicate review domain\n")
+    else:
+        with tarfile.open(dist / f"{PACKAGE}.tar.gz", "w:gz") as archive:
+            name = f"{PACKAGE}/src/tallydiff/review.py"
+            for data in (b"# runtime source\n", b"# duplicate review domain\n"):
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+    with pytest.raises(ArtifactContentError, match="Duplicate .* member"):
+        check_release_artifacts(dist, project_root=project)
+
+
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 @pytest.mark.parametrize(
     "name",
     [
         "%SystemDrive%/cache/data.bin",
         "benchmark_output/generated.csv",
+        "benchmark_output/review_v07.json",
+        "review_v07.json",
+        "scripts/review_v07.json",
         ".pytest_cache/data",
+        ".pytest-tmp/data",
         ".ruff_cache/data",
         ".uv-cache/data",
         ".venv/pyvenv.cfg",
@@ -194,7 +309,7 @@ def test_local_artifacts_are_rejected_on_either_side(release, artifact, name):
 )
 def test_wheel_rejects_nonruntime_files(release, name):
     release[2][name] = b"unintended"
-    with pytest.raises(ArtifactContentError, match="unexpected"):
+    with pytest.raises(ArtifactContentError, match="Local artifact|unexpected"):
         check(release)
 
 
@@ -204,15 +319,19 @@ def test_sdist_rejects_arbitrary_untracked_root_files(release):
         check(release)
 
 
-def test_sdist_rejects_unexpected_license(release):
-    release[3][f"{PACKAGE}/LICENSE"] = b"unintended license"
-    with pytest.raises(ArtifactContentError, match="unexpected"):
+@pytest.mark.parametrize("name", ["LICENSE", "LICENSE.txt", "scripts/LICENSE.py"])
+def test_sdist_rejects_unexpected_license(release, name):
+    release[3][f"{PACKAGE}/{name}"] = b"unintended license"
+    with pytest.raises(ArtifactContentError, match="Local artifact"):
         check(release)
 
 
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 @pytest.mark.parametrize(
-    "module", ["engine", "normalization", "normalization_config", "subset_matching"]
+    "module",
+    sorted(
+        name.removeprefix("tallydiff/").removesuffix(".py") for name in EXPECTED_RUNTIME_MODULES
+    ),
 )
 def test_required_runtime_module_cannot_be_omitted(release, artifact, module):
     _, _, wheel, source = release
@@ -241,7 +360,7 @@ def test_sdist_rejects_arbitrary_package_local_files(release, name):
 @pytest.mark.parametrize(
     "old,new",
     [
-        (b"Version: 0.6.0", b"Version: 0.5.0"),
+        (b"Version: 0.7.0", b"Version: 0.6.0"),
         (b"Name: tallydiff", b"Name: another-project"),
         (b"Requires-Python: >=3.12", b"Requires-Python: >=3.10"),
         (b"streamlit>=1.65.0", b"streamlit>=1.66.0"),
@@ -343,6 +462,8 @@ def test_archived_source_must_match_current_checkout(release, artifact):
         "dir\\file.txt",
         "C:/Users/cheer/local.txt",
         "C:relative.txt",
+        f"{PACKAGE}/C:/Users/cheer/local.txt",
+        f"{PACKAGE}/C:relative.txt",
     ],
 )
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])

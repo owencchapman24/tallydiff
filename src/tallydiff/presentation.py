@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from decimal import Decimal
 
 from tallydiff.configuration import ColumnMapping as ColumnMapping
@@ -18,6 +18,7 @@ from tallydiff.models import (
     SourceRecord,
 )
 from tallydiff.normalization_config import KeyNormalizationConfig
+from tallydiff.review import FindingReview, ReviewDisposition, ReviewSessionError
 
 CATEGORY_LABELS = {
     FindingCategory.EXACT_MATCH: "Exact match",
@@ -26,6 +27,12 @@ CATEGORY_LABELS = {
     FindingCategory.A_ONLY: "File A only",
     FindingCategory.B_ONLY: "File B only",
     FindingCategory.DUPLICATE_AMBIGUOUS: "Duplicate / ambiguous",
+}
+
+REVIEW_DISPOSITION_LABELS = {
+    ReviewDisposition.UNREVIEWED: "Unreviewed",
+    ReviewDisposition.NEEDS_FOLLOW_UP: "Needs follow-up",
+    ReviewDisposition.REVIEW_COMPLETE: "Review complete",
 }
 
 
@@ -176,6 +183,66 @@ def finding_rows(findings: Sequence[ReconciliationFinding]) -> list[dict[str, st
                 else ""
             )
     return rows
+
+
+def _validate_finding_reviews(
+    findings: Sequence[ReconciliationFinding],
+    reviews_by_key: Mapping[tuple[str, ...], FindingReview],
+) -> None:
+    """Require complete canonical annotations for a view of a larger population."""
+
+    if not isinstance(reviews_by_key, Mapping):
+        raise TypeError("reviews_by_key must be a mapping")
+    for key, review in reviews_by_key.items():
+        if not isinstance(key, tuple) or any(not isinstance(part, str) for part in key):
+            raise TypeError("review mapping keys must be tuples of strings")
+        if not isinstance(review, FindingReview):
+            raise TypeError("review mapping values must be FindingReview instances")
+        try:
+            FindingReview.__post_init__(review)
+        except (TypeError, ValueError, AttributeError):
+            raise ReviewSessionError(
+                "Review annotation violates FindingReview invariants"
+            ) from None
+        if review.matching_key != key:
+            raise ReviewSessionError("Review annotation does not belong to its canonical key")
+    for finding in findings:
+        if not isinstance(finding, ReconciliationFinding):
+            raise TypeError("findings must contain ReconciliationFinding instances")
+        if finding.key not in reviews_by_key:
+            raise ReviewSessionError("Review population is missing a finding's canonical key")
+
+
+def review_finding_rows(
+    findings: Sequence[ReconciliationFinding],
+    reviews_by_key: Mapping[tuple[str, ...], FindingReview],
+) -> list[dict[str, str]]:
+    """Append workflow labels without changing the existing reconciliation cells."""
+
+    _validate_finding_reviews(findings, reviews_by_key)
+    rows = finding_rows(findings)
+    for row, finding in zip(rows, findings, strict=True):
+        row["Review disposition"] = REVIEW_DISPOSITION_LABELS[
+            reviews_by_key[finding.key].disposition
+        ]
+    return rows
+
+
+def filter_review_dispositions(
+    findings: Sequence[ReconciliationFinding],
+    reviews_by_key: Mapping[tuple[str, ...], FindingReview],
+    dispositions: Iterable[ReviewDisposition],
+) -> tuple[ReconciliationFinding, ...]:
+    """Select workflow dispositions while preserving the incoming financial view."""
+
+    choices = tuple(dispositions)
+    if any(not isinstance(disposition, ReviewDisposition) for disposition in choices):
+        raise TypeError("dispositions must contain only ReviewDisposition enum members")
+    selected = frozenset(choices)
+    _validate_finding_reviews(findings, reviews_by_key)
+    return tuple(
+        finding for finding in findings if reviews_by_key[finding.key].disposition in selected
+    )
 
 
 EXCEPTION_CATEGORIES = (

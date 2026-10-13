@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tallydiff"
-version = "0.6.0"
+version = "0.7.0"
 description = "Traceable reconciliation for structured financial exports."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -59,6 +59,7 @@ only-include = [
     "src/tallydiff/normalization_config.py",
     "src/tallydiff/presentation.py",
     "src/tallydiff/profiles.py",
+    "src/tallydiff/review.py",
     "src/tallydiff/subset_matching.py",
     "src/tallydiff/xlsx.py",
 ]
@@ -79,6 +80,7 @@ include = [
     "/src/tallydiff/normalization_config.py",
     "/src/tallydiff/presentation.py",
     "/src/tallydiff/profiles.py",
+    "/src/tallydiff/review.py",
     "/src/tallydiff/subset_matching.py",
     "/src/tallydiff/xlsx.py",
     "/tests/*.py",
