@@ -1298,3 +1298,121 @@ def test_stage2_symbols_remain_outside_the_root_public_api():
     }
     assert names.isdisjoint(tallydiff.__all__)
     assert all(not hasattr(tallydiff, name) for name in names)
+
+
+@pytest.mark.parametrize(
+    ("column_a", "column_b", "tokens"),
+    [
+        ("Invoice Amount", "Invoice Amount", ("invoice", "amount")),
+        ("INVOICE AMOUNT", "invoice amount", ("invoice", "amount")),
+        ("  Invoice___Amount---", "invoice.amount", ("invoice", "amount")),
+        ("Account / ID: [Number]", "account-id-number", ("account", "id", "number")),
+        ("Invoice💵Amount", "invoice\tamount", ("invoice", "amount")),
+        ("Invoice-2026", "invoice 2026", ("invoice", "2026")),
+        ("MÉMO 账单 № １２3", "mémo_账单_１２3", ("mémo", "账单", "１２3")),
+        ("Straße 99", "STRASSE_99", ("strasse", "99")),
+    ],
+)
+def test_header_compatibility_uses_generic_casefolded_unicode_alphanumeric_tokens(
+    column_a, column_b, tokens
+):
+    result = discovery.compare_headers(column_a, column_b)
+    assert result == discovery.HeaderCompatibility(
+        column_a, column_b, " ".join(tokens), " ".join(tokens), tokens, tokens, True, tokens
+    )
+    assert result.column_a == column_a
+    assert result.column_b == column_b
+    assert result == discovery.compare_headers(column_a, column_b)
+
+
+def test_header_shared_tokens_are_unique_in_first_a_order_and_keep_source_repetitions():
+    result = discovery.compare_headers("Id-ID invoice id", "invoice / id / invoice")
+    assert result == discovery.HeaderCompatibility(
+        "Id-ID invoice id",
+        "invoice / id / invoice",
+        "id id invoice id",
+        "invoice id invoice",
+        ("id", "id", "invoice", "id"),
+        ("invoice", "id", "invoice"),
+        False,
+        ("id", "invoice"),
+    )
+    reversed_result = discovery.compare_headers(result.column_b, result.column_a)
+    assert reversed_result.shared_tokens == ("invoice", "id")
+
+
+def test_header_normalized_equality_requires_token_order():
+    result = discovery.compare_headers("amount invoice", "invoice amount")
+    assert result.tokens_a == ("amount", "invoice")
+    assert result.tokens_b == ("invoice", "amount")
+    assert result.shared_tokens == ("amount", "invoice")
+    assert not result.exact_normalized_match
+
+
+@pytest.mark.parametrize(
+    "column_a,column_b",
+    [
+        ("Vendor ID", "Supplier"),
+        ("Invoice", "Invoce"),
+        ("Invoices Amounts", "Invoice Amount"),
+        ("Gross", "Amount"),
+        ("Cafe\u0301", "Café"),
+    ],
+)
+def test_header_compatibility_does_not_stem_infer_aliases_or_fuzzy_match(column_a, column_b):
+    result = discovery.compare_headers(column_a, column_b)
+    assert not result.exact_normalized_match
+    assert result.shared_tokens == ()
+
+
+def test_header_punctuation_only_nonblank_names_have_empty_normalized_forms():
+    result = discovery.compare_headers("___---", "!!!")
+    assert result.normalized_a == result.normalized_b == ""
+    assert result.tokens_a == result.tokens_b == result.shared_tokens == ()
+    assert result.exact_normalized_match
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("name", [None, 1, True, [], b"id"])
+def test_header_compatibility_requires_string_names(side, name):
+    names = {"column_a": "id", "column_b": "id"}
+    names[f"column_{side}"] = name
+    with pytest.raises(TypeError):
+        discovery.compare_headers(**names)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("name", ["", " ", "\t\n", "\u2003"])
+def test_header_compatibility_requires_nonblank_names(side, name):
+    names = {"column_a": "id", "column_b": "id"}
+    names[f"column_{side}"] = name
+    with pytest.raises(ValueError):
+        discovery.compare_headers(**names)
+
+
+def test_header_compatibility_contract_is_frozen_slotted_and_has_only_factual_fields():
+    result = discovery.compare_headers("Invoice Number", "Invoice Ref")
+    assert [field.name for field in fields(discovery.HeaderCompatibility)] == [
+        "column_a",
+        "column_b",
+        "normalized_a",
+        "normalized_b",
+        "tokens_a",
+        "tokens_b",
+        "exact_normalized_match",
+        "shared_tokens",
+    ]
+    assert result.shared_tokens == ("invoice",)
+    assert not result.exact_normalized_match
+    assert not hasattr(result, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        result.normalized_a = "changed"
+    with pytest.raises(TypeError):
+        result.tokens_a[0] = "changed"
+    assert hash(result) == hash(discovery.compare_headers("Invoice Number", "Invoice Ref"))
+
+
+def test_stage3_header_symbols_remain_outside_the_root_public_api():
+    names = {"HeaderCompatibility", "compare_headers"}
+    assert names.isdisjoint(tallydiff.__all__)
+    assert all(not hasattr(tallydiff, name) for name in names)

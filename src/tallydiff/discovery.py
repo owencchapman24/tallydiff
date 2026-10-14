@@ -444,3 +444,66 @@ def compare_amount_columns(
         total_b=total_b,
         control_difference=difference,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderCompatibility:
+    """Conservative lexical facts about two headers, independent of their values."""
+
+    column_a: str
+    column_b: str
+    normalized_a: str
+    normalized_b: str
+    tokens_a: tuple[str, ...]
+    tokens_b: tuple[str, ...]
+    exact_normalized_match: bool
+    shared_tokens: tuple[str, ...]
+
+
+def _header_tokens(column: str) -> tuple[str, ...]:
+    if not isinstance(column, str):
+        raise TypeError("column names must be strings")
+    if not column.strip():
+        raise ValueError("column names must be nonblank")
+    tokens: list[str] = []
+    current: list[str] = []
+    for character in column.casefold():
+        if character.isalnum():
+            current.append(character)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tuple(tokens)
+
+
+def compare_headers(column_a: str, column_b: str) -> HeaderCompatibility:
+    """Casefold headers and split on nonalphanumeric boundaries, without aliases.
+
+    Source names and token order are preserved. Repeated tokens remain in each
+    header's tokens; shared tokens occur once, in first-appearance File A order.
+    No source value is normalized or compared by this header-only diagnostic.
+    """
+
+    tokens_a = _header_tokens(column_a)
+    tokens_b = _header_tokens(column_b)
+    normalized_a = " ".join(tokens_a)
+    normalized_b = " ".join(tokens_b)
+    present_b = set(tokens_b)
+    seen: set[str] = set()
+    shared: list[str] = []
+    for token in tokens_a:
+        if token in present_b and token not in seen:
+            shared.append(token)
+            seen.add(token)
+    return HeaderCompatibility(
+        column_a=column_a,
+        column_b=column_b,
+        normalized_a=normalized_a,
+        normalized_b=normalized_b,
+        tokens_a=tokens_a,
+        tokens_b=tokens_b,
+        exact_normalized_match=normalized_a == normalized_b,
+        shared_tokens=tuple(shared),
+    )
