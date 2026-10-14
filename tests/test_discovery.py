@@ -664,3 +664,637 @@ def test_invalid_sources_and_xlsx_data_types_are_rejected(xlsx_bytes):
         profile_xlsx(data, source="A", worksheet="Data")
     with pytest.raises(TypeError, match="XLSX bytes"):
         profile_xlsx(bytearray(data), source=Source.A, worksheet="Data")
+
+
+def _snapshot_csv(header, rows, *, source):
+    stream = StringIO(newline="")
+    writer = csv.writer(stream)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return discovery.discover_csv(stream.getvalue(), source=source)
+
+
+@pytest.fixture
+def discovery_pair():
+    return (
+        _snapshot_csv(["id", "other", "amount"], [["A", "x", "1"]], source=Source.A),
+        _snapshot_csv(["id", "other", "amount"], [["A", "x", "2"]], source=Source.B),
+    )
+
+
+def test_csv_snapshot_profile_parity_and_canonical_row_alignment():
+    text = " id ,invoice,amount,notes\n A ,100,1, note \n,101,2,\nB, ,word,memo\n"
+    snapshot = discovery.discover_csv(text, source=Source.A)
+    assert snapshot.profile == profile_csv(text, source=Source.A)
+    assert snapshot._key_rows == (
+        ("A", "100", "1", "note"),
+        (None, "101", "2", None),
+        ("B", None, "word", "memo"),
+    )
+    assert [column.name for column in snapshot.profile.columns] == [
+        " id ",
+        "invoice",
+        "amount",
+        "notes",
+    ]
+    assert snapshot == discovery.discover_csv(text, source=Source.A)
+
+
+def test_xlsx_snapshot_profile_parity_and_canonical_row_alignment(xlsx_bytes):
+    data = xlsx_bytes(
+        {
+            "Data": [
+                ["candidate", "second", "amount"],
+                [" A ", " x ", 1],
+                [True, 100, 2],
+                [date(2026, 1, 2), None, 3],
+                ["=1+1", "100", 4],
+                ["#N/A", "B", 5],
+                [timedelta(days=1), "C", 6],
+            ]
+        }
+    )
+    snapshot = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+    assert snapshot.profile == profile_xlsx(data, source=Source.B, worksheet="Data")
+    assert snapshot._key_rows == (
+        ("A", "x", "1"),
+        (None, "100", "2"),
+        ("2026-01-02", None, "3"),
+        (None, "100", "4"),
+        (None, "B", "5"),
+        (None, "C", "6"),
+    )
+    assert snapshot == discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+
+
+@pytest.mark.parametrize("format_name", ["csv", "xlsx"])
+def test_profile_functions_delegate_to_discovery_and_return_the_exact_profile(
+    discovery_pair, monkeypatch, format_name
+):
+    snapshot = discovery_pair[0]
+    calls = []
+    if format_name == "csv":
+        data = StringIO("not parsed")
+
+        def fake_discover(value, *, source):
+            calls.append((value, source))
+            return snapshot
+
+        monkeypatch.setattr(discovery, "discover_csv", fake_discover)
+        assert discovery.profile_csv(data, source=Source.A) is snapshot.profile
+        assert calls == [(data, Source.A)]
+    else:
+        data = b"not parsed"
+
+        def fake_discover(value, *, source, worksheet):
+            calls.append((value, source, worksheet))
+            return snapshot
+
+        monkeypatch.setattr(discovery, "discover_xlsx", fake_discover)
+        assert discovery.profile_xlsx(data, source=Source.A, worksheet="Data") is snapshot.profile
+        assert calls == [(data, Source.A, "Data")]
+
+
+def test_snapshots_and_diagnostics_have_immutable_slotted_storage(discovery_pair):
+    snapshot_a, snapshot_b = discovery_pair
+    keys = discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=[("id", "id")])
+    amounts = discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="amount", column_b="amount"
+    )
+    assert [field.name for field in fields(discovery.DiscoverySnapshot)] == ["profile", "_key_rows"]
+    assert [field.name for field in fields(discovery.KeyCompatibility)] == [
+        "key_pairs",
+        "row_count_a",
+        "row_count_b",
+        "eligible_row_count_a",
+        "eligible_row_count_b",
+        "distinct_key_count_a",
+        "distinct_key_count_b",
+        "duplicate_excess_count_a",
+        "duplicate_excess_count_b",
+        "overlap_distinct_count",
+        "overlap_row_count_a",
+        "overlap_row_count_b",
+        "only_a_distinct_count",
+        "only_b_distinct_count",
+    ]
+    assert [field.name for field in fields(discovery.AmountCompatibility)] == [
+        "column_a",
+        "column_b",
+        "row_count_a",
+        "row_count_b",
+        "parseable_count_a",
+        "parseable_count_b",
+        "blank_count_a",
+        "blank_count_b",
+        "total_a",
+        "total_b",
+        "control_difference",
+    ]
+    for value, name in ((snapshot_a, "profile"), (keys, "key_pairs"), (amounts, "total_a")):
+        assert not hasattr(value, "__dict__")
+        with pytest.raises(FrozenInstanceError):
+            setattr(value, name, None)
+        assert isinstance(hash(value), int)
+    assert isinstance(snapshot_a._key_rows, tuple)
+    assert all(isinstance(row, tuple) for row in snapshot_a._key_rows)
+    with pytest.raises(TypeError):
+        snapshot_a._key_rows[0][0] = "changed"
+
+
+@pytest.mark.parametrize(
+    ("rows", "error_type"),
+    [
+        ([], TypeError),
+        ([tuple(["A", "x", "1"])], TypeError),
+        ((["A", "x", "1"],), TypeError),
+        (((1, "x", "1"),), TypeError),
+        ((([], "x", "1"),), TypeError),
+        ((), ValueError),
+        ((("A", "x"),), ValueError),
+        ((("A", "x", "1", "extra"),), ValueError),
+        ((("A", "x", "1"), ("B", "y", "2")), ValueError),
+        ((("", "x", "1"),), ValueError),
+        (((" ", "x", "1"),), ValueError),
+        (((" A ", "x", "1"),), ValueError),
+    ],
+)
+def test_snapshot_constructor_rejects_mutable_misaligned_or_noncanonical_rows(
+    discovery_pair, rows, error_type
+):
+    with pytest.raises(error_type):
+        discovery.DiscoverySnapshot(discovery_pair[0].profile, rows)
+
+
+@pytest.mark.parametrize("profile", [None, {}, "profile", object()])
+def test_snapshot_constructor_requires_a_table_profile(profile):
+    with pytest.raises(TypeError):
+        discovery.DiscoverySnapshot(profile, ())
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error_type"),
+    [
+        ("source", "A", TypeError),
+        ("row_count", "1", TypeError),
+        ("row_count", True, TypeError),
+        ("row_count", -1, ValueError),
+        ("worksheet", [], TypeError),
+        ("columns", [], TypeError),
+        ("columns", ({},), TypeError),
+    ],
+)
+def test_snapshot_constructor_rejects_invalid_or_mutable_table_profile_fields(
+    discovery_pair, field_name, value, error_type
+):
+    from dataclasses import replace
+
+    profile = replace(discovery_pair[0].profile, **{field_name: value})
+    with pytest.raises(error_type):
+        discovery.DiscoverySnapshot(profile, discovery_pair[0]._key_rows)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error_type"),
+    [
+        ("name", [], TypeError),
+        ("name", "", ValueError),
+        ("name", " \t", ValueError),
+        ("row_count", 0, ValueError),
+        ("blank_count", [], TypeError),
+        ("amount_total", [], TypeError),
+        ("amount_total", 1, TypeError),
+        ("amount_total", Decimal("NaN"), ValueError),
+        ("amount_total", Decimal("Infinity"), ValueError),
+    ],
+)
+def test_snapshot_constructor_rejects_invalid_or_mutable_column_profile_fields(
+    discovery_pair, field_name, value, error_type
+):
+    from dataclasses import replace
+
+    original = discovery_pair[0]
+    column = replace(original.profile.columns[0], **{field_name: value})
+    profile = replace(original.profile, columns=(column, *original.profile.columns[1:]))
+    with pytest.raises(error_type):
+        discovery.DiscoverySnapshot(profile, original._key_rows)
+
+
+def test_snapshot_constructor_rejects_duplicate_profile_headers(discovery_pair):
+    from dataclasses import replace
+
+    original = discovery_pair[0]
+    repeated = replace(original.profile.columns[1], name=original.profile.columns[0].name)
+    profile = replace(
+        original.profile,
+        columns=(original.profile.columns[0], repeated, original.profile.columns[2]),
+    )
+    with pytest.raises(ValueError):
+        discovery.DiscoverySnapshot(profile, original._key_rows)
+
+
+@pytest.mark.parametrize(
+    ("values_a", "values_b", "counts"),
+    [
+        (["A", "B"], ["A", "B"], (2, 2, 2, 2, 2, 2, 0, 0, 2, 2, 2, 0, 0)),
+        (["A", "B", "C"], ["B", "C", "D", "E"], (3, 4, 3, 4, 3, 4, 0, 0, 2, 2, 2, 1, 2)),
+        (["a", "b"], ["A", "B"], (2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 2, 2)),
+        (
+            [" A ", "A", "A", "B", "X", "", " \t"],
+            ["A", "B", "B", "Y", "Z", ""],
+            (7, 6, 5, 5, 3, 4, 2, 1, 2, 4, 3, 1, 2),
+        ),
+        ([], [], (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+    ],
+)
+def test_single_key_compatibility_counts_distinct_overlap_and_physical_coverage(
+    values_a, values_b, counts
+):
+    snapshot_a = discovery.discover_csv(_csv(values_a), source=Source.A)
+    snapshot_b = discovery.discover_csv(_csv(values_b), source=Source.B)
+    result = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=[("candidate", "candidate")]
+    )
+    assert result == discovery.KeyCompatibility((("candidate", "candidate"),), *counts)
+
+
+def test_cross_format_keys_match_only_current_trimmed_and_numeric_canonicalization(xlsx_bytes):
+    snapshot_a = discovery.discover_csv(_csv(["1 ", "001"]), source=Source.A)
+    data = xlsx_bytes({"Data": [["id", "amount"], [1, 1], ["1", 2]]})
+    snapshot_b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+    result = discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=[("candidate", "id")])
+    assert result == discovery.KeyCompatibility(
+        (("candidate", "id"),), 2, 2, 2, 2, 2, 1, 0, 1, 1, 1, 2, 1, 0
+    )
+    records_b = ingest_xlsx(
+        data, source=Source.B, worksheet="Data", key_columns=["id"], amount_column="amount"
+    )
+    assert snapshot_b._key_rows == tuple(
+        (record.key[0], str(record.amount)) for record in records_b
+    )
+
+
+def test_xlsx_invalid_key_types_cannot_overlap_csv_evidence_text(xlsx_bytes):
+    values = [True, False, "=1+1", "#N/A", timedelta(days=1)]
+    text_values = ["TRUE", "FALSE", "=1+1", "#N/A", "1 day, 0:00:00"]
+    snapshot_a = discovery.discover_csv(_csv(text_values), source=Source.A)
+    data = xlsx_bytes({"Data": [["id", "amount"], *[[value, 1] for value in values]]})
+    snapshot_b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+    result = discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=[("candidate", "id")])
+    assert result == discovery.KeyCompatibility(
+        (("candidate", "id"),), 5, 5, 5, 0, 5, 0, 0, 0, 0, 0, 0, 5, 0
+    )
+
+
+def test_composite_second_component_resolves_duplicates_without_recommending_a_mode():
+    rows = [["V1", "100"], ["V1", "101"], ["V2", "200"]]
+    snapshot_a = _snapshot_csv(["vendor", "invoice"], rows, source=Source.A)
+    snapshot_b = _snapshot_csv(["supplier", "ref"], rows, source=Source.B)
+    single = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=[("vendor", "supplier")]
+    )
+    composite = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=[("vendor", "supplier"), ("invoice", "ref")]
+    )
+    assert single.duplicate_excess_count_a == single.duplicate_excess_count_b == 1
+    assert single.overlap_distinct_count == 2
+    assert composite == discovery.KeyCompatibility(
+        (("vendor", "supplier"), ("invoice", "ref")), 3, 3, 3, 3, 3, 3, 0, 0, 3, 3, 3, 0, 0
+    )
+
+
+def test_composite_eligibility_requires_complete_components_in_the_same_physical_row():
+    snapshot_a = _snapshot_csv(
+        ["vendor", "invoice"],
+        [["V1", "100"], ["V1", ""], ["", "101"], ["V2", "200"]],
+        source=Source.A,
+    )
+    snapshot_b = _snapshot_csv(
+        ["supplier", "ref"], [["V1", "100"], ["V1", "101"], ["V2", ""]], source=Source.B
+    )
+    result = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=[("vendor", "supplier"), ("invoice", "ref")]
+    )
+    assert result == discovery.KeyCompatibility(
+        (("vendor", "supplier"), ("invoice", "ref")), 4, 3, 2, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1
+    )
+
+
+def test_composite_mapping_order_is_preserved_and_crossed_correspondence_changes_overlap():
+    snapshot_a = _snapshot_csv(["first", "second"], [["x", "y"], ["z", "w"]], source=Source.A)
+    snapshot_b = _snapshot_csv(["left", "right"], [["x", "y"], ["q", "r"]], source=Source.B)
+    selected = [["first", "left"], ["second", "right"]]
+    forward = discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=selected)
+    reordered = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=list(reversed(selected))
+    )
+    crossed = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=[("first", "right"), ("second", "left")]
+    )
+    assert forward.key_pairs == (("first", "left"), ("second", "right"))
+    assert reordered.key_pairs == (("second", "right"), ("first", "left"))
+    assert forward != reordered
+    for field in fields(discovery.KeyCompatibility):
+        if field.name != "key_pairs":
+            assert getattr(forward, field.name) == getattr(reordered, field.name)
+    assert forward.overlap_distinct_count == 1
+    assert crossed.overlap_distinct_count == 0
+    selected[0][0] = "changed"
+    selected.append(["amount", "amount"])
+    assert forward.key_pairs == (("first", "left"), ("second", "right"))
+
+
+@pytest.mark.parametrize("rows", [(["ab", "c"], ["a", "bc"]), (["a|b", "c"], ["a", "b|c"])])
+def test_composite_keys_are_tuples_and_cannot_collide_through_string_concatenation(rows):
+    snapshot_a = _snapshot_csv(["first", "second"], [rows[0]], source=Source.A)
+    snapshot_b = _snapshot_csv(["first", "second"], [rows[1]], source=Source.B)
+    result = discovery.compare_key_mapping(
+        snapshot_a, snapshot_b, key_pairs=[("first", "first"), ("second", "second")]
+    )
+    assert result.overlap_distinct_count == 0
+    assert result.only_a_distinct_count == result.only_b_distinct_count == 1
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("wrong", [None, {}, "snapshot", 1, object()])
+def test_compatibility_rejects_wrong_snapshot_object_types(discovery_pair, side, wrong):
+    snapshot_a, snapshot_b = discovery_pair
+    if side == "a":
+        snapshot_a = wrong
+    else:
+        snapshot_b = wrong
+    with pytest.raises(TypeError):
+        discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=[("id", "id")])
+    with pytest.raises(TypeError):
+        discovery.compare_amount_columns(
+            snapshot_a, snapshot_b, column_a="amount", column_b="amount"
+        )
+
+
+def test_compatibility_rejects_table_profiles_without_snapshot_observations(discovery_pair):
+    snapshot_a, snapshot_b = discovery_pair
+    with pytest.raises(TypeError):
+        discovery.compare_key_mapping(snapshot_a.profile, snapshot_b, key_pairs=[("id", "id")])
+    with pytest.raises(TypeError):
+        discovery.compare_amount_columns(
+            snapshot_a, snapshot_b.profile, column_a="amount", column_b="amount"
+        )
+
+
+@pytest.mark.parametrize(
+    "directions", [(Source.B, Source.A), (Source.A, Source.A), (Source.B, Source.B)]
+)
+def test_compatibility_requires_explicit_a_then_b_direction(directions):
+    snapshot_a = discovery.discover_csv(_csv(["A"]), source=directions[0])
+    snapshot_b = discovery.discover_csv(_csv(["A"]), source=directions[1])
+    with pytest.raises(ValueError):
+        discovery.compare_key_mapping(
+            snapshot_a, snapshot_b, key_pairs=[("candidate", "candidate")]
+        )
+    with pytest.raises(ValueError):
+        discovery.compare_amount_columns(
+            snapshot_a, snapshot_b, column_a="amount", column_b="amount"
+        )
+
+
+@pytest.mark.parametrize("selection", [None, "id", b"id", 1, {"id"}, {"id": "id"}])
+def test_key_mapping_requires_a_nonstring_sequence(discovery_pair, selection):
+    with pytest.raises(TypeError):
+        discovery.compare_key_mapping(*discovery_pair, key_pairs=selection)
+
+
+@pytest.mark.parametrize("selection", [[None], [1], ["id"], [b"id"], [{}], [{"id"}]])
+def test_key_mapping_pair_values_must_be_nonstring_sequences(discovery_pair, selection):
+    with pytest.raises(TypeError):
+        discovery.compare_key_mapping(*discovery_pair, key_pairs=selection)
+
+
+@pytest.mark.parametrize("selection", [[], [()], [("id",)], [("id", "id", "other")]])
+def test_key_mapping_rejects_empty_or_malformed_pairs(discovery_pair, selection):
+    with pytest.raises(ValueError):
+        discovery.compare_key_mapping(*discovery_pair, key_pairs=selection)
+
+
+@pytest.mark.parametrize("selection", [[(1, "id")], [(None, "id")], [("id", False)], [([], "id")]])
+def test_key_mapping_rejects_nonstring_names_with_type_error(discovery_pair, selection):
+    with pytest.raises(TypeError):
+        discovery.compare_key_mapping(*discovery_pair, key_pairs=selection)
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        [("", "id")],
+        [("id", " \t")],
+        [("missing", "id")],
+        [("id", "missing")],
+        [(" id ", "id")],
+        [("id", "id"), ("id", "other")],
+        [("id", "id"), ("other", "id")],
+    ],
+)
+def test_key_mapping_rejects_blank_missing_and_duplicate_exact_selections(
+    discovery_pair, selection
+):
+    with pytest.raises(ValueError):
+        discovery.compare_key_mapping(*discovery_pair, key_pairs=selection)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("name", [None, 1, False, []])
+def test_amount_selection_names_must_be_strings(discovery_pair, side, name):
+    names = {"column_a": "amount", "column_b": "amount"}
+    names[f"column_{side}"] = name
+    with pytest.raises(TypeError):
+        discovery.compare_amount_columns(*discovery_pair, **names)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("name", ["", " \t", "missing", " amount "])
+def test_amount_selection_names_must_be_nonblank_and_match_headers_exactly(
+    discovery_pair, side, name
+):
+    names = {"column_a": "amount", "column_b": "amount"}
+    names[f"column_{side}"] = name
+    with pytest.raises(ValueError):
+        discovery.compare_amount_columns(*discovery_pair, **names)
+
+
+def test_cross_format_amount_compatibility_uses_exact_control_totals_and_a_minus_b(xlsx_bytes):
+    snapshot_a = _snapshot_csv(
+        ["gross", "id"], [["$1,200.00", "A"], ["(42.50)", "B"], ["0.125", "C"]], source=Source.A
+    )
+    data = xlsx_bytes({"Data": [["net", "id"], [1000, "A"], [-100.5, "B"]]})
+    snapshot_b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+    assert discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="gross", column_b="net"
+    ) == discovery.AmountCompatibility(
+        "gross", "net", 3, 2, 3, 2, 0, 0, Decimal("1157.625"), Decimal("899.5"), Decimal("258.125")
+    )
+
+
+@pytest.mark.parametrize("invalid", ["word", "", " \t"])
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_amount_compatibility_with_partial_invalidity_or_blanks_has_no_difference(side, invalid):
+    values_a = ["1", invalid, "2"] if side == "a" else ["1", "2"]
+    values_b = ["1", invalid, "2"] if side == "b" else ["1", "2"]
+    snapshot_a = discovery.discover_csv(_csv(values_a), source=Source.A)
+    snapshot_b = discovery.discover_csv(_csv(values_b), source=Source.B)
+    result = discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="candidate", column_b="candidate"
+    )
+    assert result.parseable_count_a == result.parseable_count_b == 2
+    assert result.blank_count_a == (1 if side == "a" and not invalid.strip() else 0)
+    assert result.blank_count_b == (1 if side == "b" and not invalid.strip() else 0)
+    assert result.total_a == (None if side == "a" else Decimal("3"))
+    assert result.total_b == (None if side == "b" else Decimal("3"))
+    assert result.control_difference is None
+
+
+@pytest.mark.parametrize("values_a,values_b", [([], []), ([], ["1"]), (["1"], [])])
+def test_amount_compatibility_for_empty_tables_has_no_difference(values_a, values_b):
+    snapshot_a = discovery.discover_csv(_csv(values_a), source=Source.A)
+    snapshot_b = discovery.discover_csv(_csv(values_b), source=Source.B)
+    result = discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="candidate", column_b="candidate"
+    )
+    assert result.row_count_a == result.parseable_count_a == len(values_a)
+    assert result.row_count_b == result.parseable_count_b == len(values_b)
+    assert result.total_a == (Decimal("1") if values_a else None)
+    assert result.total_b == (Decimal("1") if values_b else None)
+    assert result.control_difference is None
+
+
+def test_amount_compatibility_handles_negative_totals_directionally():
+    snapshot_a = discovery.discover_csv(_csv(["-10", "(0.25)"]), source=Source.A)
+    snapshot_b = discovery.discover_csv(_csv(["-12.5"]), source=Source.B)
+    result = discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="candidate", column_b="candidate"
+    )
+    assert result.total_a == Decimal("-10.25")
+    assert result.total_b == Decimal("-12.5")
+    assert result.control_difference == Decimal("2.25")
+
+
+def test_amount_compatibility_is_exact_under_hostile_decimal_context(xlsx_bytes):
+    text = _csv(["12345678901234567890.123456789", "0.000000001"])
+    data = xlsx_bytes({"Data": [["gross", "id"], ["12345678901234567890.123456789", "A"]]})
+    with localcontext() as context:
+        context.prec = 2
+        context.Emax = 3
+        context.Emin = -3
+        context.traps[Inexact] = True
+        context.traps[Rounded] = True
+        context.clear_flags()
+        before = context.copy()
+        snapshot_a = discovery.discover_csv(text, source=Source.A)
+        snapshot_b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+        result = discovery.compare_amount_columns(
+            snapshot_a, snapshot_b, column_a="candidate", column_b="gross"
+        )
+        assert context.prec == before.prec
+        assert context.Emax == before.Emax
+        assert context.Emin == before.Emin
+        assert context.traps == before.traps
+        assert context.flags == before.flags
+    assert result.total_a == Decimal("12345678901234567890.123456790")
+    assert result.total_b == Decimal("12345678901234567890.123456789")
+    assert result.control_difference == Decimal("0.000000001")
+
+
+def test_compatibility_uses_closed_stream_snapshot_without_reparsing_or_reconversion(
+    xlsx_bytes, monkeypatch
+):
+    stream = StringIO("ignored\nid,amount\n A ,1\nA,2\n", newline="")
+    stream.readline()
+    snapshot_a = discovery.discover_csv(stream, source=Source.A)
+    assert not stream.closed
+    assert stream.read() == ""
+    stream.close()
+    data = xlsx_bytes({"Data": [["id", "amount"], ["A", 3]]})
+    snapshot_b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+
+    def fail(*args, **kwargs):
+        raise AssertionError("compatibility must use immutable stored observations")
+
+    for name in (
+        "discover_csv",
+        "discover_xlsx",
+        "profile_csv",
+        "profile_xlsx",
+        "_open",
+        "_iter_rows",
+        "_data_rows",
+        "_key",
+        "_amount",
+        "parse_amount",
+    ):
+        monkeypatch.setattr(discovery, name, fail)
+    keys = discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=[("id", "id")])
+    amounts = discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="amount", column_b="amount"
+    )
+    assert keys.overlap_distinct_count == 1
+    assert keys.overlap_row_count_a == 2
+    assert keys.overlap_row_count_b == 1
+    assert amounts.total_a == amounts.total_b == Decimal("3")
+    assert amounts.control_difference == Decimal("0")
+
+
+def test_key_and_amount_diagnostics_are_deterministic_across_physical_row_orders():
+    rows_a = [["A", "x", "1"], ["B", "y", "2"], ["A", "x", "3"]]
+    rows_b = [["B", "y", "2"], ["A", "x", "4"]]
+    snapshot_a = _snapshot_csv(["id", "other", "amount"], rows_a, source=Source.A)
+    snapshot_b = _snapshot_csv(["id", "other", "amount"], rows_b, source=Source.B)
+    reverse_a = _snapshot_csv(["id", "other", "amount"], list(reversed(rows_a)), source=Source.A)
+    reverse_b = _snapshot_csv(["id", "other", "amount"], list(reversed(rows_b)), source=Source.B)
+    selection = [("id", "id"), ("other", "other")]
+    first = discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=selection)
+    assert first == discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=selection)
+    assert first == discovery.compare_key_mapping(reverse_a, reverse_b, key_pairs=selection)
+    amounts = discovery.compare_amount_columns(
+        snapshot_a, snapshot_b, column_a="amount", column_b="amount"
+    )
+    assert amounts == discovery.compare_amount_columns(
+        reverse_a, reverse_b, column_a="amount", column_b="amount"
+    )
+    assert snapshot_a._key_rows == (("A", "x", "1"), ("B", "y", "2"), ("A", "x", "3"))
+
+
+def test_stage2_diagnostics_leave_ingestion_reconciliation_and_export_bytes_unchanged(xlsx_bytes):
+    text = "id,amount,notes\nA,100,memo\nDUP,1,\nDUP,2,other\n"
+    data = xlsx_bytes({"Data": [["id", "amount", "notes"], ["A", 100.01, "=1+1"], ["DUP", 3]]})
+    before_a = ingest_csv(text, source=Source.A, key_columns=["id"], amount_column="amount")
+    before_b = ingest_xlsx(
+        data, source=Source.B, worksheet="Data", key_columns=["id"], amount_column="amount"
+    )
+    before = reconcile(before_a, before_b, amount_tolerance=Decimal("0.01"))
+    exported = export_exceptions_csv(before)
+    snapshot_a = discovery.discover_csv(text, source=Source.A)
+    snapshot_b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+    discovery.compare_key_mapping(snapshot_a, snapshot_b, key_pairs=[("notes", "notes")])
+    discovery.compare_amount_columns(snapshot_a, snapshot_b, column_a="amount", column_b="amount")
+    after_a = ingest_csv(text, source=Source.A, key_columns=["id"], amount_column="amount")
+    after_b = ingest_xlsx(
+        data, source=Source.B, worksheet="Data", key_columns=["id"], amount_column="amount"
+    )
+    after = reconcile(after_a, after_b, amount_tolerance=Decimal("0.01"))
+    assert before_a == after_a
+    assert before_b == after_b
+    assert before == after
+    assert exported == export_exceptions_csv(after)
+    assert snapshot_b._key_rows[0][2] is None
+
+
+def test_stage2_symbols_remain_outside_the_root_public_api():
+    names = {
+        "DiscoverySnapshot",
+        "KeyCompatibility",
+        "AmountCompatibility",
+        "discover_csv",
+        "discover_xlsx",
+        "compare_key_mapping",
+        "compare_amount_columns",
+    }
+    assert names.isdisjoint(tallydiff.__all__)
+    assert all(not hasattr(tallydiff, name) for name in names)
