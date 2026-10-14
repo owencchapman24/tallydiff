@@ -71,6 +71,7 @@ EXPECTED_RUNTIME_MODULES = frozenset(
         "tallydiff/amounts.py",
         "tallydiff/app.py",
         "tallydiff/configuration.py",
+        "tallydiff/discovery.py",
         "tallydiff/engine.py",
         "tallydiff/export.py",
         "tallydiff/ingest.py",
@@ -166,7 +167,27 @@ def test_release_freezes_exact_complete_runtime_module_allowlists():
     assert PACKAGE_MODULES == EXPECTED_RUNTIME_MODULES
     assert set(wheel_modules) == {f"src/{name}" for name in EXPECTED_RUNTIME_MODULES}
     assert set(source_modules) == {f"/src/{name}" for name in EXPECTED_RUNTIME_MODULES}
-    assert len(wheel_modules) == len(source_modules) == len(EXPECTED_RUNTIME_MODULES) == 16
+    assert len(wheel_modules) == len(source_modules) == len(EXPECTED_RUNTIME_MODULES) == 17
+
+
+def test_discovery_ships_exactly_once_in_both_archives(release):
+    _, dist, _, _ = release
+    check(release)
+    with ZipFile(dist / f"{PACKAGE}-py3-none-any.whl") as archive:
+        assert archive.namelist().count("tallydiff/discovery.py") == 1
+    with tarfile.open(dist / f"{PACKAGE}.tar.gz", "r:gz") as archive:
+        assert archive.getnames().count(f"{PACKAGE}/src/tallydiff/discovery.py") == 1
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "sdist"])
+def test_discovery_source_bytes_must_match_checkout(release, artifact):
+    _, _, wheel, source = release
+    if artifact == "wheel":
+        wheel["tallydiff/discovery.py"] = b"# stale discovery profile"
+    else:
+        source[f"{PACKAGE}/src/tallydiff/discovery.py"] = b"# stale discovery profile"
+    with pytest.raises(ArtifactContentError, match="differs from current project"):
+        check(release)
 
 
 def test_review_scale_developer_sources_follow_existing_sdist_only_policy(release):

@@ -155,6 +155,37 @@ def _header(rows: Iterator[tuple[Cell, ...]], source: Source, worksheet: str) ->
     return tuple(names)
 
 
+def _data_rows(
+    rows: Iterator[tuple[Cell, ...]],
+    source: Source,
+    worksheet: str,
+    header: tuple[str, ...],
+) -> Iterator[tuple[int, tuple[Cell, ...]]]:
+    """Validate table structure independently of selected field conversions."""
+
+    first_blank = None
+    for source_row, cells in enumerate(rows, start=2):
+        if all(cell.value is None for cell in cells):
+            if first_blank is None:
+                first_blank = source_row
+            continue
+        if first_blank is not None:
+            raise IngestionError(
+                source,
+                "wholly blank interior data row",
+                source_row=first_blank,
+                worksheet=worksheet,
+            )
+        if any(cell.value is not None for cell in cells[len(header) :]):
+            raise IngestionError(
+                source,
+                "data extends beyond the header columns",
+                source_row=source_row,
+                worksheet=worksheet,
+            )
+        yield source_row, cells
+
+
 def inspect_xlsx_columns(data: bytes, *, source: Source, worksheet: str) -> tuple[str, ...]:
     """Validate row 1 only, with exact text headers and no display-format inference."""
     with _open(data, source, worksheet) as workbook:
@@ -266,26 +297,7 @@ def ingest_xlsx(
                         column=column,
                         worksheet=worksheet,
                     )
-            first_blank = None
-            for source_row, cells in enumerate(rows, start=2):
-                if all(cell.value is None for cell in cells):
-                    if first_blank is None:
-                        first_blank = source_row
-                    continue
-                if first_blank is not None:
-                    raise IngestionError(
-                        source,
-                        "wholly blank interior data row",
-                        source_row=first_blank,
-                        worksheet=worksheet,
-                    )
-                if any(cell.value is not None for cell in cells[len(header) :]):
-                    raise IngestionError(
-                        source,
-                        "data extends beyond the header columns",
-                        source_row=source_row,
-                        worksheet=worksheet,
-                    )
+            for source_row, cells in _data_rows(rows, source, worksheet, header):
                 fields = dict(zip(header, cells, strict=False))
                 converted_keys = []
                 for index, column in enumerate(selected_columns):
