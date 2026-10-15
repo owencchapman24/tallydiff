@@ -384,3 +384,202 @@ def test_twenty_thousand_two_component_keys_are_fully_evaluated_with_bounded_dis
     assert [candidate.key_b for candidate in result.candidates] == [
         (f"V{index:05}", "RIGHT") for index in range(20)
     ]
+
+
+def test_large_ambiguous_signature_group_retains_linear_entries_and_only_constructs_clean_pair(
+    monkeypatch,
+):
+    original_index = discovery._key_difference_signature_index
+    original_candidate = discovery.PossibleKeyDifference
+    indexed_sizes = []
+    constructed = []
+
+    def record_index(keys, prefixes, suffixes):
+        result = original_index(keys, prefixes, suffixes)
+        indexed_sizes.append(
+            (len(keys), sum(map(len, result.values())), max(map(len, result.values())))
+        )
+        return result
+
+    def record_candidate(*args):
+        constructed.append(args)
+        return original_candidate(*args)
+
+    monkeypatch.setattr(discovery, "_key_difference_signature_index", record_index)
+    monkeypatch.setattr(discovery, "PossibleKeyDifference", record_candidate)
+    rows_a = [("shared", f"left-{index}") for index in range(128)] + [("clean", "left")]
+    rows_b = [("shared", f"right-{index}") for index in range(128)] + [("clean", "right")]
+    result = _find(rows_a, rows_b)
+    assert indexed_sizes == [(129, 258, 128), (129, 258, 128)]
+    assert result.evaluated and result.ambiguity_suppressed
+    assert result.signature_entry_count == 516
+    assert result.total_candidate_count == len(result.candidates) == 1
+    assert not result.display_truncated
+    assert constructed == [(("clean", "left"), ("clean", "right"), 1, "A1", "B1")]
+
+
+def test_duplicate_heavy_rows_use_distinct_key_budget_without_losing_unique_evidence(monkeypatch):
+    rows_a = [("repeat", "left")] * 500 + [("clean", "left")]
+    rows_b = [("repeat", "right")] * 400 + [("clean", "right")]
+    a, b = _snapshot(rows_a, Source.A), _snapshot(rows_b, Source.B)
+    before = (a._key_rows, b._key_rows, hash(a), hash(b))
+    original_index = discovery._key_difference_signature_index
+    indexed_keys = []
+
+    def record_index(keys, prefixes, suffixes):
+        indexed_keys.append(keys)
+        return original_index(keys, prefixes, suffixes)
+
+    monkeypatch.setattr(discovery, "MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES", 8)
+    monkeypatch.setattr(discovery, "_key_difference_signature_index", record_index)
+    result = discovery.find_possible_key_differences(a, b, key_pairs=(("A0", "B0"), ("A1", "B1")))
+    assert result.evaluated and result.signature_entry_count == 8
+    assert [len(keys) for keys in indexed_keys] == [2, 2]
+    assert result.candidates == (
+        discovery.PossibleKeyDifference(("clean", "left"), ("clean", "right"), 1, "A1", "B1"),
+    )
+    assert result.total_candidate_count == 1
+    assert a.profile.row_count == 501 and b.profile.row_count == 401
+    assert a._key_rows.count(("repeat", "left")) == 500
+    assert b._key_rows.count(("repeat", "right")) == 400
+    assert before == (a._key_rows, b._key_rows, hash(a), hash(b))
+
+
+@pytest.mark.parametrize(
+    "rows_a,rows_b",
+    (
+        ([], []),
+        ([("X", "1")] * 4 + [("Y", "2")] * 2, [("Y", "2"), ("X", "1")]),
+        ([(" ", "present"), ("present", "\t")], [("present", " "), ("\t", "present")]),
+    ),
+)
+def test_matched_or_ineligible_keys_consume_no_signature_budget(rows_a, rows_b, monkeypatch):
+    original_index = discovery._key_difference_signature_index
+    indexed_keys = []
+
+    def record_index(keys, prefixes, suffixes):
+        indexed_keys.append(keys)
+        return original_index(keys, prefixes, suffixes)
+
+    monkeypatch.setattr(discovery, "MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES", 0)
+    monkeypatch.setattr(discovery, "_key_difference_signature_index", record_index)
+    result = _find(rows_a, rows_b)
+    assert indexed_keys == [(), ()]
+    assert result.evaluated and result.skip_reason is None
+    assert result.signature_entry_count == 0
+    assert result.candidates == () and result.total_candidate_count == 0
+    assert not result.display_truncated and not result.ambiguity_suppressed
+
+
+def test_mixed_four_component_evidence_preserves_exact_count_and_order_under_permutations():
+    rows_a = []
+    rows_b = []
+    expected = []
+    pairs = tuple((f"A{index}", f"B{index}") for index in range(4))
+    for group in range(25):
+        left = tuple(f"C{group:02}-{component}" for component in range(4))
+        differing = group % 4
+        right = tuple(
+            f"changed-{value}" if component == differing else value
+            for component, value in enumerate(left)
+        )
+        rows_a.append(left)
+        rows_b.append(right)
+        expected.append(discovery.PossibleKeyDifference(left, right, differing, *pairs[differing]))
+    rows_a.extend(
+        [
+            ("ambiguous-0", "ambiguous-1", "ambiguous-2", "left"),
+            *(("duplicate-0", "duplicate-1", "duplicate-2", "left"),) * 3,
+            ("exact-0", "exact-1", "exact-2", "exact-3"),
+            ("missing-0", "missing-1", "missing-2", " "),
+        ]
+    )
+    rows_b.extend(
+        [
+            ("ambiguous-0", "ambiguous-1", "ambiguous-2", "right-1"),
+            ("ambiguous-0", "ambiguous-1", "ambiguous-2", "right-2"),
+            ("duplicate-0", "duplicate-1", "duplicate-2", "right"),
+            ("exact-0", "exact-1", "exact-2", "exact-3"),
+            ("missing-0", "missing-1", "missing-2", "\t"),
+        ]
+    )
+    expected.sort(
+        key=lambda candidate: (candidate.component_index, candidate.key_a, candidate.key_b)
+    )
+    result = _find(rows_a, rows_b, 4)
+    assert result.evaluated and result.ambiguity_suppressed
+    assert result.signature_entry_count == 220
+    assert result.total_candidate_count == 25
+    assert result.display_truncated and result.candidates == tuple(expected[:20])
+    permutations = (
+        (list(reversed(rows_a)), list(reversed(rows_b))),
+        (rows_a[7:] + rows_a[:7], rows_b[1::2] + rows_b[::2]),
+        (rows_a[::2] + rows_a[1::2], rows_b[11:] + rows_b[:11]),
+    )
+    for permuted_a, permuted_b in permutations:
+        assert _find(permuted_a, permuted_b, 4) == result
+    a, b = _snapshot(rows_a, Source.A, 4), _snapshot(rows_b, Source.B, 4)
+    selected_order = (2, 0, 3, 1)
+    reordered_pairs = tuple(pairs[index] for index in selected_order)
+    reordered = discovery.find_possible_key_differences(a, b, key_pairs=reordered_pairs)
+    expected_reordered = sorted(
+        (
+            discovery.PossibleKeyDifference(
+                tuple(candidate.key_a[index] for index in selected_order),
+                tuple(candidate.key_b[index] for index in selected_order),
+                selected_order.index(candidate.component_index),
+                candidate.column_a,
+                candidate.column_b,
+            )
+            for candidate in expected
+        ),
+        key=lambda candidate: (candidate.component_index, candidate.key_a, candidate.key_b),
+    )
+    assert reordered.key_pairs == reordered_pairs
+    assert reordered.total_candidate_count == result.total_candidate_count
+    assert reordered.signature_entry_count == result.signature_entry_count
+    assert reordered.candidates == tuple(expected_reordered[:20])
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    (
+        (("ab", "c", "shared"), ("a", "bc", "shared")),
+        (("a|b", "c", "shared"), ("a", "b|c", "shared")),
+        (("α|β", "雪", "shared"), ("α", "β|雪", "shared")),
+    ),
+)
+def test_omitted_component_signatures_do_not_collide_through_concatenation(left, right):
+    result = _find([left], [right], 3)
+    assert result.evaluated and result.signature_entry_count == 6
+    assert result.candidates == () and result.total_candidate_count == 0
+    assert not result.ambiguity_suppressed
+
+
+@pytest.mark.parametrize("format_name", ["csv", "xlsx"])
+def test_invalid_unselected_amount_evidence_cannot_change_possible_key_differences(
+    xlsx_bytes, format_name
+):
+    rows_a = [(f"V{index}", "left", "10") for index in range(3)]
+    rows_b = [(f"V{index}", "right", value) for index, value in enumerate(("NaN", "#N/A", "=1+1"))]
+    a = _snapshot(rows_a, Source.A, 3)
+    if format_name == "csv":
+        b = _snapshot(rows_b, Source.B, 3)
+    else:
+        data = xlsx_bytes({"Data": [["B0", "B1", "B2"], *rows_b]})
+        b = discovery.discover_xlsx(data, source=Source.B, worksheet="Data")
+    before = (a._key_rows, b._key_rows, hash(a), hash(b))
+    pairs = (("A0", "B0"), ("A1", "B1"))
+    amount = discovery.compare_amount_columns(a, b, column_a="A2", column_b="B2")
+    key = discovery.compare_key_mapping(a, b, key_pairs=pairs)
+    result = discovery.find_possible_key_differences(a, b, key_pairs=pairs)
+    assert amount.parseable_count_a == 3 and amount.parseable_count_b == 0
+    assert amount.total_b is None and amount.control_difference is None
+    assert key.eligible_row_count_a == key.eligible_row_count_b == 3
+    assert key.overlap_distinct_count == 0
+    assert result.evaluated and result.total_candidate_count == 3
+    assert result.signature_entry_count == 12
+    assert [(candidate.key_a, candidate.key_b) for candidate in result.candidates] == [
+        ((f"V{index}", "left"), (f"V{index}", "right")) for index in range(3)
+    ]
+    assert before == (a._key_rows, b._key_rows, hash(a), hash(b))

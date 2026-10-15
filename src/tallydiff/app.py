@@ -752,7 +752,7 @@ def _choose_file(source: Source) -> _Input | None:
                 sheet_cache = (data, inspect_xlsx_sheets(data, source=source))
                 st.session_state[sheets_key] = sheet_cache
             sheets = sheet_cache[1]
-            sheet_key = sha256(upload.name.encode("utf-8") + b"\0" + data).hexdigest()
+            sheet_key = sha256(data).hexdigest()
             worksheet = st.selectbox(
                 f"File {source.value} worksheet",
                 sheets,

@@ -1193,3 +1193,93 @@ def test_possible_key_rows_preserve_detector_order_without_suggesting_rank():
     )
     empty = replace(result, candidates=(), total_candidate_count=0, display_truncated=False)
     assert ui._possible_key_difference_rows(empty) == []
+
+
+def test_all_discovery_caches_keep_only_current_entries_through_repeated_source_and_mapping_cycles(
+    state, monkeypatch
+):
+    from collections import Counter
+
+    calls = Counter()
+    for name in (
+        "discover_csv",
+        "suggest_key_mappings",
+        "suggest_amount_mappings",
+        "compare_key_mapping",
+        "compare_amount_columns",
+        "find_possible_key_differences",
+    ):
+        original = getattr(ui, name)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(ui, name, record)
+    cache_keys = {
+        "_discovery_source_A",
+        "_discovery_source_B",
+        "_discovery_pair",
+        "_configuration_evidence",
+        "_possible_key_differences",
+    }
+    mapping = _selected_mapping()
+    for cycle in range(4):
+        data_a = (
+            "first,second,third,amount,alternate,secondary\n"
+            f"V1,I1,L1,{10 + cycle},100,x\n"
+            f"V1,I2,L2,{20 + cycle},200,y\n"
+        ).encode()
+        data_b = (
+            "first,second,third,amount,alternate,secondary\n"
+            f"V1,I1,L1,{11 + cycle},100,x\n"
+            f"V1,I3,L2,{21 + cycle},200,y\n"
+        ).encode()
+        file_a = _input(Source.A, data_a)
+        file_b = _input(Source.B, data_b)
+        suggestions = ui._cached_suggestions(file_a, file_b)
+        original = ui._cached_configuration_evidence(file_a, file_b, mapping)
+        requested = ui._inspect_possible_key_differences(file_a, file_b, mapping)
+        ownership = _completed_state(state)
+        before = calls.copy()
+        for mode in ReconciliationMode:
+            state.update(reconciliation_mode=mode, amount_tolerance="0.01", norm_casefold_0=True)
+            renamed_a = _input(Source.A, data_a, name=f"renamed-{cycle}.csv")
+            renamed_b = _input(Source.B, data_b, name=f"other-{cycle}.csv")
+            assert ui._cached_suggestions(renamed_a, renamed_b) is suggestions
+            assert ui._cached_configuration_evidence(renamed_a, renamed_b, mapping) is original
+            assert ui._inspect_possible_key_differences(renamed_a, renamed_b, mapping) is requested
+        assert calls == before
+        amount_changed = replace(mapping, amount_a="alternate", amount_b="alternate")
+        assert ui._cached_configuration_evidence(file_a, file_b, amount_changed) is not original
+        assert ui._current_possible_key_differences(file_a, file_b, amount_changed) is requested
+        reordered = replace(amount_changed, key_pairs=tuple(reversed(mapping.key_pairs)))
+        ui._cached_configuration_evidence(file_a, file_b, reordered)
+        searches = calls["find_possible_key_differences"]
+        assert ui._current_possible_key_differences(file_a, file_b, reordered) is None
+        assert calls["find_possible_key_differences"] == searches
+        changed_request = ui._inspect_possible_key_differences(file_a, file_b, reordered)
+        assert changed_request is not requested
+        restored = ui._cached_configuration_evidence(file_a, file_b, mapping)
+        assert restored is not original
+        assert ui._current_possible_key_differences(file_a, file_b, mapping) is None
+        assert ui._inspect_possible_key_differences(file_a, file_b, mapping) is not requested
+        assert ui._cached_suggestions(file_a, file_b) is suggestions
+        assert all(state[key] is value for key, value in ownership.items())
+        assert {
+            key
+            for key in state
+            if key.startswith(("_discovery_", "_configuration_", "_possible_key_"))
+        } == cache_keys
+        assert state["_discovery_source_A"].identity[1] == data_a
+        assert state["_discovery_source_B"].identity[1] == data_b
+        assert state["_configuration_evidence"].identity[:2] == suggestions.identity
+        assert state["_possible_key_differences"].identity[:2] == suggestions.identity
+        assert calls == {
+            "discover_csv": 2 * (cycle + 1),
+            "suggest_key_mappings": cycle + 1,
+            "suggest_amount_mappings": cycle + 1,
+            "compare_key_mapping": 4 * (cycle + 1),
+            "compare_amount_columns": 4 * (cycle + 1),
+            "find_possible_key_differences": 3 * (cycle + 1),
+        }

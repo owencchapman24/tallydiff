@@ -1378,3 +1378,211 @@ def test_possible_difference_dataframe_preserves_markdown_like_keys_as_read_only
     ]
     assert _map_values(app) == before
     _assert_no_result(app)
+
+
+@pytest.mark.parametrize("side", ["A", "B"])
+def test_renaming_same_multisheet_workbook_retains_sheet_and_reuses_current_discovery(
+    xlsx_bytes, discovery_calls, side
+):
+    header = ["vendor", "invoice", "amount"] if side == "A" else ["supplier", "ref", "gross"]
+    data = xlsx_bytes(
+        {"One": [header, ["Vendor-17", "INV-003", 9]], "Two": [header, ["Vendor-17", "INV-005", 9]]}
+    )
+    data_a, data_b = _possible_data()
+    inputs = (data, data_b) if side == "A" else (data_a, data)
+    app = _uploaded_app(*inputs, **{f"name_{side.lower()}": "original.xlsx"})
+    _worksheet(app, side).set_value("One").run()
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    source = app.session_state[f"_discovery_source_{side}"]
+    suggestions = _bundle(app)
+    calls = dict(discovery_calls)
+    app.file_uploader(key=f"upload_{side}").set_value(
+        (
+            "renamed.xlsx",
+            data,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    ).run()
+    assert not app.exception
+    assert _worksheet(app, side).value == "One"
+    assert app.session_state[f"_discovery_source_{side}"] is source
+    assert _bundle(app) is suggestions
+    assert discovery_calls == calls
+    assert all(value is None for value in _map_values(app).values())
+    changed = xlsx_bytes(
+        {"One": [header, ["Vendor-17", "INV-006", 9]], "Two": [header, ["Vendor-17", "INV-007", 9]]}
+    )
+    app.file_uploader(key=f"upload_{side}").set_value(
+        (
+            "renamed.xlsx",
+            changed,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    ).run()
+    assert _worksheet(app, side).value is None
+    assert f"_discovery_source_{side}" not in app.session_state
+    assert "_discovery_pair" not in app.session_state
+
+
+@pytest.fixture
+def all_discovery_calls(monkeypatch):
+    calls = Counter()
+    for name in (
+        "discover_csv",
+        "discover_xlsx",
+        "suggest_key_mappings",
+        "suggest_amount_mappings",
+        "compare_key_mapping",
+        "compare_amount_columns",
+        "find_possible_key_differences",
+    ):
+        original = getattr(discovery, name)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(discovery, name, record)
+    return calls
+
+
+def test_repeated_configuration_and_review_filter_cycles_reuse_all_discovery_layers(
+    all_discovery_calls,
+):
+    from test_app import _exception_table, _review_widget
+
+    from tallydiff import ReviewDisposition
+
+    app = _possible_app()
+    _comparison(app, "vendor", "supplier")
+    possible = _inspect_possible(app)
+    snapshots = tuple(app.session_state[f"_discovery_source_{side}"] for side in ("A", "B"))
+    suggestions = _bundle(app)
+    selected = _configuration_evidence(app)
+    calls = dict(all_discovery_calls)
+    for mode, tolerance, comparison in (
+        (ReconciliationMode.GROUPED_BY_KEY, "0.01", ("invoice", "ref")),
+        (ReconciliationMode.BOUNDED_ONE_TO_MANY, "0.10", ("vendor", "supplier")),
+        (ReconciliationMode.UNIQUE, "0", ("invoice", "ref")),
+    ):
+        app.radio(key="reconciliation_mode").set_value(mode)
+        app.text_input(key="amount_tolerance").set_value(tolerance)
+        app.selectbox(key="map_comparison_a_0").set_value(comparison[0])
+        app.selectbox(key="map_comparison_b_0").set_value(comparison[1]).run()
+        assert all_discovery_calls == calls
+        assert _bundle(app) is suggestions
+        assert _configuration_evidence(app) is selected
+        assert _possible_cache(app) is possible
+        assert (
+            tuple(app.session_state[f"_discovery_source_{side}"] for side in ("A", "B"))
+            == snapshots
+        )
+    app.button(key="run").click().run()
+    table = _exception_table(app)
+    app.session_state[table.key] = {"selection": {"rows": [0], "columns": [], "cells": []}}
+    app.run()
+    next(widget for widget in app.selectbox if widget.label == "Analyst disposition").set_value(
+        ReviewDisposition.NEEDS_FOLLOW_UP
+    ).run()
+    next(widget for widget in app.text_area if widget.label == "Analyst note").set_value(
+        "Retain annotation across filter cycles"
+    )
+    next(button for button in app.button if button.label == "Save note").click().run()
+    next(
+        button for button in app.button if button.label == "Prepare review downloads"
+    ).click().run()
+    completed = app.session_state["completed"][1]
+    runtime = app.session_state[ui._REVIEW_STATE_KEY]
+    annotations = runtime.snapshot()
+    prepared = app.session_state[ui._REVIEW_PREPARED_KEY]
+    for search, threshold in (("missing", "0"), ("Vendor-17", "100"), ("", "0")):
+        _review_widget(app, "Search matching keys").set_value(search)
+        _review_widget(app, "Minimum absolute delta").set_value(threshold).run()
+        assert not app.exception
+        assert all_discovery_calls == calls
+        assert _configuration_evidence(app) is selected
+        assert _possible_cache(app) is possible
+        assert app.session_state["completed"][1] is completed
+        assert app.session_state[ui._REVIEW_STATE_KEY] is runtime
+        assert runtime.snapshot() == annotations
+        assert app.session_state[ui._REVIEW_PREPARED_KEY] is prepared
+
+
+@pytest.mark.parametrize("input_format", ["csv", "xlsx"])
+def test_malformed_source_replacement_cannot_display_prior_cached_evidence(
+    input_format, xlsx_bytes
+):
+    app = _possible_app()
+    _inspect_possible(app)
+    other_source = app.session_state["_discovery_source_B"]
+    if input_format == "csv":
+        data = b"vendor,invoice,amount\nV1,I1,10,extra\n"
+        name = "replacement.csv"
+        mime = "text/csv"
+    else:
+        data = xlsx_bytes(
+            {"Data": [["vendor", "invoice", "amount"], ["V1", "I1", 10], [], ["V2", "I2", 20]]}
+        )
+        name = "replacement.xlsx"
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    app.file_uploader(key="upload_A").set_value((name, data, mime)).run()
+    assert not app.exception
+    assert any("File A" in message.value for message in app.error)
+    assert "_discovery_source_A" not in app.session_state
+    assert app.session_state["_discovery_source_B"] is other_source
+    for key in ("_discovery_pair", "_configuration_evidence", "_possible_key_differences"):
+        assert key not in app.session_state
+    assert _possible_table(app) is None
+    assert not _has_configuration_diagnostics(app)
+    assert not any(widget.key.startswith("map_") for widget in app.selectbox)
+    assert not any(header.value == "Key mapping candidates" for header in app.subheader)
+    app.run()
+    assert not app.exception and app.error
+    assert "_discovery_source_A" not in app.session_state
+    assert "_possible_key_differences" not in app.session_state
+
+
+def test_mixed_invalid_candidate_evidence_preserves_rows_and_manual_configuration(xlsx_bytes):
+    from datetime import timedelta
+
+    data_a = _possible_csv(
+        ["vendor", "invoice", "amount"],
+        [
+            ["東京", "A-001", "10"],
+            ["東京", "A-001", "word"],
+            [" \t", "A-002", "3"],
+            ["Ω", "A-003", "4"],
+        ],
+    )
+    data_b = xlsx_bytes(
+        {
+            "Data": [
+                ["supplier", "ref", "gross", "notes"],
+                ["東京", "A-004", 11, timedelta(hours=1)],
+                ["Ω", "A-003", 4, "=1+1"],
+                [True, "A-002", 5, "#N/A"],
+            ]
+        }
+    )
+    app = _uploaded_app(data_a, data_b, name_b="candidates.xlsx")
+    assert not app.exception and not app.error
+    pairs = (("vendor", "supplier"), ("invoice", "ref"))
+    _set_pairs(app, pairs, amount_a="amount", amount_b="gross")
+    selected = _configuration_evidence(app)
+    assert _bundle(app).keys.suggestions[0].key_pairs != pairs
+    assert selected.key.key_pairs == pairs
+    assert selected.key.row_count_a == 4 and selected.key.row_count_b == 3
+    assert selected.key.eligible_row_count_a == 3 and selected.key.eligible_row_count_b == 2
+    assert selected.key.duplicate_excess_count_a == 1
+    assert selected.amount.parseable_count_a == 3 and selected.amount.total_a is None
+    source_a = app.session_state["_discovery_source_A"].snapshot
+    source_b = app.session_state["_discovery_source_B"].snapshot
+    before = (source_a._key_rows, source_b._key_rows)
+    assert _inspect_possible(app).result.total_candidate_count == 0
+    assert (source_a._key_rows, source_b._key_rows) == before
+    assert source_a._key_rows[0][:2] == source_a._key_rows[1][:2]
+    assert _map_values(app)["map_key_a_0"] == "vendor"
+    assert not app.error and not app.button(key="run").disabled
+    _assert_no_result(app)

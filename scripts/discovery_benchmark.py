@@ -13,6 +13,10 @@ import json
 import time
 import tracemalloc
 from collections.abc import Sequence
+from dataclasses import fields, is_dataclass
+from decimal import Decimal
+from enum import Enum
+from hashlib import sha256
 from io import StringIO
 from itertools import combinations
 
@@ -21,6 +25,7 @@ from tallydiff.discovery import (
     compare_amount_columns,
     compare_key_mapping,
     discover_csv,
+    find_possible_key_differences,
     suggest_amount_mappings,
     suggest_key_mappings,
 )
@@ -56,6 +61,7 @@ HEADERS_B = (
 )
 DEFAULT_ROW_COUNTS = (1_000, 5_000, 20_000)
 DEFAULT_COMPOSITE_LIMIT = 64
+WORKFLOW_SCENARIOS = ("one_component_differences", "ambiguous_signatures")
 _MIB = 1024 * 1024
 
 
@@ -306,6 +312,217 @@ def _measure_pass(csv_pair, columns_a, columns_b, composites, *, measure_memory:
     return report
 
 
+def generate_workflow_csv_pair(
+    row_count: int, column_count: int = 12, *, scenario: str = "one_component_differences"
+) -> tuple[str, str]:
+    """Reuse representative mixed columns while exposing exact differences or ambiguity.
+
+    Difference workloads have one vendor per observation and different invoice
+    values across files. Ambiguity workloads share one vendor and have distinct
+    invoices on both sides, so a cross-file signature group suppresses all pairs
+    when there are at least two rows. No Cartesian candidate list is generated.
+    """
+
+    _nonnegative_integer(row_count, "row_count")
+    _validate_width(column_count)
+    if scenario not in WORKFLOW_SCENARIOS:
+        raise ValueError(f"scenario must be one of {WORKFLOW_SCENARIOS}")
+    output = []
+    for headers, invoice_prefix in ((HEADERS_A, "LEFT"), (HEADERS_B, "RIGHT")):
+        stream = StringIO(newline="")
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(headers[:column_count])
+        for index in range(row_count):
+            row = list(_synthetic_row(index)[:column_count])
+            row[0] = "AMB-GROUP" if scenario == "ambiguous_signatures" else f"D{index:06d}"
+            row[1] = f"{invoice_prefix}-{index:06d}"
+            writer.writerow(row)
+        output.append(stream.getvalue())
+    return output[0], output[1]
+
+
+def _json_default(value):
+    if is_dataclass(value):
+        return {field.name: getattr(value, field.name) for field in fields(value)}
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"unsupported checksum value: {type(value).__name__}")
+
+
+def _content_checksum(value) -> str:
+    encoded = json.dumps(
+        value,
+        default=_json_default,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _workflow_observation(phase, result) -> dict:
+    if isinstance(result, DiscoverySnapshot):
+        return {
+            "row_count": result.profile.row_count,
+            "column_count": len(result.profile.columns),
+            "checksum": _content_checksum(result.profile),
+        }
+    observed = {"checksum": _content_checksum(result)}
+    if phase == "suggest_key_mappings":
+        observed.update(
+            evaluated_single_count=result.evaluated_single_count,
+            evaluated_composite_count=result.evaluated_composite_count,
+            composite_search_truncated=result.composite_search_truncated,
+            leading_count=result.leading_count,
+            returned_count=len(result.suggestions),
+        )
+    elif phase == "suggest_amount_mappings":
+        observed.update(
+            evaluated_count=result.evaluated_count,
+            leading_count=result.leading_count,
+            returned_count=len(result.suggestions),
+        )
+    elif phase == "compare_key_mapping":
+        observed.update(
+            cardinality=len(result.key_pairs),
+            eligible_row_count_a=result.eligible_row_count_a,
+            eligible_row_count_b=result.eligible_row_count_b,
+            overlap_distinct_count=result.overlap_distinct_count,
+            duplicate_excess_count_a=result.duplicate_excess_count_a,
+            duplicate_excess_count_b=result.duplicate_excess_count_b,
+        )
+    elif phase == "compare_amount_columns":
+        observed.update(
+            parseable_count_a=result.parseable_count_a,
+            parseable_count_b=result.parseable_count_b,
+            total_a=str(result.total_a) if result.total_a is not None else None,
+            total_b=str(result.total_b) if result.total_b is not None else None,
+            control_difference=(
+                str(result.control_difference) if result.control_difference is not None else None
+            ),
+        )
+    elif phase == "find_possible_key_differences":
+        observed.update(
+            evaluated=result.evaluated,
+            skip_reason=result.skip_reason,
+            signature_entry_count=result.signature_entry_count,
+            total_candidate_count=result.total_candidate_count,
+            displayed_candidate_count=len(result.candidates),
+            display_truncated=result.display_truncated,
+            ambiguity_suppressed=result.ambiguity_suppressed,
+        )
+    return observed
+
+
+def _measure_workflow_pass(csv_pair, *, measure_memory: bool) -> dict:
+    elapsed = {}
+    observations = {}
+    peaks = {}
+    incremental_peaks = {}
+    retained_snapshot_bytes = 0
+    baseline = 0
+    if measure_memory:
+        if tracemalloc.is_tracing():
+            raise RuntimeError("benchmark memory measurement requires inactive tracemalloc")
+        gc.collect()
+        tracemalloc.start()
+        baseline = tracemalloc.get_traced_memory()[0]
+
+    def measure(phase, action):
+        before = 0
+        if measure_memory:
+            gc.collect()
+            before = tracemalloc.get_traced_memory()[0]
+            tracemalloc.reset_peak()
+        started = time.perf_counter()
+        result = action()
+        elapsed[phase] = time.perf_counter() - started
+        if measure_memory:
+            peak = tracemalloc.get_traced_memory()[1]
+            peaks[phase] = peak / _MIB
+            incremental_peaks[phase] = max(0, peak - before) / _MIB
+        # Serialization/checksumming is outside operation timing and peak capture.
+        observations[phase] = _workflow_observation(phase, result)
+        return result
+
+    try:
+        snapshot_a = measure("discover_csv_a", lambda: discover_csv(csv_pair[0], source=Source.A))
+        snapshot_b = measure("discover_csv_b", lambda: discover_csv(csv_pair[1], source=Source.B))
+        elapsed["discover_csv_pair"] = elapsed["discover_csv_a"] + elapsed["discover_csv_b"]
+        observations["discover_csv_pair"] = {
+            "row_count_a": snapshot_a.profile.row_count,
+            "row_count_b": snapshot_b.profile.row_count,
+            "checksum": _content_checksum((snapshot_a.profile, snapshot_b.profile)),
+        }
+        if measure_memory:
+            gc.collect()
+            retained_snapshot_bytes = tracemalloc.get_traced_memory()[0] - baseline
+            peaks["discover_csv_pair"] = max(peaks["discover_csv_a"], peaks["discover_csv_b"])
+            incremental_peaks["discover_csv_pair"] = max(
+                0, peaks["discover_csv_pair"] - baseline / _MIB
+            )
+        pairs = tuple(zip(HEADERS_A[:2], HEADERS_B[:2], strict=True))
+        for phase, action in (
+            ("suggest_key_mappings", lambda: suggest_key_mappings(snapshot_a, snapshot_b)),
+            ("suggest_amount_mappings", lambda: suggest_amount_mappings(snapshot_a, snapshot_b)),
+            (
+                "compare_key_mapping",
+                lambda: compare_key_mapping(snapshot_a, snapshot_b, key_pairs=pairs),
+            ),
+            (
+                "compare_amount_columns",
+                lambda: compare_amount_columns(
+                    snapshot_a, snapshot_b, column_a=HEADERS_A[3], column_b=HEADERS_B[3]
+                ),
+            ),
+            (
+                "find_possible_key_differences",
+                lambda: find_possible_key_differences(snapshot_a, snapshot_b, key_pairs=pairs),
+            ),
+        ):
+            # Keep both snapshots, but release each operation result immediately.
+            measure(phase, action)
+    finally:
+        if measure_memory:
+            tracemalloc.stop()
+    return {
+        "elapsed_seconds": elapsed,
+        "observations": observations,
+        "python_memory": {
+            "peak_mib": peaks,
+            "incremental_peak_mib": incremental_peaks,
+            "retained_snapshot_bytes": retained_snapshot_bytes,
+            "retained_snapshot_mib": retained_snapshot_bytes / _MIB,
+        },
+    }
+
+
+def benchmark_workflow_case(
+    row_count: int, column_count: int = 12, *, scenario: str = "one_component_differences"
+) -> dict:
+    """Measure completed discovery operations on one deterministic representative scenario."""
+
+    csv_pair = generate_workflow_csv_pair(row_count, column_count, scenario=scenario)
+    timing = _measure_workflow_pass(csv_pair, measure_memory=False)
+    memory = _measure_workflow_pass(csv_pair, measure_memory=True)
+    if timing["observations"] != memory["observations"]:
+        raise AssertionError("timing and allocation passes observed different workflow content")
+    return {
+        "scenario": scenario,
+        "row_count_per_side": row_count,
+        "column_count_per_side": column_count,
+        "input_sha256": [sha256(text.encode("utf-8")).hexdigest() for text in csv_pair],
+        "selected_key_pairs": tuple(zip(HEADERS_A[:2], HEADERS_B[:2], strict=True)),
+        "selected_amount_pair": (HEADERS_A[3], HEADERS_B[3]),
+        "elapsed_seconds": timing["elapsed_seconds"],
+        "observations": timing["observations"],
+        "python_memory": memory["python_memory"],
+    }
+
+
 def benchmark_case(
     row_count: int, column_count: int = 12, composite_limit: int = DEFAULT_COMPOSITE_LIMIT
 ) -> dict:
@@ -330,6 +547,10 @@ def benchmark_case(
         "python_memory": memory["python_memory"],
         "checksums": timing["checksums"],
         "production_suggestions": timing["production_suggestions"],
+        "v08_workflows": [
+            benchmark_workflow_case(row_count, column_count, scenario=scenario)
+            for scenario in WORKFLOW_SCENARIOS
+        ],
     }
 
 
@@ -371,6 +592,24 @@ def run_benchmark(
                 "Uses production defaults, independent of the Stage 3 composite sample limit. "
                 "Suggestion result tuples are discarded after evaluation, tie, and return "
                 "counts are recorded. No calibration labels enter these calls."
+            ),
+            "v08_workflows": (
+                "Each scenario uses separate untraced timing and traced allocation passes over "
+                "pre-generated CSVs. Both snapshots remain alive through all operations. "
+                "Individual discovery timings sum to combined discovery time. Combined peak "
+                "is the maximum absolute tracked peak across sequential A/B discovery, with A "
+                "retained during B; individual peaks are never added. Absolute peaks include "
+                "retained snapshots and small report allocations; incremental peaks subtract "
+                "current allocations at phase start. Retained snapshot bytes are current "
+                "traced allocations after discovery/GC minus the initial baseline, including "
+                "small instrumentation allocations. Only Python allocations, not RSS, "
+                "are measured. "
+                "Canonical UTF-8 JSON SHA-256 checksums cover complete profiles and returned "
+                "diagnostic/suggestion dataclasses, including candidate tuple values and exact "
+                "Decimal strings; snapshots' private row matrix is excluded. Raw CSV SHA-256 "
+                "is also recorded. Checksums/counts must agree across passes. Checksumming and "
+                "dataset generation are outside operation timing/peak capture. Results are "
+                "discarded after bounded observations/checksums are recorded."
             ),
             "thresholds": None,
         },
