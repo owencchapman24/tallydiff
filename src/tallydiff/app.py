@@ -49,12 +49,16 @@ from tallydiff import (
     reconcile,
 )
 from tallydiff.discovery import (
+    AmountCompatibility,
     AmountMappingSuggestion,
     AmountSuggestionResult,
     DiscoverySnapshot,
     HeaderCompatibility,
+    KeyCompatibility,
     KeyMappingSuggestion,
     KeySuggestionResult,
+    compare_amount_columns,
+    compare_key_mapping,
     discover_csv,
     discover_xlsx,
     suggest_amount_mappings,
@@ -600,6 +604,7 @@ def _reset_mapping(*, reset_discovery: bool = True) -> None:
     _clear_result()
     if reset_discovery:
         _clear_discovery_ui()
+        st.session_state.pop("_configuration_evidence", None)
     for key in list(st.session_state):
         if key.startswith(("map_", "norm_")):
             del st.session_state[key]
@@ -1186,6 +1191,165 @@ def _normalization_config() -> KeyNormalizationConfig | None:
     return KeyNormalizationConfig(component_rules)
 
 
+@dataclass(frozen=True, slots=True)
+class _ConfigurationEvidence:
+    identity: tuple[object, ...]
+    key: KeyCompatibility
+    amount: AmountCompatibility
+
+
+def _cached_configuration_evidence(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> _ConfigurationEvidence | None:
+    if mapping.problem(file_a.columns, file_b.columns) is not None:
+        st.session_state.pop("_configuration_evidence", None)
+        return None
+    identity = (
+        _discovery_identity(Source.A, file_a.data, file_a.input_format, file_a.worksheet),
+        _discovery_identity(Source.B, file_b.data, file_b.input_format, file_b.worksheet),
+        mapping.key_pairs,
+        mapping.amount_a,
+        mapping.amount_b,
+    )
+    cached = st.session_state.get("_configuration_evidence")
+    if cached is not None and cached.identity == identity:
+        return cached
+    st.session_state.pop("_configuration_evidence", None)
+    cached = _ConfigurationEvidence(
+        identity,
+        compare_key_mapping(file_a.discovery, file_b.discovery, key_pairs=mapping.key_pairs),
+        compare_amount_columns(
+            file_a.discovery, file_b.discovery, column_a=mapping.amount_a, column_b=mapping.amount_b
+        ),
+    )
+    st.session_state["_configuration_evidence"] = cached
+    return cached
+
+
+def _configuration_warnings(
+    key: KeyCompatibility, amount: AmountCompatibility, mode: ReconciliationMode
+) -> tuple[str, ...]:
+    """Apply advisory integer thresholds to existing baseline facts, without ingestion."""
+
+    warnings = []
+    sides = (
+        ("A", key.eligible_row_count_a, key.row_count_a),
+        ("B", key.eligible_row_count_b, key.row_count_b),
+    )
+    for side, eligible, total in sides:
+        if total > 0 and eligible == 0:
+            warnings.append(
+                f"File {side} has no eligible baseline key rows under the selected key "
+                f"({eligible} / {total} rows)."
+            )
+    if key.eligible_row_count_a > 0 and key.eligible_row_count_b > 0:
+        if key.overlap_distinct_count == 0:
+            warnings.append(
+                "The selected keys have no exact baseline overlap. This may indicate an "
+                "unsuitable mapping or genuinely nonoverlapping source populations; "
+                "it is not proof that the mapping is wrong."
+            )
+        elif (
+            key.overlap_row_count_a * 10 < key.eligible_row_count_a
+            and key.overlap_row_count_b * 10 < key.eligible_row_count_b
+        ):
+            warnings.append(
+                "The selected keys have very low baseline overlap: "
+                f"File A {key.overlap_row_count_a} / {key.eligible_row_count_a} eligible rows; "
+                f"File B {key.overlap_row_count_b} / {key.eligible_row_count_b} eligible rows. "
+                "Both are below 10%. Partial source overlap can be legitimate."
+            )
+    for side, eligible, total in sides:
+        if total > 0 and eligible * 10 < total * 9:
+            warnings.append(
+                f"File {side} has poor baseline key eligibility: {eligible} / {total} rows "
+                "are eligible under the selected key (below 90%)."
+            )
+    if mode is ReconciliationMode.UNIQUE and (
+        key.duplicate_excess_count_a > 0 or key.duplicate_excess_count_b > 0
+    ):
+        warnings.append(
+            "In Unique records mode, duplicate keys may produce ambiguous findings requiring "
+            f"review. Baseline duplicate excess: File A {key.duplicate_excess_count_a}; "
+            f"File B {key.duplicate_excess_count_b}. "
+            "This does not establish that a different reconciliation mode is appropriate."
+        )
+    for side, parseable, total in (
+        ("A", amount.parseable_count_a, amount.row_count_a),
+        ("B", amount.parseable_count_b, amount.row_count_b),
+    ):
+        if parseable < total:
+            warnings.append(
+                f"File {side}'s selected amount column contains values incompatible with amount "
+                f"parsing: {parseable} / {total} rows parse. "
+                "Existing ingestion validation may reject this configuration during Run."
+            )
+    return tuple(warnings)
+
+
+def _show_configuration_diagnostics(
+    file_a: _Input,
+    file_b: _Input,
+    mapping: ColumnMapping,
+    mode: ReconciliationMode,
+    key_normalization: KeyNormalizationConfig | None,
+) -> None:
+    evidence = _cached_configuration_evidence(file_a, file_b, mapping)
+    if evidence is None:
+        return
+    key, amount = evidence.key, evidence.amount
+    st.subheader("Configuration diagnostics — advisory")
+    st.caption(
+        "These counts describe the selected mapping using baseline key values before optional "
+        "normalization. They are independent of reconciliation mode and amount tolerance."
+    )
+    if key_normalization is not None:
+        st.caption(
+            "Normalization is enabled. Overlap and duplication diagnostics reflect baseline "
+            "values and may differ from reconciliation outcomes. "
+            "Zero baseline overlap does not guarantee zero final matches."
+        )
+    st.markdown("**Selected key mapping**")
+    st.table(
+        [
+            {
+                "Key mapping": " / ".join(f"{a} ↔ {b}" for a, b in key.key_pairs),
+                "Eligible A / total A": f"{key.eligible_row_count_a} / {key.row_count_a}",
+                "Eligible B / total B": f"{key.eligible_row_count_b} / {key.row_count_b}",
+                "Overlap rows A / eligible A": (
+                    f"{key.overlap_row_count_a} / {key.eligible_row_count_a}"
+                ),
+                "Overlap rows B / eligible B": (
+                    f"{key.overlap_row_count_b} / {key.eligible_row_count_b}"
+                ),
+                "Distinct overlapping keys": key.overlap_distinct_count,
+                "Duplicate excess A": key.duplicate_excess_count_a,
+                "Duplicate excess B": key.duplicate_excess_count_b,
+            }
+        ]
+    )
+    st.caption(
+        "Duplicate excess counts eligible rows beyond one per distinct baseline key; "
+        "it is not the number of distinct duplicated keys."
+    )
+    st.markdown("**Selected amount mapping**")
+    st.table(
+        [
+            {
+                "File A column": amount.column_a,
+                "File B column": amount.column_b,
+                "Parseable A / total A": f"{amount.parseable_count_a} / {amount.row_count_a}",
+                "Parseable B / total B": f"{amount.parseable_count_b} / {amount.row_count_b}",
+            }
+        ]
+    )
+    warnings = _configuration_warnings(key, amount, mode)
+    for warning in warnings:
+        st.warning(warning)
+    if not warnings:
+        st.caption("No baseline warnings were detected. This does not verify the mapping.")
+
+
 def _show_evidence(rows: tuple[SourceRecord, ...], source: Source) -> None:
     st.subheader(f"File {source.value} evidence")
     if not rows:
@@ -1720,6 +1884,7 @@ def main() -> None:
         _clear_result()
         _clear_discovery_ui()
         st.session_state.pop("_discovery_pair", None)
+        st.session_state.pop("_configuration_evidence", None)
         st.info("Upload both files and select any required worksheets to map their columns.")
         return
     columns_a, columns_b = file_a.columns, file_b.columns
@@ -1821,6 +1986,7 @@ def main() -> None:
             key="download_profile",
             on_click="ignore",
         )
+    _show_configuration_diagnostics(file_a, file_b, mapping, mode, key_normalization)
     if st.button(
         "Run reconciliation",
         type="primary",

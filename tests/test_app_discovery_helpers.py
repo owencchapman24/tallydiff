@@ -6,10 +6,18 @@ from decimal import Decimal
 import pytest
 
 import tallydiff.app as ui
-from tallydiff import IngestionError, ReconciliationMode, Source
+from tallydiff import (
+    ColumnMapping,
+    ComparisonFieldMapping,
+    IngestionError,
+    ReconciliationMode,
+    Source,
+)
 from tallydiff.discovery import (
+    AmountCompatibility,
     AmountMappingSuggestion,
     AmountSuggestionResult,
+    KeyCompatibility,
     KeyMappingSuggestion,
     KeySuggestionResult,
     compare_amount_columns,
@@ -496,3 +504,390 @@ def test_amount_rows_show_exact_decimal_totals_and_signed_control_difference():
         }
     ]
     assert ui._amount_candidate_rows(AmountSuggestionResult((), 0, 1)) == []
+
+
+def _threshold_facts(
+    *,
+    total_a=100,
+    total_b=100,
+    eligible_a=None,
+    eligible_b=None,
+    overlap_a=None,
+    overlap_b=None,
+    duplicate_a=0,
+    duplicate_b=0,
+    parseable_a=None,
+    parseable_b=None,
+):
+    eligible_a = total_a if eligible_a is None else eligible_a
+    eligible_b = total_b if eligible_b is None else eligible_b
+    overlap_a = min(eligible_a, eligible_b) if overlap_a is None else overlap_a
+    overlap_b = min(eligible_a, eligible_b) if overlap_b is None else overlap_b
+    distinct_a = eligible_a - duplicate_a
+    distinct_b = eligible_b - duplicate_b
+    distinct_overlap = min(overlap_a, overlap_b, distinct_a, distinct_b)
+    parseable_a = total_a if parseable_a is None else parseable_a
+    parseable_b = total_b if parseable_b is None else parseable_b
+    total_amount_a = Decimal(0) if total_a and parseable_a == total_a else None
+    total_amount_b = Decimal(0) if total_b and parseable_b == total_b else None
+    return (
+        KeyCompatibility(
+            key_pairs=(("id", "id"),),
+            row_count_a=total_a,
+            row_count_b=total_b,
+            eligible_row_count_a=eligible_a,
+            eligible_row_count_b=eligible_b,
+            distinct_key_count_a=distinct_a,
+            distinct_key_count_b=distinct_b,
+            duplicate_excess_count_a=duplicate_a,
+            duplicate_excess_count_b=duplicate_b,
+            overlap_distinct_count=distinct_overlap,
+            overlap_row_count_a=overlap_a,
+            overlap_row_count_b=overlap_b,
+            only_a_distinct_count=distinct_a - distinct_overlap,
+            only_b_distinct_count=distinct_b - distinct_overlap,
+        ),
+        AmountCompatibility(
+            column_a="amount",
+            column_b="amount",
+            row_count_a=total_a,
+            row_count_b=total_b,
+            parseable_count_a=parseable_a,
+            parseable_count_b=parseable_b,
+            blank_count_a=0,
+            blank_count_b=0,
+            total_a=total_amount_a,
+            total_b=total_amount_b,
+            control_difference=(
+                Decimal(0) if total_amount_a is not None and total_amount_b is not None else None
+            ),
+        ),
+    )
+
+
+def _warnings_containing(warnings, text):
+    return tuple(warning for warning in warnings if text.casefold() in warning.casefold())
+
+
+@pytest.mark.parametrize(
+    "total,overlap,warn",
+    [
+        (100, 9, True),
+        (100, 10, False),
+        (100, 11, False),
+        (10**30, 10**29 - 1, True),
+        (10**30, 10**29, False),
+        (10**30, 10**29 + 1, False),
+    ],
+)
+def test_configuration_low_overlap_threshold_is_strict_and_exact_at_large_integers(
+    total, overlap, warn
+):
+    key, amount = _threshold_facts(
+        total_a=total, total_b=total, overlap_a=overlap, overlap_b=overlap
+    )
+    warnings = ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE)
+    low = _warnings_containing(warnings, "very low baseline overlap")
+    assert bool(low) is warn
+    assert len(warnings) == int(warn)
+    if low:
+        assert f"File A {overlap} / {total}" in low[0]
+        assert f"File B {overlap} / {total}" in low[0]
+        assert "legitimate" in low[0]
+    assert warnings == ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE)
+
+
+@pytest.mark.parametrize("totals", [(1000, 100), (100, 1000)])
+@pytest.mark.parametrize("overlap", [10, 90])
+def test_configuration_low_overlap_requires_both_directions_below_ten_percent(totals, overlap):
+    key, amount = _threshold_facts(
+        total_a=totals[0], total_b=totals[1], overlap_a=overlap, overlap_b=overlap
+    )
+    assert ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE) == ()
+
+
+@pytest.mark.parametrize("eligible_a,eligible_b", [(0, 3), (3, 0), (0, 0)])
+def test_configuration_zero_eligible_rows_do_not_also_warn_about_overlap(eligible_a, eligible_b):
+    key, amount = _threshold_facts(
+        total_a=3, total_b=3, eligible_a=eligible_a, eligible_b=eligible_b
+    )
+    warnings = ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE)
+    assert not _warnings_containing(warnings, "baseline overlap")
+    no_eligible = _warnings_containing(warnings, "no eligible baseline key rows")
+    poor = _warnings_containing(warnings, "poor baseline key eligibility")
+    expected_sides = [
+        side for side, eligible in (("A", eligible_a), ("B", eligible_b)) if not eligible
+    ]
+    assert len(no_eligible) == len(poor) == len(expected_sides)
+    for side, warning in zip(expected_sides, no_eligible, strict=True):
+        assert f"File {side}" in warning and "0 / 3" in warning
+
+
+def test_configuration_zero_overlap_with_eligible_rows_is_advisory_and_excludes_low_warning():
+    key, amount = _threshold_facts(total_a=3, total_b=3, overlap_a=0, overlap_b=0)
+    warnings = ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE)
+    assert len(warnings) == 1
+    assert "no exact baseline overlap" in warnings[0]
+    assert "nonoverlapping source populations" in warnings[0]
+    assert "not proof" in warnings[0]
+    assert not _warnings_containing(warnings, "very low")
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize(
+    "total,eligible,warn",
+    [
+        (10, 8, True),
+        (10, 9, False),
+        (10, 10, False),
+        (10**30, 9 * 10**29 - 1, True),
+        (10**30, 9 * 10**29, False),
+        (10**30, 9 * 10**29 + 1, False),
+    ],
+)
+def test_configuration_poor_eligibility_threshold_is_strict_per_side_and_exact(
+    side, total, eligible, warn
+):
+    key, amount = _threshold_facts(total_a=total, total_b=total, **{f"eligible_{side}": eligible})
+    warnings = ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE)
+    poor = _warnings_containing(warnings, "poor baseline key eligibility")
+    assert bool(poor) is warn
+    assert len(warnings) == int(warn)
+    if poor:
+        assert f"File {side.upper()}" in poor[0]
+        assert f"{eligible} / {total}" in poor[0]
+
+
+@pytest.mark.parametrize("mode", list(ReconciliationMode))
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_configuration_duplicate_excess_warning_is_unique_specific_and_avoids_mode_advice(
+    mode, side
+):
+    key, amount = _threshold_facts(
+        total_a=10,
+        total_b=10,
+        duplicate_a=9 if side == "a" else 0,
+        duplicate_b=9 if side == "b" else 0,
+        overlap_a=10 if side == "a" else 1,
+        overlap_b=10 if side == "b" else 1,
+    )
+    warnings = ui._configuration_warnings(key, amount, mode)
+    duplicate = _warnings_containing(warnings, "duplicate keys may produce ambiguous findings")
+    assert bool(duplicate) is (mode is ReconciliationMode.UNIQUE)
+    assert len(warnings) == int(mode is ReconciliationMode.UNIQUE)
+    if duplicate:
+        assert "duplicate excess" in duplicate[0]
+        assert f"File {side.upper()} 9" in duplicate[0]
+        assert "does not establish" in duplicate[0]
+
+
+@pytest.mark.parametrize("totals", [(0, 0), (0, 3), (3, 0)])
+def test_configuration_empty_tables_generate_no_misleading_overlap_or_eligibility_warning(totals):
+    key, amount = _threshold_facts(total_a=totals[0], total_b=totals[1])
+    assert ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE) == ()
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("parseable", [0, 1])
+def test_configuration_amount_warning_identifies_each_affected_side_and_exact_counts(
+    side, parseable
+):
+    key, amount = _threshold_facts(total_a=2, total_b=2, **{f"parseable_{side}": parseable})
+    warnings = ui._configuration_warnings(key, amount, ReconciliationMode.UNIQUE)
+    assert len(warnings) == 1
+    assert "values incompatible with amount parsing" in warnings[0]
+    assert f"File {side.upper()}" in warnings[0]
+    assert f"{parseable} / 2" in warnings[0]
+    assert "ingestion validation" in warnings[0] and "Run" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "difference", [Decimal(0), Decimal("0.000001"), Decimal("999999999999999")]
+)
+def test_configuration_warnings_ignore_control_total_equality_and_proximity(difference):
+    key, amount = _threshold_facts()
+    changed = replace(amount, total_a=difference, total_b=Decimal(0), control_difference=difference)
+    assert ui._configuration_warnings(key, changed, ReconciliationMode.UNIQUE) == ()
+
+
+def _configuration_inputs():
+    data = b"first,second,third,amount,alternate,secondary\nV1,I1,L1,10,100,x\nV1,I1,L2,20,200,y\n"
+    return _input(Source.A, data), _input(Source.B, data)
+
+
+def _selected_mapping():
+    return ColumnMapping(
+        (("first", "first"), ("second", "second"), ("third", "third")), "amount", "amount"
+    )
+
+
+def _record_configuration_comparisons(monkeypatch):
+    calls = []
+    original_key = ui.compare_key_mapping
+    original_amount = ui.compare_amount_columns
+
+    def key(a, b, *, key_pairs):
+        calls.append(("key", key_pairs))
+        return original_key(a, b, key_pairs=key_pairs)
+
+    def amount(a, b, *, column_a, column_b):
+        calls.append(("amount", column_a, column_b))
+        return original_amount(a, b, column_a=column_a, column_b=column_b)
+
+    monkeypatch.setattr(ui, "compare_key_mapping", key)
+    monkeypatch.setattr(ui, "compare_amount_columns", amount)
+    return calls
+
+
+def test_configuration_cache_uses_exact_selected_identity_and_reuses_baseline_facts(
+    state, monkeypatch
+):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_configuration_comparisons(monkeypatch)
+    evidence = ui._cached_configuration_evidence(file_a, file_b, mapping)
+    assert evidence is state["_configuration_evidence"]
+    assert evidence.identity == (
+        (Source.A, file_a.data, "csv", None),
+        (Source.B, file_b.data, "csv", None),
+        mapping.key_pairs,
+        "amount",
+        "amount",
+    )
+    assert evidence.key == compare_key_mapping(
+        file_a.discovery, file_b.discovery, key_pairs=mapping.key_pairs
+    )
+    assert evidence.amount == compare_amount_columns(
+        file_a.discovery, file_b.discovery, column_a="amount", column_b="amount"
+    )
+    assert len(evidence.key.key_pairs) == 3
+    ownership = _completed_state(state)
+    suggestion_bundle = object()
+    state["_discovery_pair"] = suggestion_bundle
+    for mode in ReconciliationMode:
+        state.update(reconciliation_mode=mode, amount_tolerance="-invalid", norm_casefold_0=True)
+        assert ui._cached_configuration_evidence(file_a, file_b, mapping) is evidence
+        assert (
+            ui._cached_configuration_evidence(
+                replace(file_a, name="renamed.csv"), replace(file_b, name="other.csv"), mapping
+            )
+            is evidence
+        )
+    with_comparison = replace(
+        mapping, comparison_fields=(ComparisonFieldMapping("secondary", "secondary"),)
+    )
+    assert ui._cached_configuration_evidence(file_a, file_b, with_comparison) is evidence
+    assert calls == [("key", mapping.key_pairs), ("amount", "amount", "amount")]
+    assert all(state[key] is value for key, value in ownership.items())
+    assert state["_discovery_pair"] is suggestion_bundle
+
+
+def test_configuration_cache_replaces_ordered_keys_and_either_selected_amount(state, monkeypatch):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_configuration_comparisons(monkeypatch)
+    previous = ui._cached_configuration_evidence(file_a, file_b, mapping)
+    variants = (
+        replace(mapping, key_pairs=tuple(reversed(mapping.key_pairs))),
+        replace(mapping, amount_a="alternate"),
+        replace(mapping, amount_b="alternate"),
+        replace(mapping, key_pairs=(("second", "second"),)),
+    )
+    for selected in variants:
+        current = ui._cached_configuration_evidence(file_a, file_b, selected)
+        assert current is not previous
+        assert state["_configuration_evidence"] is current
+        assert current.identity[-3:] == (selected.key_pairs, selected.amount_a, selected.amount_b)
+        assert current.key == compare_key_mapping(
+            file_a.discovery, file_b.discovery, key_pairs=selected.key_pairs
+        )
+        previous = current
+    assert len(calls) == 2 * (len(variants) + 1)
+    assert {key for key in state if key.startswith("_configuration_")} == {
+        "_configuration_evidence"
+    }
+
+
+def test_configuration_cache_recomputes_for_bytes_format_or_worksheet_changes(
+    state, monkeypatch, xlsx_bytes
+):
+    file_a = _input(Source.A, b"id,amount\nA,1\n")
+    file_b = _input(Source.B, b"id,amount\nA,1\n")
+    mapping = ColumnMapping((("id", "id"),), "amount", "amount")
+    calls = _record_configuration_comparisons(monkeypatch)
+    previous = ui._cached_configuration_evidence(file_a, file_b, mapping)
+    data = xlsx_bytes({"One": [["id", "amount"], ["A", 1]], "Two": [["id", "amount"], ["A", 1]]})
+    sources = (
+        _input(Source.B, b"id,amount\nA,2\n"),
+        _input(Source.B, data, input_format="xlsx", worksheet="One"),
+        _input(Source.B, data, input_format="xlsx", worksheet="Two"),
+    )
+    for changed_b in sources:
+        current = ui._cached_configuration_evidence(file_a, changed_b, mapping)
+        assert current is not previous
+        assert current.identity[1] == (
+            Source.B,
+            changed_b.data,
+            changed_b.input_format,
+            changed_b.worksheet,
+        )
+        assert ui._cached_configuration_evidence(file_a, changed_b, mapping) is current
+        previous = current
+    changed_a = _input(Source.A, b"id,amount\nA,9\n")
+    current = ui._cached_configuration_evidence(changed_a, sources[-1], mapping)
+    assert current is not previous
+    assert current.identity[0] == (Source.A, changed_a.data, "csv", None)
+    assert len(calls) == 10
+
+
+def test_invalid_selected_configuration_evicts_cache_without_comparison_or_result_changes(
+    state, monkeypatch
+):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_configuration_comparisons(monkeypatch)
+    ownership = _completed_state(state)
+    invalid = (
+        replace(mapping, key_pairs=((None, "first"),)),
+        replace(mapping, key_pairs=(("first", "first"), ("first", "second"))),
+        replace(mapping, amount_a=None),
+        replace(mapping, amount_b="missing"),
+        replace(mapping, comparison_fields=(ComparisonFieldMapping("amount", "secondary"),)),
+        replace(mapping, comparison_fields=(ComparisonFieldMapping("secondary", None),)),
+    )
+    for selected in invalid:
+        assert ui._cached_configuration_evidence(file_a, file_b, mapping) is not None
+        previous_count = len(calls)
+        assert ui._cached_configuration_evidence(file_a, file_b, selected) is None
+        assert "_configuration_evidence" not in state
+        assert len(calls) == previous_count
+        assert all(state[key] is value for key, value in ownership.items())
+
+
+@pytest.mark.parametrize("reset_discovery", [True, False])
+def test_configuration_cache_survives_result_clear_and_profile_reset_but_not_source_reset(
+    state, reset_discovery
+):
+    file_a, file_b = _configuration_inputs()
+    selected = ui._cached_configuration_evidence(file_a, file_b, _selected_mapping())
+    _completed_state(state)
+    ui._clear_result()
+    assert state["_configuration_evidence"] is selected
+    ui._reset_mapping(reset_discovery=reset_discovery)
+    if reset_discovery:
+        assert "_configuration_evidence" not in state
+    else:
+        assert state["_configuration_evidence"] is selected
+        mapping = _selected_mapping()
+        state["key_count"] = len(mapping.key_pairs)
+        for index, (left, right) in enumerate(mapping.key_pairs):
+            state[f"map_key_a_{index}"] = left
+            state[f"map_key_b_{index}"] = right
+        state.update(
+            map_amount_a=mapping.amount_a,
+            map_amount_b=mapping.amount_b,
+            reconciliation_mode=ReconciliationMode.GROUPED_BY_KEY,
+            amount_tolerance="0.01",
+            norm_casefold_0=True,
+        )
+        assert ui._cached_configuration_evidence(file_a, file_b, mapping) is selected
