@@ -914,3 +914,467 @@ def test_profile_changing_only_mode_and_tolerance_reuses_selected_baseline_evide
     assert selected_evidence_calls == {}
     assert app.radio(key="reconciliation_mode").value is ReconciliationMode.GROUPED_BY_KEY
     assert app.text_input(key="amount_tolerance").value == "0.0100"
+
+
+def _possible_csv(header, rows):
+    import csv
+    from io import StringIO
+
+    stream = StringIO(newline="")
+    writer = csv.writer(stream)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return stream.getvalue().encode("utf-8")
+
+
+def _possible_data():
+    return (
+        _possible_csv(
+            ["vendor", "invoice", "amount", "other_amount"],
+            [["Vendor-17", "INV-002", "10", "100"], ["Exact", "SAME", "5", "500"]],
+        ),
+        _possible_csv(
+            ["supplier", "ref", "gross", "other_gross"],
+            [["Vendor-17", "INV-003", "9", "100"], ["Exact", "SAME", "5", "500"]],
+        ),
+    )
+
+
+def _possible_app():
+    app = _uploaded_app(*_possible_data())
+    _set_pairs(
+        app,
+        (("vendor", "supplier"), ("invoice", "ref")),
+        amount_a="amount",
+        amount_b="gross",
+    )
+    return app
+
+
+def _possible_button(app):
+    return next(
+        (button for button in app.button if button.label == "Inspect possible key differences"),
+        None,
+    )
+
+
+def _possible_cache(app):
+    return app.session_state["_possible_key_differences"]
+
+
+def _possible_table(app):
+    return next(
+        (frame.value for frame in app.dataframe if "File A baseline key" in frame.value.columns),
+        None,
+    )
+
+
+def _possible_messages(app):
+    active = False
+    messages = []
+    for element in app._tree:
+        if getattr(element, "type", None) == "subheader":
+            active = element.value == "Possible key differences — advisory"
+        if (
+            getattr(element, "type", None) == "markdown"
+            and element.value.strip("# ") == "Possible key differences — advisory"
+        ):
+            active = True
+        if active and getattr(element, "type", None) in (
+            "caption",
+            "text",
+            "info",
+            "warning",
+            "markdown",
+        ):
+            messages.append(element.value)
+        if active and getattr(element, "key", None) == "run":
+            break
+    return "\n".join(messages)
+
+
+def _inspect_possible(app):
+    _possible_button(app).click().run()
+    assert not app.exception
+    return _possible_cache(app)
+
+
+@pytest.fixture
+def possible_search_calls(monkeypatch):
+    calls = []
+    original = discovery.find_possible_key_differences
+
+    def record(a, b, *, key_pairs):
+        calls.append((a, b, tuple(key_pairs)))
+        return original(a, b, key_pairs=key_pairs)
+
+    monkeypatch.setattr(discovery, "find_possible_key_differences", record)
+    return calls
+
+
+def test_possible_difference_search_requires_an_explicit_request_and_valid_composite(
+    possible_search_calls,
+):
+    app = _uploaded_app(DATA_A, DATA_B)
+    assert _possible_button(app) is None
+    _simple_mapping(app)
+    assert _possible_button(app) is None
+    assert "composite key" in _possible_messages(app).lower()
+    app.button(key="add_key").click().run()
+    assert _possible_button(app) is None
+    app.selectbox(key="map_key_a_1").set_value("amount")
+    app.selectbox(key="map_key_b_1").set_value("amount").run()
+    assert _possible_button(app) is not None
+    assert possible_search_calls == []
+    assert _possible_table(app) is None
+    assert "_possible_key_differences" not in app.session_state
+    _assert_no_result(app)
+
+
+def test_possible_difference_table_shows_one_component_and_excludes_exact_keys(
+    possible_search_calls,
+):
+    import json
+
+    app = _possible_app()
+    mappings = _map_values(app)
+    suggestions = _bundle(app)
+    evidence = _configuration_evidence(app)
+    cached = _inspect_possible(app)
+    assert len(possible_search_calls) == 1
+    assert cached.result.evaluated
+    assert cached.result.total_candidate_count == 1
+    assert not cached.result.display_truncated
+    table = _possible_table(app)
+    assert len(table) == 1
+    row = table.iloc[0]
+    assert json.loads(row["File A baseline key"]) == ["Vendor-17", "INV-002"]
+    assert json.loads(row["File B baseline key"]) == ["Vendor-17", "INV-003"]
+    assert "invoice" in row["Differing key component"] and "ref" in row["Differing key component"]
+    assert "Vendor-17" in row["Exact shared-component evidence"]
+    assert "Exact" not in row["File A baseline key"]
+    messages = _possible_messages(app).lower()
+    assert "possible key differences, not verified matches" in messages
+    assert "same transaction" in messages
+    assert "repeat" in messages or "exactly once" in messages
+    assert _map_values(app) == mappings
+    assert _bundle(app) is suggestions
+    assert _configuration_evidence(app) is evidence
+    assert len(app.dataframe) == 1
+    _assert_no_result(app)
+
+
+def test_possible_difference_ui_preserves_complete_three_component_unicode_keys():
+    import json
+
+    vendor = "Vendor | / é\n17"
+    period = "October | 2026"
+    key_a = [vendor, 'INV-002 "quoted"', period]
+    key_b = [vendor, 'INV-003 "quoted"', period]
+    app = _uploaded_app(
+        _possible_csv(["vendor", "invoice", "period", "amount"], [[*key_a, "10"]]),
+        _possible_csv(["supplier", "ref", "month", "gross"], [[*key_b, "9"]]),
+    )
+    _set_pairs(
+        app,
+        (("vendor", "supplier"), ("invoice", "ref"), ("period", "month")),
+        amount_a="amount",
+        amount_b="gross",
+    )
+    result = _inspect_possible(app).result
+    assert result.total_candidate_count == 1
+    assert result.candidates[0].component_index == 1
+    row = _possible_table(app).iloc[0]
+    assert json.loads(row["File A baseline key"]) == key_a
+    assert json.loads(row["File B baseline key"]) == key_b
+    assert "period" in row["Exact shared-component evidence"]
+    assert "month" in row["Exact shared-component evidence"]
+
+
+def test_possible_difference_ui_supports_mixed_csv_xlsx_observations(xlsx_bytes):
+    data_b = xlsx_bytes({"Data": [["supplier", "ref", "gross"], ["Vendor-17", "INV-003", 9]]})
+    app = _uploaded_app(_possible_data()[0], data_b, name_b="ledger.xlsx")
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    result = _inspect_possible(app).result
+    assert result.total_candidate_count == 1
+    assert result.candidates[0].key_a == ("Vendor-17", "INV-002")
+    assert result.candidates[0].key_b == ("Vendor-17", "INV-003")
+
+
+def test_possible_difference_ambiguity_is_disclosed_without_manufacturing_candidates():
+    app = _uploaded_app(
+        b"vendor,invoice,amount\nV1,A1,10\n",
+        b"supplier,ref,gross\nV1,B1,9\nV1,B2,8\n",
+    )
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    result = _inspect_possible(app).result
+    assert result.ambiguity_suppressed
+    assert result.total_candidate_count == 0
+    assert _possible_table(app) is None
+    assert "ambigu" in _possible_messages(app).lower()
+
+
+def test_superficially_similar_keys_are_not_a_possible_difference_when_two_components_differ():
+    app = _uploaded_app(
+        b"vendor,invoice,amount\nVendor-17,INV-002,10\n",
+        b"supplier,ref,gross\nVendor-18,INV-003,9\n",
+    )
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    result = _inspect_possible(app).result
+    assert result.evaluated
+    assert result.total_candidate_count == 0
+    assert _possible_table(app) is None
+    messages = _possible_messages(app).lower()
+    assert "not evaluated" not in messages
+    assert any(phrase in messages for phrase in ("no qualifying", "no candidates", "no possible"))
+    assert "not verified matches" in messages
+
+
+def test_possible_difference_table_is_limited_to_twenty_with_exact_total_count():
+    import json
+
+    app = _uploaded_app(
+        _possible_csv(
+            ["vendor", "invoice", "amount"],
+            [[f"V{index:02}", f"A{index:02}", "10"] for index in range(21)],
+        ),
+        _possible_csv(
+            ["supplier", "ref", "gross"],
+            [[f"V{index:02}", f"B{index:02}", "9"] for index in range(21)],
+        ),
+    )
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    result = _inspect_possible(app).result
+    assert result.evaluated and result.display_truncated
+    assert result.total_candidate_count == 21
+    table = _possible_table(app)
+    assert len(table) == 20
+    assert json.loads(table.iloc[0]["File A baseline key"]) == ["V00", "A00"]
+    assert json.loads(table.iloc[-1]["File A baseline key"]) == ["V19", "A19"]
+    messages = _possible_messages(app).lower()
+    assert "21" in messages and "20" in messages
+    assert "truncat" in messages or "first 20" in messages
+
+
+@pytest.mark.parametrize(
+    "reason,signature_count", [("source_row_limit", None), ("signature_entry_limit", 100001)]
+)
+def test_possible_difference_resource_skip_is_not_reported_as_no_candidates(
+    monkeypatch, reason, signature_count
+):
+    def skipped(a, b, *, key_pairs):
+        return discovery.PossibleKeyDifferenceResult(
+            tuple(key_pairs), (), 0, False, False, reason, False, signature_count
+        )
+
+    monkeypatch.setattr(discovery, "find_possible_key_differences", skipped)
+    app = _possible_app()
+    result = _inspect_possible(app).result
+    assert not result.evaluated
+    assert result.skip_reason == reason
+    assert _possible_table(app) is None
+    assert "not evaluated" in _possible_messages(app).lower()
+
+
+def test_requested_possible_difference_cache_ignores_unrelated_mapping_settings(
+    possible_search_calls,
+):
+    app = _possible_app()
+    cached = _inspect_possible(app)
+    app.run()
+    app.selectbox(key="map_amount_a").set_value("other_amount").run()
+    app.selectbox(key="map_amount_b").set_value("other_gross").run()
+    app.radio(key="reconciliation_mode").set_value(ReconciliationMode.GROUPED_BY_KEY).run()
+    app.text_input(key="amount_tolerance").set_value("0.0100").run()
+    app.checkbox(key="norm_casefold_0").set_value(True).run()
+    assert len(possible_search_calls) == 1
+    assert _possible_cache(app) is cached
+    assert len(_possible_table(app)) == 1
+    messages = _possible_messages(app).lower()
+    assert "normalization" in messages and "baseline" in messages
+    assert "may differ" in messages or "may not reflect" in messages
+
+
+def test_profile_changes_excluded_settings_without_repeating_possible_difference_search(
+    possible_search_calls,
+):
+    app = _possible_app()
+    cached = _inspect_possible(app)
+    mapping = ColumnMapping(
+        (("vendor", "supplier"), ("invoice", "ref")), "other_amount", "other_gross"
+    )
+    profile = export_mapping_profile(
+        mapping,
+        amount_tolerance=Decimal("0.01"),
+        reconciliation_mode=ReconciliationMode.GROUPED_BY_KEY,
+    )
+    app.file_uploader(key="profile_upload").set_value(
+        ("mapping.json", profile, "application/json")
+    ).run()
+    app.button(key="apply_profile").click().run()
+    assert not app.exception
+    assert _possible_cache(app) is cached
+    assert len(possible_search_calls) == 1
+    assert len(_possible_table(app)) == 1
+
+
+def test_ordered_key_mapping_changes_hide_previous_search_until_explicitly_requested(
+    possible_search_calls,
+):
+    app = _possible_app()
+    first = _inspect_possible(app)
+    app.selectbox(key="map_key_a_0").set_value("invoice")
+    app.selectbox(key="map_key_b_0").set_value("ref")
+    app.selectbox(key="map_key_a_1").set_value("vendor")
+    app.selectbox(key="map_key_b_1").set_value("supplier").run()
+    assert _possible_table(app) is None
+    assert "_possible_key_differences" not in app.session_state
+    assert len(possible_search_calls) == 1
+    second = _inspect_possible(app)
+    assert second.identity != first.identity
+    assert second.result.candidates[0].component_index == 0
+    assert len(possible_search_calls) == 2
+
+
+def test_invalid_configuration_clears_requested_possible_difference_output(possible_search_calls):
+    app = _possible_app()
+    _inspect_possible(app)
+    app.selectbox(key="map_amount_a").set_value(None).run()
+    assert _possible_button(app) is None
+    assert _possible_table(app) is None
+    assert "_possible_key_differences" not in app.session_state
+    app.selectbox(key="map_amount_a").set_value("amount").run()
+    assert _possible_table(app) is None
+    assert _possible_button(app) is not None
+    assert len(possible_search_calls) == 1
+
+
+def test_source_changes_clear_requested_possible_difference_output(possible_search_calls):
+    app = _possible_app()
+    _inspect_possible(app)
+    changed = _possible_data()[0].replace(b"INV-002", b"INV-004")
+    app.file_uploader(key="upload_A").set_value(("changed.csv", changed, "text/csv")).run()
+    assert "_possible_key_differences" not in app.session_state
+    assert _possible_table(app) is None
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    assert _possible_table(app) is None
+    assert len(possible_search_calls) == 1
+    assert _inspect_possible(app).result.candidates[0].key_a == ("Vendor-17", "INV-004")
+    assert len(possible_search_calls) == 2
+
+
+def test_worksheet_changes_clear_requested_possible_difference_output(
+    xlsx_bytes, possible_search_calls
+):
+    data = xlsx_bytes(
+        {
+            "One": [["supplier", "ref", "gross"], ["Vendor-17", "INV-003", 9]],
+            "Two": [["supplier", "ref", "gross"], ["Vendor-17", "INV-005", 9]],
+        }
+    )
+    app = _uploaded_app(_possible_data()[0], data, name_b="multi.xlsx")
+    _worksheet(app, "B").set_value("One").run()
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    first = _inspect_possible(app)
+    _worksheet(app, "B").set_value("Two").run()
+    assert "_possible_key_differences" not in app.session_state
+    assert _possible_table(app) is None
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    assert len(possible_search_calls) == 1
+    second = _inspect_possible(app)
+    assert second.identity != first.identity
+    assert second.result.candidates[0].key_b == ("Vendor-17", "INV-005")
+
+
+def test_inspecting_possible_differences_preserves_results_annotations_and_prepared_downloads(
+    monkeypatch,
+):
+    from test_app import _exception_table
+
+    from tallydiff import ReviewDisposition
+
+    app = _possible_app()
+    app.button(key="run").click().run()
+    table = _exception_table(app)
+    app.session_state[table.key] = {"selection": {"rows": [0], "columns": [], "cells": []}}
+    app.run()
+    next(widget for widget in app.selectbox if widget.label == "Analyst disposition").set_value(
+        ReviewDisposition.NEEDS_FOLLOW_UP
+    ).run()
+    next(widget for widget in app.text_area if widget.label == "Analyst note").set_value(
+        "Investigate source document"
+    )
+    next(button for button in app.button if button.label == "Save note").click().run()
+    next(
+        button for button in app.button if button.label == "Prepare review downloads"
+    ).click().run()
+    completed = app.session_state["completed"]
+    runtime = app.session_state[ui._REVIEW_STATE_KEY]
+    binding = app.session_state[ui._REVIEW_BINDING_KEY]
+    annotations = runtime.snapshot()
+    prepared = app.session_state[ui._REVIEW_PREPARED_KEY]
+    mappings = _map_values(app)
+    suggestions = _bundle(app)
+    evidence = _configuration_evidence(app)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("inspection must not ingest, reconcile, or rebind review")
+
+    for name in ("ingest_csv", "ingest_xlsx", "reconcile", "bind_review_result"):
+        monkeypatch.setattr(f"tallydiff.{name}", fail)
+    assert _inspect_possible(app).result.total_candidate_count == 1
+    assert app.session_state["completed"][1] is completed[1]
+    assert app.session_state[ui._REVIEW_STATE_KEY] is runtime
+    assert app.session_state[ui._REVIEW_BINDING_KEY] is binding
+    assert runtime.snapshot() == annotations
+    assert app.session_state[ui._REVIEW_PREPARED_KEY] is prepared
+    assert _map_values(app) == mappings
+    assert _bundle(app) is suggestions
+    assert _configuration_evidence(app) is evidence
+    assert len(_possible_table(app)) == 1
+    assert not app.button(key="run").disabled
+
+
+def test_possible_difference_dataframe_preserves_markdown_like_keys_as_read_only_text():
+    import json
+
+    vendor = "**bold** [id](https://example.invalid) <b>literal</b> `code` é\nnext"
+    invoice_a = 'INV-002 **A** [left](https://a.invalid) "quoted"'
+    invoice_b = 'INV-003 **B** [right](https://b.invalid) "quoted"'
+    app = _uploaded_app(
+        _possible_csv(["vendor", "invoice", "amount"], [[vendor, invoice_a, "10"]]),
+        _possible_csv(["supplier", "ref", "gross"], [[vendor, invoice_b, "9"]]),
+    )
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    before = _map_values(app)
+    assert _inspect_possible(app).result.total_candidate_count == 1
+    frame = next(frame for frame in app.dataframe if "File A baseline key" in frame.value.columns)
+    assert frame.proto.editing_mode == frame.proto.READ_ONLY
+    assert not frame.proto.selection_mode
+    config = json.loads(frame.proto.columns)
+    assert all(config[column]["type_config"]["type"] == "text" for column in frame.value.columns)
+    row = frame.value.iloc[0]
+    assert json.loads(row["File A baseline key"]) == [vendor, invoice_a]
+    assert json.loads(row["File B baseline key"]) == [vendor, invoice_b]
+    shared = json.loads(row["Exact shared-component evidence"])
+    assert shared == [
+        {"component": 1, "column_a": "vendor", "column_b": "supplier", "value": vendor}
+    ]
+    assert _map_values(app) == before
+    _assert_no_result(app)

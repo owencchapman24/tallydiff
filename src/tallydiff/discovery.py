@@ -764,3 +764,193 @@ def suggest_amount_mappings(
     return AmountSuggestionResult(
         tuple(candidates[: max(max_suggestions, leading_count)]), leading_count, evaluated_count
     )
+
+
+MAX_KEY_DIFFERENCE_ROWS = 25_000
+MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES = 100_000
+MAX_KEY_DIFFERENCE_CANDIDATES = 20
+
+
+@dataclass(frozen=True, slots=True)
+class PossibleKeyDifference:
+    """Two original baseline keys requiring investigation, never established matches."""
+
+    key_a: tuple[str, ...]
+    key_b: tuple[str, ...]
+    component_index: int
+    column_a: str
+    column_b: str
+
+
+@dataclass(frozen=True, slots=True)
+class PossibleKeyDifferenceResult:
+    """Bounded advisory evidence; a skipped search has no exhaustive candidate count."""
+
+    key_pairs: tuple[tuple[str, str], ...]
+    candidates: tuple[PossibleKeyDifference, ...]
+    total_candidate_count: int
+    display_truncated: bool
+    evaluated: bool
+    skip_reason: str | None
+    ambiguity_suppressed: bool
+    signature_entry_count: int | None
+
+
+def _difference_key_selection(snapshot_a, snapshot_b, key_pairs):
+    """Validate selection with the same order and errors as compare_key_mapping."""
+
+    _validate_snapshot_direction(snapshot_a, snapshot_b)
+    if not isinstance(key_pairs, Sequence) or isinstance(key_pairs, str | bytes | bytearray):
+        raise TypeError("key_pairs must be a sequence of column-name pairs")
+    selections = tuple(key_pairs)
+    if not selections:
+        raise ValueError("select one or more key column pairs")
+    ordinals_a = {column.name: index for index, column in enumerate(snapshot_a.profile.columns)}
+    ordinals_b = {column.name: index for index, column in enumerate(snapshot_b.profile.columns)}
+    pairs = []
+    indices_a = []
+    indices_b = []
+    seen_a = set()
+    seen_b = set()
+    for pair in selections:
+        if not isinstance(pair, Sequence) or isinstance(pair, str | bytes | bytearray):
+            raise TypeError("each key pair must be a sequence of column names")
+        if len(pair) != 2:
+            raise ValueError("each key pair must contain exactly two column names")
+        name_a, name_b = pair
+        index_a = ordinals_a.get(name_a) if isinstance(name_a, str) else None
+        if index_a is None:
+            index_a = _column_index(snapshot_a, name_a)
+        index_b = ordinals_b.get(name_b) if isinstance(name_b, str) else None
+        if index_b is None:
+            index_b = _column_index(snapshot_b, name_b)
+        if name_a in seen_a:
+            raise ValueError("selected File A key columns must be distinct")
+        if name_b in seen_b:
+            raise ValueError("selected File B key columns must be distinct")
+        seen_a.add(name_a)
+        seen_b.add(name_b)
+        pairs.append((name_a, name_b))
+        indices_a.append(index_a)
+        indices_b.append(index_b)
+    return tuple(pairs), tuple(indices_a), tuple(indices_b)
+
+
+def _key_difference_signature_index(keys, prefixes, suffixes):
+    """Index exact omitted-position signatures using bounded prefix/suffix tries.
+
+    Intern IDs are shared across both files. Each transition includes the exact
+    component string, so equality does not rely on a digest or approximate hash.
+    Signatures retain three integers rather than a copy of every remaining key
+    component. All retained nodes and entries are linear in the signature budget.
+    """
+
+    index = {}
+    for key in keys:
+        before = []
+        current = 0
+        for value in key:
+            before.append(current)
+            transition = (current, value)
+            if transition not in prefixes:
+                prefixes[transition] = len(prefixes) + 1
+            current = prefixes[transition]
+        after = [0] * len(key)
+        current = 0
+        for component in range(len(key) - 1, -1, -1):
+            after[component] = current
+            transition = (current, key[component])
+            if transition not in suffixes:
+                suffixes[transition] = len(suffixes) + 1
+            current = suffixes[transition]
+        for component in range(len(key)):
+            signature = (component, before[component], after[component])
+            index.setdefault(signature, []).append(key)
+    return index
+
+
+def find_possible_key_differences(
+    snapshot_a: DiscoverySnapshot,
+    snapshot_b: DiscoverySnapshot,
+    *,
+    key_pairs: Sequence[tuple[str, str]],
+) -> PossibleKeyDifferenceResult:
+    """Find conservative one-component differences in unmatched baseline keys.
+
+    Only occurrence-one keys can be displayed. All unmatched distinct keys,
+    including repeated keys, remain ambiguity evidence. A cross-file signature
+    with multiple distinct keys on either side suppresses every participating
+    endpoint. Multiple partners through different omitted components also
+    suppress an endpoint, even if one of those relationships was already
+    ambiguous or involved a repeated key.
+
+    Row limits precede key counting. The exact unmatched-distinct-key count times
+    cardinality bounds signature construction before either index is built.
+    Results sort by zero-based component index and complete original tuples;
+    only display is truncated, never the qualifying count. Nothing is applied.
+    """
+
+    pairs, indices_a, indices_b = _difference_key_selection(snapshot_a, snapshot_b, key_pairs)
+
+    def skipped(reason, entries=None):
+        return PossibleKeyDifferenceResult(pairs, (), 0, False, False, reason, False, entries)
+
+    if len(pairs) < 2:
+        return skipped("requires_composite_key")
+    if (
+        snapshot_a.profile.row_count > MAX_KEY_DIFFERENCE_ROWS
+        or snapshot_b.profile.row_count > MAX_KEY_DIFFERENCE_ROWS
+    ):
+        return skipped("source_row_limit")
+    counts_a = _key_counts(snapshot_a, indices_a)
+    counts_b = _key_counts(snapshot_b, indices_b)
+    unmatched_a = tuple(key for key in counts_a if key not in counts_b)
+    unmatched_b = tuple(key for key in counts_b if key not in counts_a)
+    entries = (len(unmatched_a) + len(unmatched_b)) * len(pairs)
+    if entries > MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES:
+        return skipped("signature_entry_limit", entries)
+    prefixes = {}
+    suffixes = {}
+    index_a = _key_difference_signature_index(unmatched_a, prefixes, suffixes)
+    index_b = _key_difference_signature_index(unmatched_b, prefixes, suffixes)
+    ambiguous_a = set()
+    ambiguous_b = set()
+    partners_a = {}
+    partners_b = {}
+    provisional = []
+    for signature, keys_a in index_a.items():
+        keys_b = index_b.get(signature)
+        if keys_b is None:
+            continue
+        if len(keys_a) != 1 or len(keys_b) != 1:
+            ambiguous_a.update(keys_a)
+            ambiguous_b.update(keys_b)
+            continue
+        key_a, key_b = keys_a[0], keys_b[0]
+        partners_a.setdefault(key_a, set()).add(key_b)
+        partners_b.setdefault(key_b, set()).add(key_a)
+        provisional.append((signature[0], key_a, key_b))
+    ambiguous_a.update(key for key, partners in partners_a.items() if len(partners) > 1)
+    ambiguous_b.update(key for key, partners in partners_b.items() if len(partners) > 1)
+    qualifying = sorted(
+        (component, key_a, key_b)
+        for component, key_a, key_b in provisional
+        if key_a not in ambiguous_a
+        and key_b not in ambiguous_b
+        and counts_a[key_a] == 1
+        and counts_b[key_b] == 1
+    )
+    candidates = tuple(
+        PossibleKeyDifference(key_a, key_b, component, *pairs[component])
+        for component, key_a, key_b in qualifying[:MAX_KEY_DIFFERENCE_CANDIDATES]
+    )
+    return PossibleKeyDifferenceResult(
+        pairs,
+        candidates,
+        len(qualifying),
+        len(qualifying) > MAX_KEY_DIFFERENCE_CANDIDATES,
+        True,
+        None,
+        bool(ambiguous_a or ambiguous_b),
+        entries,
+    )

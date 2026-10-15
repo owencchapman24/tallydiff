@@ -49,6 +49,9 @@ from tallydiff import (
     reconcile,
 )
 from tallydiff.discovery import (
+    MAX_KEY_DIFFERENCE_CANDIDATES,
+    MAX_KEY_DIFFERENCE_ROWS,
+    MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES,
     AmountCompatibility,
     AmountMappingSuggestion,
     AmountSuggestionResult,
@@ -57,10 +60,12 @@ from tallydiff.discovery import (
     KeyCompatibility,
     KeyMappingSuggestion,
     KeySuggestionResult,
+    PossibleKeyDifferenceResult,
     compare_amount_columns,
     compare_key_mapping,
     discover_csv,
     discover_xlsx,
+    find_possible_key_differences,
     suggest_amount_mappings,
     suggest_key_mappings,
 )
@@ -605,6 +610,7 @@ def _reset_mapping(*, reset_discovery: bool = True) -> None:
     if reset_discovery:
         _clear_discovery_ui()
         st.session_state.pop("_configuration_evidence", None)
+        st.session_state.pop("_possible_key_differences", None)
     for key in list(st.session_state):
         if key.startswith(("map_", "norm_")):
             del st.session_state[key]
@@ -1296,6 +1302,7 @@ def _show_configuration_diagnostics(
 ) -> None:
     evidence = _cached_configuration_evidence(file_a, file_b, mapping)
     if evidence is None:
+        st.session_state.pop("_possible_key_differences", None)
         return
     key, amount = evidence.key, evidence.amount
     st.subheader("Configuration diagnostics — advisory")
@@ -1348,6 +1355,163 @@ def _show_configuration_diagnostics(
         st.warning(warning)
     if not warnings:
         st.caption("No baseline warnings were detected. This does not verify the mapping.")
+    _show_possible_key_differences(file_a, file_b, mapping, key_normalization)
+
+
+@dataclass(frozen=True, slots=True)
+class _PossibleKeyDifferenceCache:
+    identity: tuple[object, ...]
+    result: PossibleKeyDifferenceResult
+
+
+def _possible_key_difference_identity(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> tuple[object, ...] | None:
+    if mapping.problem(file_a.columns, file_b.columns) is not None or len(mapping.key_pairs) < 2:
+        return None
+    return (
+        _discovery_identity(Source.A, file_a.data, file_a.input_format, file_a.worksheet),
+        _discovery_identity(Source.B, file_b.data, file_b.input_format, file_b.worksheet),
+        mapping.key_pairs,
+    )
+
+
+def _current_possible_key_differences(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> _PossibleKeyDifferenceCache | None:
+    """Read or evict the current request without ever starting a search."""
+
+    identity = _possible_key_difference_identity(file_a, file_b, mapping)
+    cached = st.session_state.get("_possible_key_differences")
+    if identity is None or (cached is not None and cached.identity != identity):
+        st.session_state.pop("_possible_key_differences", None)
+        return None
+    return cached
+
+
+def _inspect_possible_key_differences(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> _PossibleKeyDifferenceCache | None:
+    cached = _current_possible_key_differences(file_a, file_b, mapping)
+    if cached is not None:
+        return cached
+    identity = _possible_key_difference_identity(file_a, file_b, mapping)
+    if identity is None:
+        return None
+    cached = _PossibleKeyDifferenceCache(
+        identity,
+        find_possible_key_differences(
+            file_a.discovery, file_b.discovery, key_pairs=mapping.key_pairs
+        ),
+    )
+    st.session_state["_possible_key_differences"] = cached
+    return cached
+
+
+def _possible_key_difference_rows(result: PossibleKeyDifferenceResult) -> list[dict[str, str]]:
+    return [
+        {
+            "File A baseline key": json.dumps(candidate.key_a, ensure_ascii=False),
+            "File B baseline key": json.dumps(candidate.key_b, ensure_ascii=False),
+            "Differing key component": (
+                f"{candidate.component_index + 1}: {candidate.column_a} ↔ {candidate.column_b}"
+            ),
+            "Exact shared-component evidence": json.dumps(
+                [
+                    {"component": index + 1, "column_a": a, "column_b": b, "value": value}
+                    for index, ((a, b), value) in enumerate(
+                        zip(result.key_pairs, candidate.key_a, strict=True)
+                    )
+                    if index != candidate.component_index
+                ],
+                ensure_ascii=False,
+            ),
+        }
+        for candidate in result.candidates
+    ]
+
+
+def _show_possible_key_differences(
+    file_a: _Input,
+    file_b: _Input,
+    mapping: ColumnMapping,
+    key_normalization: KeyNormalizationConfig | None,
+) -> None:
+    cached = _current_possible_key_differences(file_a, file_b, mapping)
+    if mapping.problem(file_a.columns, file_b.columns) is not None:
+        return
+    st.markdown("#### Possible key differences — advisory")
+    if len(mapping.key_pairs) < 2:
+        st.caption(
+            "This diagnostic requires a composite key with at least two selected components."
+        )
+        return
+    st.caption(
+        "These are possible key differences, not verified matches. Agreement on the other "
+        "selected components does not establish that the records represent the same transaction."
+    )
+    st.caption(
+        "Only complete unmatched baseline keys occurring exactly once in their source can be "
+        "displayed. Repeated baseline keys are excluded from display, remain in the original "
+        "source evidence, and can suppress ambiguous relationships."
+    )
+    st.caption(
+        f"Search limits: {MAX_KEY_DIFFERENCE_ROWS:,} rows per file, "
+        f"{MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES:,} combined signature entries, and "
+        f"{MAX_KEY_DIFFERENCE_CANDIDATES} displayed pairs."
+    )
+    if key_normalization is not None:
+        st.caption(
+            "These diagnostics use baseline values before normalization and may not reflect "
+            "final reconciliation behavior."
+        )
+    if st.button("Inspect possible key differences", key="inspect_possible_key_differences"):
+        cached = _inspect_possible_key_differences(file_a, file_b, mapping)
+    if cached is None:
+        return
+    result = cached.result
+    if not result.evaluated:
+        reasons = {
+            "requires_composite_key": "at least two key components are required",
+            "source_row_limit": f"a source exceeds {MAX_KEY_DIFFERENCE_ROWS:,} rows",
+            "signature_entry_limit": (
+                f"more than {MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES:,} combined signature entries "
+                "would be required"
+            ),
+        }
+        st.info(
+            "Possible-key-difference diagnostic was not evaluated: "
+            f"{reasons.get(result.skip_reason, result.skip_reason)}."
+        )
+        return
+    if result.ambiguity_suppressed:
+        st.caption("Cross-file signature ambiguity suppressed possible candidates.")
+    if not result.candidates:
+        st.info(
+            "No qualifying possible key differences were identified. "
+            "This does not verify the data or selected mapping."
+        )
+        return
+    if result.display_truncated:
+        st.caption(
+            f"Showing the first {len(result.candidates)} of {result.total_candidate_count} "
+            "qualifying possible key differences; the display is truncated."
+        )
+    else:
+        st.caption(
+            f"{result.total_candidate_count} qualifying possible key differences identified."
+        )
+    st.caption(
+        "Keys are shown as JSON arrays; quoting and escapes preserve their exact baseline strings."
+    )
+    rows = _possible_key_difference_rows(result)
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        column_config={column: st.column_config.TextColumn() for column in rows[0]},
+        key="possible_key_differences_table",
+    )
 
 
 def _show_evidence(rows: tuple[SourceRecord, ...], source: Source) -> None:
@@ -1885,6 +2049,7 @@ def main() -> None:
         _clear_discovery_ui()
         st.session_state.pop("_discovery_pair", None)
         st.session_state.pop("_configuration_evidence", None)
+        st.session_state.pop("_possible_key_differences", None)
         st.info("Upload both files and select any required worksheets to map their columns.")
         return
     columns_a, columns_b = file_a.columns, file_b.columns

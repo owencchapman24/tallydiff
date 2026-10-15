@@ -891,3 +891,305 @@ def test_configuration_cache_survives_result_clear_and_profile_reset_but_not_sou
             norm_casefold_0=True,
         )
         assert ui._cached_configuration_evidence(file_a, file_b, mapping) is selected
+
+
+def _record_possible_key_searches(monkeypatch):
+    original = ui.find_possible_key_differences
+    calls = []
+
+    def record(file_a, file_b, *, key_pairs):
+        calls.append((file_a, file_b, key_pairs))
+        return original(file_a, file_b, key_pairs=key_pairs)
+
+    monkeypatch.setattr(ui, "find_possible_key_differences", record)
+    return calls
+
+
+def test_possible_key_identity_uses_exact_sources_and_ordered_keys_only(state):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    expected = (
+        (Source.A, file_a.data, "csv", None),
+        (Source.B, file_b.data, "csv", None),
+        mapping.key_pairs,
+    )
+    assert ui._possible_key_difference_identity(file_a, file_b, mapping) == expected
+    renamed_a = replace(file_a, name="renamed.csv")
+    renamed_b = replace(file_b, name="another name.csv")
+    variants = (
+        replace(mapping, amount_a="alternate"),
+        replace(mapping, amount_b="alternate"),
+        replace(mapping, comparison_fields=(ComparisonFieldMapping("secondary", "secondary"),)),
+    )
+    for selected in variants:
+        assert ui._possible_key_difference_identity(renamed_a, renamed_b, selected) == expected
+    reversed_keys = replace(mapping, key_pairs=tuple(reversed(mapping.key_pairs)))
+    assert ui._possible_key_difference_identity(file_a, file_b, reversed_keys) == (
+        *expected[:2],
+        reversed_keys.key_pairs,
+    )
+
+
+def test_possible_key_getter_never_searches_before_inspection(state, monkeypatch):
+    file_a, file_b = _configuration_inputs()
+    calls = _record_possible_key_searches(monkeypatch)
+    ownership = _completed_state(state)
+    for _ in range(3):
+        assert ui._current_possible_key_differences(file_a, file_b, _selected_mapping()) is None
+    assert calls == []
+    assert "_possible_key_differences" not in state
+    assert all(state[key] is value for key, value in ownership.items())
+
+
+def test_possible_key_inspection_caches_one_request_without_changing_other_ownership(
+    state, monkeypatch
+):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_possible_key_searches(monkeypatch)
+    ui._cached_configuration_evidence(file_a, file_b, mapping)
+    ownership = _completed_state(state)
+    state.update(
+        key_count=3,
+        map_key_a_0="first",
+        map_key_b_0="first",
+        map_amount_a="amount",
+        map_amount_b="amount",
+        norm_casefold_0=True,
+        reconciliation_mode=ReconciliationMode.UNIQUE,
+        amount_tolerance="0.01",
+        _discovery_pair=object(),
+        discovery_key_candidate=1,
+        discovery_amount_candidate=2,
+        _discovery_notice="existing notice",
+        unrelated=object(),
+    )
+    before = dict(state)
+    selected = ui._inspect_possible_key_differences(file_a, file_b, mapping)
+    holder = state["_possible_key_differences"]
+    assert holder is selected
+    assert holder.identity == ui._possible_key_difference_identity(file_a, file_b, mapping)
+    assert selected.result.evaluated and selected.result.total_candidate_count == 0
+    assert ui._current_possible_key_differences(file_a, file_b, mapping) is selected
+    assert ui._inspect_possible_key_differences(file_a, file_b, mapping) is selected
+    assert calls == [(file_a.discovery, file_b.discovery, mapping.key_pairs)]
+    assert all(state[key] is value for key, value in before.items())
+    assert all(state[key] is value for key, value in ownership.items())
+    assert {key for key in state if key.startswith("_possible_key_")} == {
+        "_possible_key_differences"
+    }
+
+
+def test_possible_key_cache_reuses_valid_amount_mode_tolerance_and_normalization_changes(
+    state, monkeypatch
+):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_possible_key_searches(monkeypatch)
+    selected = ui._inspect_possible_key_differences(file_a, file_b, mapping)
+    for mode in ReconciliationMode:
+        state.update(reconciliation_mode=mode, amount_tolerance="12.34", norm_casefold_0=True)
+        ui._clear_result()
+        assert ui._current_possible_key_differences(file_a, file_b, mapping) is selected
+    for changed in (
+        replace(mapping, amount_a="alternate"),
+        replace(mapping, amount_b="alternate"),
+        replace(mapping, comparison_fields=(ComparisonFieldMapping("secondary", "secondary"),)),
+    ):
+        assert ui._current_possible_key_differences(file_a, file_b, changed) is selected
+        assert ui._inspect_possible_key_differences(file_a, file_b, changed) is selected
+    assert (
+        ui._inspect_possible_key_differences(
+            replace(file_a, name="changed name.csv"), file_b, mapping
+        )
+        is selected
+    )
+    assert len(calls) == 1
+
+
+def test_possible_key_getter_clears_changed_keys_without_automatic_search(state, monkeypatch):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_possible_key_searches(monkeypatch)
+    selections = (
+        replace(mapping, key_pairs=tuple(reversed(mapping.key_pairs))),
+        replace(mapping, key_pairs=(("first", "first"), ("third", "third"))),
+        replace(mapping, key_pairs=(("second", "first"), ("first", "second"))),
+    )
+    for changed in selections:
+        selected = ui._inspect_possible_key_differences(file_a, file_b, mapping)
+        count = len(calls)
+        assert ui._current_possible_key_differences(file_a, file_b, changed) is None
+        assert "_possible_key_differences" not in state
+        assert len(calls) == count
+        replacement = ui._inspect_possible_key_differences(file_a, file_b, changed)
+        assert replacement is not selected
+        assert replacement.result.key_pairs == changed.key_pairs
+        assert len(calls) == count + 1
+
+
+def test_possible_key_source_changes_clear_current_result_without_search(
+    state, monkeypatch, xlsx_bytes
+):
+    data = b"first,second,amount\nV,I1,10\n"
+    file_a = _input(Source.A, data)
+    file_b = _input(Source.B, data)
+    mapping = ColumnMapping((("first", "first"), ("second", "second")), "amount", "amount")
+    workbook = xlsx_bytes(
+        {
+            "One": [["first", "second", "amount"], ["V", "I1", 10]],
+            "Two": [["first", "second", "amount"], ["V", "I1", 10]],
+        }
+    )
+    sources = (
+        (file_a, _input(Source.B, b"first,second,amount\nV,I1,11\n")),
+        (_input(Source.A, b"first,second,amount\nV,I1,12\n"), file_b),
+        (file_a, _input(Source.B, workbook, input_format="xlsx", worksheet="One")),
+        (file_a, _input(Source.B, workbook, input_format="xlsx", worksheet="Two")),
+    )
+    calls = _record_possible_key_searches(monkeypatch)
+    for changed_a, changed_b in sources:
+        ui._inspect_possible_key_differences(file_a, file_b, mapping)
+        count = len(calls)
+        assert ui._current_possible_key_differences(changed_a, changed_b, mapping) is None
+        assert "_possible_key_differences" not in state
+        assert len(calls) == count
+        selected = ui._inspect_possible_key_differences(changed_a, changed_b, mapping)
+        assert selected is state["_possible_key_differences"]
+        assert len(calls) == count + 1
+    one = _input(Source.B, workbook, input_format="xlsx", worksheet="One")
+    two = _input(Source.B, workbook, input_format="xlsx", worksheet="Two")
+    ui._inspect_possible_key_differences(file_a, one, mapping)
+    count = len(calls)
+    assert ui._current_possible_key_differences(file_a, two, mapping) is None
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"key_pairs": ((None, "first"), ("second", "second"))},
+        {"key_pairs": (("first", "first"), ("first", "second"))},
+        {"key_pairs": (("missing", "first"), ("second", "second"))},
+        {"amount_a": None},
+        {"amount_b": "missing"},
+        {"comparison_fields": (ComparisonFieldMapping("amount", "secondary"),)},
+        {"comparison_fields": (ComparisonFieldMapping("secondary", None),)},
+    ),
+)
+def test_possible_key_invalid_full_configuration_clears_without_search_or_result_changes(
+    state, monkeypatch, change
+):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    invalid = replace(mapping, **change)
+    calls = _record_possible_key_searches(monkeypatch)
+    ownership = _completed_state(state)
+    for getter in (ui._current_possible_key_differences, ui._inspect_possible_key_differences):
+        ui._inspect_possible_key_differences(file_a, file_b, mapping)
+        count = len(calls)
+        assert ui._possible_key_difference_identity(file_a, file_b, invalid) is None
+        assert getter(file_a, file_b, invalid) is None
+        assert "_possible_key_differences" not in state
+        assert len(calls) == count
+        assert all(state[key] is value for key, value in ownership.items())
+
+
+def test_possible_key_single_component_never_searches_or_retains_old_composite_result(
+    state, monkeypatch
+):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    single = replace(mapping, key_pairs=(("first", "first"),))
+    calls = _record_possible_key_searches(monkeypatch)
+    ui._inspect_possible_key_differences(file_a, file_b, mapping)
+    assert ui._possible_key_difference_identity(file_a, file_b, single) is None
+    assert ui._current_possible_key_differences(file_a, file_b, single) is None
+    assert ui._inspect_possible_key_differences(file_a, file_b, single) is None
+    assert "_possible_key_differences" not in state
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("reset_discovery", [True, False])
+def test_possible_key_cache_source_reset_clears_profile_reset_preserves(state, reset_discovery):
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    selected = ui._inspect_possible_key_differences(file_a, file_b, mapping)
+    ui._reset_mapping(reset_discovery=reset_discovery)
+    if reset_discovery:
+        assert "_possible_key_differences" not in state
+    else:
+        assert ui._current_possible_key_differences(file_a, file_b, mapping) is selected
+
+
+def test_possible_key_getter_reuses_identity_holder_after_app_class_recreation(state, monkeypatch):
+    from types import SimpleNamespace
+
+    file_a, file_b = _configuration_inputs()
+    mapping = _selected_mapping()
+    calls = _record_possible_key_searches(monkeypatch)
+    selected = ui._inspect_possible_key_differences(file_a, file_b, mapping)
+    identity = state["_possible_key_differences"].identity
+    restored = SimpleNamespace(identity=identity, result=selected.result)
+    state["_possible_key_differences"] = restored
+    assert ui._current_possible_key_differences(file_a, file_b, mapping) is restored
+    assert ui._inspect_possible_key_differences(file_a, file_b, mapping) is restored
+    assert len(calls) == 1
+
+
+def test_possible_key_rows_preserve_complete_baseline_keys_and_exact_shared_components():
+    import json
+
+    from tallydiff.discovery import PossibleKeyDifference, PossibleKeyDifferenceResult
+
+    common = 'Vendor "quoted", [one] | café 雪'
+    long_value = "0" * 1000 + "7"
+    key_a = (common, "000123", long_value)
+    key_b = (common, "000124", long_value)
+    pairs = (("Vendor", "Supplier"), ("Invoice", "Reference"), ("Account", "Account code"))
+    candidate = PossibleKeyDifference(key_a, key_b, 1, "Invoice", "Reference")
+    result = PossibleKeyDifferenceResult(pairs, (candidate,), 1, False, True, None, False, 6)
+    rows = ui._possible_key_difference_rows(result)
+    assert len(rows) == 1
+    row = rows[0]
+    assert tuple(row) == (
+        "File A baseline key",
+        "File B baseline key",
+        "Differing key component",
+        "Exact shared-component evidence",
+    )
+    assert json.loads(row["File A baseline key"]) == list(key_a)
+    assert json.loads(row["File B baseline key"]) == list(key_b)
+    assert "café 雪" in row["File A baseline key"]
+    assert row["Differing key component"] == "2: Invoice ↔ Reference"
+    assert json.loads(row["Exact shared-component evidence"]) == [
+        {"component": 1, "column_a": "Vendor", "column_b": "Supplier", "value": common},
+        {"component": 3, "column_a": "Account", "column_b": "Account code", "value": long_value},
+    ]
+    assert ui._possible_key_difference_rows(result) == rows
+    assert result.candidates == (candidate,)
+
+
+def test_possible_key_rows_preserve_detector_order_without_suggesting_rank():
+    import json
+
+    from tallydiff.discovery import PossibleKeyDifference, PossibleKeyDifferenceResult
+
+    pairs = (("First", "One"), ("Second", "Two"))
+    candidates = (
+        PossibleKeyDifference(("B", "same"), ("C", "same"), 0, "First", "One"),
+        PossibleKeyDifference(("same", "01"), ("same", "1"), 1, "Second", "Two"),
+    )
+    result = PossibleKeyDifferenceResult(pairs, candidates, 21, True, True, None, True, 100)
+    rows = ui._possible_key_difference_rows(result)
+    assert [json.loads(row["File A baseline key"]) for row in rows] == [
+        ["B", "same"],
+        ["same", "01"],
+    ]
+    assert [row["Differing key component"] for row in rows] == ["1: First ↔ One", "2: Second ↔ Two"]
+    assert all(
+        not any(word in name.lower() for word in ("rank", "score", "confidence"))
+        for name in rows[0]
+    )
+    empty = replace(result, candidates=(), total_candidate_count=0, display_truncated=False)
+    assert ui._possible_key_difference_rows(empty) == []

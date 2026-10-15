@@ -73,6 +73,7 @@ def _assert_blocked(app):
         "Remove last key field",
         "+ Add comparison field",
         "Remove last comparison field",
+        *(["Inspect possible key differences"] if app.session_state["key_count"] >= 2 else []),
         "Run reconciliation",
     ]
 
