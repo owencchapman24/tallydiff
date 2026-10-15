@@ -21,6 +21,8 @@ from tallydiff.discovery import (
     compare_amount_columns,
     compare_key_mapping,
     discover_csv,
+    suggest_amount_mappings,
+    suggest_key_mappings,
 )
 from tallydiff.models import Source
 
@@ -206,6 +208,30 @@ def _composite_key_phase(snapshot_a, snapshot_b, candidates) -> tuple[int, int]:
     return count, checksum
 
 
+def _production_suggestion_phase(snapshot_a, snapshot_b) -> dict:
+    started = time.perf_counter()
+    keys = suggest_key_mappings(snapshot_a, snapshot_b)
+    key_seconds = time.perf_counter() - started
+    result = {
+        "elapsed_seconds": {"suggest_key_mappings": key_seconds},
+        "evaluated_single_count": keys.evaluated_single_count,
+        "evaluated_composite_count": keys.evaluated_composite_count,
+        "composite_search_truncated": keys.composite_search_truncated,
+        "key_leading_count": keys.leading_count,
+        "returned_key_count": len(keys.suggestions),
+    }
+    del keys
+    started = time.perf_counter()
+    amounts = suggest_amount_mappings(snapshot_a, snapshot_b)
+    result["elapsed_seconds"]["suggest_amount_mappings"] = time.perf_counter() - started
+    result.update(
+        evaluated_amount_count=amounts.evaluated_count,
+        amount_leading_count=amounts.leading_count,
+        returned_amount_count=len(amounts.suggestions),
+    )
+    return result
+
+
 def _measure_pass(csv_pair, columns_a, columns_b, composites, *, measure_memory: bool) -> dict:
     elapsed: dict[str, float] = {}
     counts: dict[str, int] = {}
@@ -264,7 +290,7 @@ def _measure_pass(csv_pair, columns_a, columns_b, composites, *, measure_memory:
     finally:
         if measure_memory:
             tracemalloc.stop()
-    return {
+    report = {
         "elapsed_seconds": elapsed,
         "candidate_counts": counts,
         "checksums": checksums,
@@ -275,6 +301,9 @@ def _measure_pass(csv_pair, columns_a, columns_b, composites, *, measure_memory:
             "incremental_peak_mib": incremental_peaks,
         },
     }
+    if not measure_memory:
+        report["production_suggestions"] = _production_suggestion_phase(snapshot_a, snapshot_b)
+    return report
 
 
 def benchmark_case(
@@ -300,6 +329,7 @@ def benchmark_case(
         "elapsed_seconds": timing["elapsed_seconds"],
         "python_memory": memory["python_memory"],
         "checksums": timing["checksums"],
+        "production_suggestions": timing["production_suggestions"],
     }
 
 
@@ -335,6 +365,13 @@ def run_benchmark(
                 "correspondence orders; no arbitrary-cardinality enumeration"
             ),
             "composite_limit": composite_limit,
+            "production_suggestions": (
+                "Separate untraced timings on the existing discovered snapshot pair, after the "
+                "Stage 3 comparison phases; excludes discovery and adds no memory measurement. "
+                "Uses production defaults, independent of the Stage 3 composite sample limit. "
+                "Suggestion result tuples are discarded after evaluation, tie, and return "
+                "counts are recorded. No calibration labels enter these calls."
+            ),
             "thresholds": None,
         },
         "cases": [benchmark_case(rows, column_count, composite_limit) for rows in row_counts],

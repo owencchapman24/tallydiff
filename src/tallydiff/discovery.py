@@ -5,7 +5,9 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from fractions import Fraction
 from io import StringIO
+from itertools import combinations
 from typing import TextIO
 
 from tallydiff._decimal import sum_decimals
@@ -347,6 +349,34 @@ def _key_counts(snapshot: DiscoverySnapshot, indices: tuple[int, ...]) -> Counte
     return counts
 
 
+def _key_compatibility_from_counts(
+    snapshot_a: DiscoverySnapshot,
+    snapshot_b: DiscoverySnapshot,
+    key_pairs: tuple[tuple[str, str], ...],
+    counts_a: Counter[tuple[str, ...]],
+    counts_b: Counter[tuple[str, ...]],
+) -> KeyCompatibility:
+    eligible_a = sum(counts_a.values())
+    eligible_b = sum(counts_b.values())
+    overlap = sum(key in counts_b for key in counts_a)
+    return KeyCompatibility(
+        key_pairs=key_pairs,
+        row_count_a=snapshot_a.profile.row_count,
+        row_count_b=snapshot_b.profile.row_count,
+        eligible_row_count_a=eligible_a,
+        eligible_row_count_b=eligible_b,
+        distinct_key_count_a=len(counts_a),
+        distinct_key_count_b=len(counts_b),
+        duplicate_excess_count_a=eligible_a - len(counts_a),
+        duplicate_excess_count_b=eligible_b - len(counts_b),
+        overlap_distinct_count=overlap,
+        overlap_row_count_a=sum(count for key, count in counts_a.items() if key in counts_b),
+        overlap_row_count_b=sum(count for key, count in counts_b.items() if key in counts_a),
+        only_a_distinct_count=len(counts_a) - overlap,
+        only_b_distinct_count=len(counts_b) - overlap,
+    )
+
+
 def compare_key_mapping(
     snapshot_a: DiscoverySnapshot,
     snapshot_b: DiscoverySnapshot,
@@ -391,25 +421,7 @@ def compare_key_mapping(
 
     counts_a = _key_counts(snapshot_a, tuple(indices_a))
     counts_b = _key_counts(snapshot_b, tuple(indices_b))
-    eligible_a = sum(counts_a.values())
-    eligible_b = sum(counts_b.values())
-    overlap = sum(key in counts_b for key in counts_a)
-    return KeyCompatibility(
-        key_pairs=tuple(pairs),
-        row_count_a=snapshot_a.profile.row_count,
-        row_count_b=snapshot_b.profile.row_count,
-        eligible_row_count_a=eligible_a,
-        eligible_row_count_b=eligible_b,
-        distinct_key_count_a=len(counts_a),
-        distinct_key_count_b=len(counts_b),
-        duplicate_excess_count_a=eligible_a - len(counts_a),
-        duplicate_excess_count_b=eligible_b - len(counts_b),
-        overlap_distinct_count=overlap,
-        overlap_row_count_a=sum(count for key, count in counts_a.items() if key in counts_b),
-        overlap_row_count_b=sum(count for key, count in counts_b.items() if key in counts_a),
-        only_a_distinct_count=len(counts_a) - overlap,
-        only_b_distinct_count=len(counts_b) - overlap,
-    )
+    return _key_compatibility_from_counts(snapshot_a, snapshot_b, tuple(pairs), counts_a, counts_b)
 
 
 def compare_amount_columns(
@@ -506,4 +518,249 @@ def compare_headers(column_a: str, column_b: str) -> HeaderCompatibility:
         tokens_b=tokens_b,
         exact_normalized_match=normalized_a == normalized_b,
         shared_tokens=tuple(shared),
+    )
+
+
+MAX_COMPOSITE_BASE_PAIRS = 8
+MAX_COMPOSITE_EVALUATIONS = 64
+MAX_SUGGESTIONS = 20
+
+
+@dataclass(frozen=True, slots=True)
+class KeyMappingSuggestion:
+    """One advisory mapping with its unchanged factual diagnostics."""
+
+    key_pairs: tuple[tuple[str, str], ...]
+    compatibility: KeyCompatibility
+    headers: tuple[HeaderCompatibility, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class KeySuggestionResult:
+    """Best-first candidates, preserving the complete leading evidence tie."""
+
+    suggestions: tuple[KeyMappingSuggestion, ...]
+    leading_count: int
+    evaluated_single_count: int
+    evaluated_composite_count: int
+    composite_search_truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AmountMappingSuggestion:
+    """A fully runnable advisory amount mapping, without accounting authority."""
+
+    column_a: str
+    column_b: str
+    compatibility: AmountCompatibility
+    header: HeaderCompatibility
+
+
+@dataclass(frozen=True, slots=True)
+class AmountSuggestionResult:
+    """Runnable candidates, preserving the complete leading evidence tie."""
+
+    suggestions: tuple[AmountMappingSuggestion, ...]
+    leading_count: int
+    evaluated_count: int
+
+
+def _validate_max_suggestions(max_suggestions: int) -> None:
+    if type(max_suggestions) is not int:
+        raise TypeError("max_suggestions must be an integer")
+    if not 1 <= max_suggestions <= MAX_SUGGESTIONS:
+        raise ValueError(f"max_suggestions must be between 1 and {MAX_SUGGESTIONS}")
+
+
+def _positive_exact_header(header: HeaderCompatibility) -> bool:
+    return bool(header.normalized_a) and bool(header.normalized_b) and header.exact_normalized_match
+
+
+def _evidence_ratio(numerator: int, denominator: int) -> Fraction:
+    # All defined ratios are nonnegative; -1 is a bottom sentinel, not a percentage.
+    return Fraction(numerator, denominator) if denominator else Fraction(-1)
+
+
+def _key_evidence_rank(
+    suggestion: KeyMappingSuggestion,
+) -> tuple[bool, Fraction, Fraction, Fraction, int, int, int, int]:
+    compatibility = suggestion.compatibility
+    return (
+        compatibility.overlap_distinct_count > 0,
+        min(
+            _evidence_ratio(compatibility.overlap_row_count_a, compatibility.eligible_row_count_a),
+            _evidence_ratio(compatibility.overlap_row_count_b, compatibility.eligible_row_count_b),
+        ),
+        min(
+            _evidence_ratio(compatibility.eligible_row_count_a, compatibility.row_count_a),
+            _evidence_ratio(compatibility.eligible_row_count_b, compatibility.row_count_b),
+        ),
+        min(
+            _evidence_ratio(compatibility.distinct_key_count_a, compatibility.eligible_row_count_a),
+            _evidence_ratio(compatibility.distinct_key_count_b, compatibility.eligible_row_count_b),
+        ),
+        compatibility.overlap_distinct_count,
+        sum(_positive_exact_header(header) for header in suggestion.headers),
+        sum(len(header.shared_tokens) for header in suggestion.headers),
+        -len(suggestion.key_pairs),
+    )
+
+
+def _amount_evidence_rank(suggestion: AmountMappingSuggestion) -> tuple[bool, int]:
+    return _positive_exact_header(suggestion.header), len(suggestion.header.shared_tokens)
+
+
+def _cached_key_counts(
+    snapshot: DiscoverySnapshot,
+    indices: tuple[int, ...],
+    cache: dict[tuple[int, ...], Counter[tuple[str, ...]]],
+) -> Counter[tuple[str, ...]]:
+    if indices not in cache:
+        cache[indices] = _key_counts(snapshot, indices)
+    return cache[indices]
+
+
+def suggest_key_mappings(
+    snapshot_a: DiscoverySnapshot,
+    snapshot_b: DiscoverySnapshot,
+    *,
+    max_suggestions: int = 8,
+) -> KeySuggestionResult:
+    """Rank all single pairs and bounded two-component mappings, without applying any.
+
+    Descending evidence is: positive overlap; minimum overlap/eligible ratio;
+    minimum eligible/table ratio; minimum distinct/eligible ratio; distinct overlap;
+    nonempty exact-header component count; total shared-token count; lower key
+    cardinality. Ratios are exact and undefined ratios rank below every defined
+    ratio. Source-header ordinals only order equal evidence, never resolve a tie.
+
+    The best eight single pairs seed composites. A tie crossing that bound is
+    cut in source order and reported as truncated; ordinary exclusion of worse
+    groups is not. At most 64 distinct-column composites are evaluated. Complete
+    leading ties are returned even when larger than ``max_suggestions``.
+    """
+
+    _validate_snapshot_direction(snapshot_a, snapshot_b)
+    _validate_max_suggestions(max_suggestions)
+    ordinals_a = {column.name: index for index, column in enumerate(snapshot_a.profile.columns)}
+    ordinals_b = {column.name: index for index, column in enumerate(snapshot_b.profile.columns)}
+    cache_a: dict[tuple[int, ...], Counter[tuple[str, ...]]] = {}
+    cache_b: dict[tuple[int, ...], Counter[tuple[str, ...]]] = {}
+    headers: dict[tuple[str, str], HeaderCompatibility] = {}
+
+    def display_order(key_pairs: tuple[tuple[str, str], ...]) -> tuple[tuple[int, int], ...]:
+        return tuple((ordinals_a[name_a], ordinals_b[name_b]) for name_a, name_b in key_pairs)
+
+    def evaluate(key_pairs: tuple[tuple[str, str], ...]) -> KeyMappingSuggestion:
+        indices_a = tuple(ordinals_a[name_a] for name_a, _ in key_pairs)
+        indices_b = tuple(ordinals_b[name_b] for _, name_b in key_pairs)
+        compatibility = _key_compatibility_from_counts(
+            snapshot_a,
+            snapshot_b,
+            key_pairs,
+            _cached_key_counts(snapshot_a, indices_a, cache_a),
+            _cached_key_counts(snapshot_b, indices_b, cache_b),
+        )
+        return KeyMappingSuggestion(
+            key_pairs, compatibility, tuple(headers[pair] for pair in key_pairs)
+        )
+
+    singles: list[KeyMappingSuggestion] = []
+    for column_a in snapshot_a.profile.columns:
+        for column_b in snapshot_b.profile.columns:
+            pair = (column_a.name, column_b.name)
+            headers[pair] = compare_headers(*pair)
+            singles.append(evaluate((pair,)))
+    # Stable evidence sorting preserves explicit source order within ties.
+    singles.sort(key=lambda suggestion: display_order(suggestion.key_pairs))
+    singles.sort(key=_key_evidence_rank, reverse=True)
+    base = singles[:MAX_COMPOSITE_BASE_PAIRS]
+    truncated = len(singles) > len(base) and _key_evidence_rank(singles[len(base) - 1]) == (
+        _key_evidence_rank(singles[len(base)])
+    )
+    composite_pairs: list[tuple[tuple[str, str], ...]] = []
+    for first, second in combinations(base, 2):
+        pair_a = first.key_pairs[0]
+        pair_b = second.key_pairs[0]
+        if pair_a[0] != pair_b[0] and pair_a[1] != pair_b[1]:
+            canonical = tuple(sorted((pair_a, pair_b), key=lambda pair: display_order((pair,))))
+            composite_pairs.append(canonical)
+    composite_pairs.sort(key=display_order)
+    if len(composite_pairs) > MAX_COMPOSITE_EVALUATIONS:
+        truncated = True
+    evaluated = composite_pairs[:MAX_COMPOSITE_EVALUATIONS]
+    candidates = singles + [evaluate(key_pairs) for key_pairs in evaluated]
+    candidates.sort(key=lambda suggestion: display_order(suggestion.key_pairs))
+    candidates.sort(key=_key_evidence_rank, reverse=True)
+    leading_rank = _key_evidence_rank(candidates[0])
+    leading_count = next(
+        (
+            index
+            for index, candidate in enumerate(candidates)
+            if _key_evidence_rank(candidate) != leading_rank
+        ),
+        len(candidates),
+    )
+    return KeySuggestionResult(
+        suggestions=tuple(candidates[: max(max_suggestions, leading_count)]),
+        leading_count=leading_count,
+        evaluated_single_count=len(singles),
+        evaluated_composite_count=len(evaluated),
+        composite_search_truncated=truncated,
+    )
+
+
+def suggest_amount_mappings(
+    snapshot_a: DiscoverySnapshot,
+    snapshot_b: DiscoverySnapshot,
+    *,
+    max_suggestions: int = 8,
+) -> AmountSuggestionResult:
+    """Evaluate all pairs and suggest only columns with a total on both nonempty tables.
+
+    Descending evidence is only nonempty exact normalized-header equality, then
+    shared-token count. Totals and every value statistic are absent from ranking.
+    Source-header ordinals order equal evidence without resolving ambiguity. The
+    complete leading tie is retained even when larger than ``max_suggestions``.
+    """
+
+    _validate_snapshot_direction(snapshot_a, snapshot_b)
+    _validate_max_suggestions(max_suggestions)
+    candidates: list[AmountMappingSuggestion] = []
+    evaluated_count = 0
+    # Enumeration supplies explicit A-then-B source order for the stable sort.
+    for column_a in snapshot_a.profile.columns:
+        for column_b in snapshot_b.profile.columns:
+            compatibility = compare_amount_columns(
+                snapshot_a, snapshot_b, column_a=column_a.name, column_b=column_b.name
+            )
+            evaluated_count += 1
+            if (
+                compatibility.row_count_a > 0
+                and compatibility.row_count_b > 0
+                and compatibility.total_a is not None
+                and compatibility.total_b is not None
+            ):
+                candidates.append(
+                    AmountMappingSuggestion(
+                        column_a.name,
+                        column_b.name,
+                        compatibility,
+                        compare_headers(column_a.name, column_b.name),
+                    )
+                )
+    candidates.sort(key=_amount_evidence_rank, reverse=True)
+    if not candidates:
+        return AmountSuggestionResult((), 0, evaluated_count)
+    leading_rank = _amount_evidence_rank(candidates[0])
+    leading_count = next(
+        (
+            index
+            for index, candidate in enumerate(candidates)
+            if _amount_evidence_rank(candidate) != leading_rank
+        ),
+        len(candidates),
+    )
+    return AmountSuggestionResult(
+        tuple(candidates[: max(max_suggestions, leading_count)]), leading_count, evaluated_count
     )
