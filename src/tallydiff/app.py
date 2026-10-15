@@ -42,13 +42,23 @@ from tallydiff import (
     export_reviewed_exceptions_csv,
     ingest_csv,
     ingest_xlsx,
-    inspect_csv_columns,
-    inspect_xlsx_columns,
     inspect_xlsx_sheets,
     load_mapping_profile,
     load_review_session,
     parse_amount,
     reconcile,
+)
+from tallydiff.discovery import (
+    AmountMappingSuggestion,
+    AmountSuggestionResult,
+    DiscoverySnapshot,
+    HeaderCompatibility,
+    KeyMappingSuggestion,
+    KeySuggestionResult,
+    discover_csv,
+    discover_xlsx,
+    suggest_amount_mappings,
+    suggest_key_mappings,
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
@@ -581,8 +591,15 @@ def _show_review_progress(session: ReviewSession) -> None:
     st.caption(f"Reviewed: {session.reviewed_count} · Open review items: {session.open_count}")
 
 
-def _reset_mapping() -> None:
+def _clear_discovery_ui() -> None:
+    for key in ("discovery_key_candidate", "discovery_amount_candidate", "_discovery_notice"):
+        st.session_state.pop(key, None)
+
+
+def _reset_mapping(*, reset_discovery: bool = True) -> None:
     _clear_result()
+    if reset_discovery:
+        _clear_discovery_ui()
     for key in list(st.session_state):
         if key.startswith(("map_", "norm_")):
             del st.session_state[key]
@@ -618,6 +635,7 @@ class _Input:
     data: bytes
     columns: tuple[str, ...]
     input_format: Literal["csv", "xlsx"]
+    discovery: DiscoverySnapshot
     worksheet: str | None = None
     text: str | None = None
 
@@ -626,6 +644,69 @@ class _Input:
         return (
             self.name if self.worksheet is None else f"{self.name} — worksheet {self.worksheet!r}"
         )
+
+
+def _discovery_identity(
+    source: Source, data: bytes, input_format: Literal["csv", "xlsx"], worksheet: str | None
+) -> tuple[Source, bytes, str, str | None]:
+    # Built-in tuple equality survives app.py being executed again on each rerun.
+    return source, data, input_format, worksheet
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscoverySourceCache:
+    identity: tuple[Source, bytes, str, str | None]
+    snapshot: DiscoverySnapshot
+    text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscoveryPairCache:
+    identity: tuple[tuple[Source, bytes, str, str | None], ...]
+    keys: KeySuggestionResult
+    amounts: AmountSuggestionResult
+
+
+def _cached_discovery(
+    source: Source, data: bytes, input_format: Literal["csv", "xlsx"], worksheet: str | None
+) -> _DiscoverySourceCache:
+    identity = _discovery_identity(source, data, input_format, worksheet)
+    cache_key = f"_discovery_source_{source.value}"
+    cached = st.session_state.get(cache_key)
+    if cached is not None and cached.identity == identity:
+        return cached
+    # Drop the previous side even if the new input cannot be discovered.
+    st.session_state.pop(cache_key, None)
+    text = decode_upload(data, source=source) if input_format == "csv" else None
+    snapshot = (
+        discover_csv(text, source=source)
+        if input_format == "csv"
+        else discover_xlsx(data, source=source, worksheet=worksheet)
+    )
+    cached = _DiscoverySourceCache(identity, snapshot, text)
+    st.session_state[cache_key] = cached
+    return cached
+
+
+def _cached_suggestions(file_a: _Input, file_b: _Input) -> _DiscoveryPairCache:
+    identity = tuple(
+        _discovery_identity(
+            file.discovery.profile.source, file.data, file.input_format, file.worksheet
+        )
+        for file in (file_a, file_b)
+    )
+    cached = st.session_state.get("_discovery_pair")
+    if cached is not None and cached.identity == identity:
+        return cached
+    _clear_discovery_ui()
+    st.session_state.pop("_discovery_pair", None)
+    cached = _DiscoveryPairCache(
+        identity,
+        suggest_key_mappings(file_a.discovery, file_b.discovery, max_suggestions=8),
+        suggest_amount_mappings(file_a.discovery, file_b.discovery, max_suggestions=8),
+    )
+    st.session_state["_discovery_pair"] = cached
+    return cached
 
 
 def _choose_file(source: Source) -> _Input | None:
@@ -637,6 +718,8 @@ def _choose_file(source: Source) -> _Input | None:
         on_change=_reset_mapping,
     )
     if upload is None:
+        st.session_state.pop(f"_discovery_source_{source.value}", None)
+        st.session_state.pop(f"_discovery_sheets_{source.value}", None)
         return None
     st.text(upload.name)
     data = upload.getvalue()
@@ -647,12 +730,17 @@ def _choose_file(source: Source) -> _Input | None:
         if suffix == ".csv":
             input_format = "csv"
             st.caption("Detected file type: CSV")
-            text = decode_upload(data, source=source)
-            columns = inspect_csv_columns(text, source=source)
+            st.session_state.pop(f"_discovery_sheets_{source.value}", None)
         elif suffix == ".xlsx":
             input_format = "xlsx"
             st.caption("Detected file type: XLSX")
-            sheets = inspect_xlsx_sheets(data, source=source)
+            sheets_key = f"_discovery_sheets_{source.value}"
+            sheet_cache = st.session_state.get(sheets_key)
+            if sheet_cache is None or sheet_cache[0] != data:
+                st.session_state.pop(sheets_key, None)
+                sheet_cache = (data, inspect_xlsx_sheets(data, source=source))
+                st.session_state[sheets_key] = sheet_cache
+            sheets = sheet_cache[1]
             sheet_key = sha256(upload.name.encode("utf-8") + b"\0" + data).hexdigest()
             worksheet = st.selectbox(
                 f"File {source.value} worksheet",
@@ -666,17 +754,248 @@ def _choose_file(source: Source) -> _Input | None:
                 "Hidden worksheets are included.",
             )
             if worksheet is None:
+                st.session_state.pop(f"_discovery_source_{source.value}", None)
                 st.info(f"Choose a worksheet for File {source.value} to detect its columns.")
                 return None
-            columns = inspect_xlsx_columns(data, source=source, worksheet=worksheet)
         else:
             raise IngestionError(source, "upload a .csv or .xlsx file")
+        cached = _cached_discovery(source, data, input_format, worksheet)
+        columns = tuple(column.name for column in cached.snapshot.profile.columns)
+        text = cached.text
     except IngestionError as exc:
+        st.session_state.pop(f"_discovery_source_{source.value}", None)
         st.error(str(exc))
         return None
     st.caption("Detected columns")
     st.text(" | ".join(columns))
-    return _Input(upload.name, data, columns, input_format, worksheet, text)
+    return _Input(upload.name, data, columns, input_format, cached.snapshot, worksheet, text)
+
+
+def _profile_rows(snapshot: DiscoverySnapshot) -> list[dict[str, str | int]]:
+    return [
+        {
+            "Column": column.name,
+            "Blank rows": column.blank_count,
+            "Distinct nonblank evidence": column.distinct_evidence_count,
+            "Key-eligible rows": column.key_eligible_count,
+            "Distinct baseline keys": column.distinct_key_count,
+            "Duplicate excess": column.duplicate_excess_count,
+            "Amount-parseable rows": column.amount_parseable_count,
+            "Candidate amount total": (
+                display_amount(column.amount_total) if column.amount_total is not None else "—"
+            ),
+        }
+        for column in snapshot.profile.columns
+    ]
+
+
+def _key_candidate_label(suggestion: KeyMappingSuggestion) -> str:
+    return " / ".join(f"{name_a} ↔ {name_b}" for name_a, name_b in suggestion.key_pairs)
+
+
+def _header_evidence(headers: tuple[HeaderCompatibility, ...]) -> str:
+    exact = sum(
+        bool(header.normalized_a) and bool(header.normalized_b) and header.exact_normalized_match
+        for header in headers
+    )
+    shared = " / ".join(
+        ", ".join(header.shared_tokens) if header.shared_tokens else "—" for header in headers
+    )
+    return f"Nonempty exact component matches: {exact}; shared tokens: {shared}"
+
+
+def _key_candidate_rows(result: KeySuggestionResult) -> list[dict[str, str | int]]:
+    rows = []
+    for number, suggestion in enumerate(result.suggestions, start=1):
+        facts = suggestion.compatibility
+        rows.append(
+            {
+                "Candidate": number,
+                "Key mapping": _key_candidate_label(suggestion),
+                "Cardinality": len(suggestion.key_pairs),
+                "Eligible A / total A": f"{facts.eligible_row_count_a} / {facts.row_count_a}",
+                "Eligible B / total B": f"{facts.eligible_row_count_b} / {facts.row_count_b}",
+                "Overlap rows A / eligible A": (
+                    f"{facts.overlap_row_count_a} / {facts.eligible_row_count_a}"
+                ),
+                "Overlap rows B / eligible B": (
+                    f"{facts.overlap_row_count_b} / {facts.eligible_row_count_b}"
+                ),
+                "Distinct overlapping keys": facts.overlap_distinct_count,
+                "Duplicate excess A": facts.duplicate_excess_count_a,
+                "Duplicate excess B": facts.duplicate_excess_count_b,
+                "Header evidence": _header_evidence(suggestion.headers),
+            }
+        )
+    return rows
+
+
+def _amount_candidate_rows(result: AmountSuggestionResult) -> list[dict[str, str | int]]:
+    rows = []
+    for number, suggestion in enumerate(result.suggestions, start=1):
+        facts = suggestion.compatibility
+        rows.append(
+            {
+                "Candidate": number,
+                "File A column": suggestion.column_a,
+                "File B column": suggestion.column_b,
+                "Parseable A / total A": f"{facts.parseable_count_a} / {facts.row_count_a}",
+                "Parseable B / total B": f"{facts.parseable_count_b} / {facts.row_count_b}",
+                "Candidate total A": display_amount(facts.total_a),
+                "Candidate total B": display_amount(facts.total_b),
+                "A - B control difference": display_amount(facts.control_difference, signed=True),
+                "Header evidence": _header_evidence((suggestion.header,)),
+            }
+        )
+    return rows
+
+
+def _apply_key_suggestion(suggestion: KeyMappingSuggestion) -> None:
+    count = st.session_state.get("key_count", 1)
+    current = tuple(
+        (st.session_state.get(f"map_key_a_{index}"), st.session_state.get(f"map_key_b_{index}"))
+        for index in range(count)
+    )
+    changed = current != suggestion.key_pairs or any(
+        st.session_state.get(f"norm_{name}_{index}", False)
+        for index in range(count)
+        for name in NORMALIZATION_LABELS
+    )
+    for key in list(st.session_state):
+        if key.startswith(("map_key_", "norm_")):
+            del st.session_state[key]
+    st.session_state.key_count = len(suggestion.key_pairs)
+    for index, (name_a, name_b) in enumerate(suggestion.key_pairs):
+        st.session_state[f"map_key_a_{index}"] = name_a
+        st.session_state[f"map_key_b_{index}"] = name_b
+        for name in NORMALIZATION_LABELS:
+            st.session_state[f"norm_{name}_{index}"] = False
+    if changed:
+        _clear_result()
+    st.session_state["_discovery_notice"] = (
+        "Key mapping candidate applied. Review or edit it before running reconciliation."
+    )
+
+
+def _apply_amount_suggestion(suggestion: AmountMappingSuggestion) -> None:
+    current = st.session_state.get("map_amount_a"), st.session_state.get("map_amount_b")
+    st.session_state.map_amount_a = suggestion.column_a
+    st.session_state.map_amount_b = suggestion.column_b
+    if current != (suggestion.column_a, suggestion.column_b):
+        _clear_result()
+    st.session_state["_discovery_notice"] = (
+        "Amount mapping candidate applied. Review or edit it before running reconciliation."
+    )
+
+
+def _show_discovery(file_a: _Input, file_b: _Input) -> None:
+    bundle = _cached_suggestions(file_a, file_b)
+    st.subheader("Discovery — advisory")
+    st.caption(
+        "TallyDiff profiles the uploaded data and ranks mapping candidates using deterministic "
+        "evidence. Suggestions are not accounting decisions and are never applied automatically."
+    )
+    st.caption(
+        "A candidate amount total is available only when every row parses under amount semantics. "
+        "This does not establish that the column is an amount field. — means unavailable."
+    )
+    for container, file in zip(st.columns(2), (file_a, file_b), strict=True):
+        with container:
+            profile = file.discovery.profile
+            st.caption(
+                f"File {profile.source.value}: {profile.row_count} rows · "
+                f"{len(profile.columns)} columns"
+            )
+            with st.expander(f"File {profile.source.value} column profile"):
+                st.table(_profile_rows(file.discovery))
+
+    keys = bundle.keys
+    st.subheader("Key mapping candidates")
+    if keys.leading_count == 1:
+        st.caption(
+            "One candidate leads under the deterministic discovery evidence. "
+            "This is not proof that it is the correct mapping."
+        )
+    elif keys.leading_count > 1:
+        st.caption(
+            f"{keys.leading_count} candidates are tied for the strongest discovery evidence. "
+            "Their displayed order within the tie is deterministic only."
+        )
+    st.caption(
+        f"{keys.evaluated_single_count} single-column candidates evaluated · "
+        f"{keys.evaluated_composite_count} two-column candidates evaluated. "
+        "Two-field discovery is intentionally bounded."
+    )
+    if keys.composite_search_truncated:
+        st.warning(
+            "The bounded two-field search was truncated by the discovery tie/evaluation policy."
+        )
+    with st.expander("Key candidate evidence"):
+        st.table(_key_candidate_rows(keys))
+    key_index = st.selectbox(
+        "Key mapping candidate",
+        range(len(keys.suggestions)),
+        index=None,
+        key="discovery_key_candidate",
+        placeholder="Choose a key mapping candidate",
+        format_func=lambda index: f"{index + 1}. {_key_candidate_label(keys.suggestions[index])}",
+    )
+    if (
+        st.button("Use selected key mapping", key="discovery_apply_key", disabled=key_index is None)
+        and key_index is not None
+        and 0 <= key_index < len(keys.suggestions)
+    ):
+        _apply_key_suggestion(keys.suggestions[key_index])
+
+    amounts = bundle.amounts
+    st.subheader("Amount mapping candidates")
+    st.caption(
+        "Candidate totals and control differences are factual diagnostics and do not "
+        "affect suggestion ordering."
+    )
+    st.caption(f"{amounts.evaluated_count} amount column pairs evaluated.")
+    if amounts.leading_count == 1:
+        st.caption(
+            "One candidate leads under the limited header evidence. "
+            "This is not proof of amount semantics."
+        )
+    elif amounts.leading_count > 1:
+        st.caption(
+            f"{amounts.leading_count} candidates are tied for the strongest amount header evidence."
+            " Their displayed order within the tie is deterministic only."
+        )
+    if amounts.suggestions:
+        with st.expander("Amount candidate evidence"):
+            st.table(_amount_candidate_rows(amounts))
+    else:
+        st.info(
+            "No fully runnable amount mapping candidates. You can still choose columns manually."
+        )
+    amount_index = st.selectbox(
+        "Amount mapping candidate",
+        range(len(amounts.suggestions)),
+        index=None,
+        key="discovery_amount_candidate",
+        placeholder="Choose an amount mapping candidate",
+        disabled=not amounts.suggestions,
+        format_func=lambda index: (
+            f"{index + 1}. {amounts.suggestions[index].column_a} ↔ "
+            f"{amounts.suggestions[index].column_b}"
+        ),
+    )
+    if (
+        st.button(
+            "Use selected amount mapping",
+            key="discovery_apply_amount",
+            disabled=amount_index is None,
+        )
+        and amount_index is not None
+        and 0 <= amount_index < len(amounts.suggestions)
+    ):
+        _apply_amount_suggestion(amounts.suggestions[amount_index])
+    notice = st.session_state.pop("_discovery_notice", None)
+    if notice is not None:
+        st.success(notice)
 
 
 def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
@@ -697,7 +1016,7 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
         else:
             # These widgets have not been instantiated on this run. Validate everything
             # before replacing any state, so failed application cannot partially apply.
-            _reset_mapping()
+            _reset_mapping(reset_discovery=False)
             st.session_state.key_count = len(profile.mapping.key_pairs)
             for index, (a, b) in enumerate(profile.mapping.key_pairs):
                 st.session_state[f"map_key_a_{index}"] = a
@@ -1399,10 +1718,13 @@ def main() -> None:
         file_b = _choose_file(Source.B)
     if file_a is None or file_b is None:
         _clear_result()
+        _clear_discovery_ui()
+        st.session_state.pop("_discovery_pair", None)
         st.info("Upload both files and select any required worksheets to map their columns.")
         return
     columns_a, columns_b = file_a.columns, file_b.columns
     st.header("2. Map columns")
+    _show_discovery(file_a, file_b)
     _profile_controls(columns_a, columns_b)
     mapping = _map_columns(columns_a, columns_b)
     key_normalization = _normalization_config()

@@ -868,6 +868,8 @@ def test_review_progress_filter_and_persistence_controls_precede_prepared_downlo
     app = _run_app()
     _assert_active(app)
     assert {widget.label for widget in app.button} == {
+        "Use selected key mapping",
+        "Use selected amount mapping",
         "Apply profile",
         "+ Add key field",
         "Remove last key field",
