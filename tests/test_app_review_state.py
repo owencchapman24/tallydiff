@@ -343,7 +343,7 @@ def test_review_state_is_app_only_and_public_contracts_and_release_version_match
         assert not any(
             "review" in field.name or "annotation" in field.name for field in fields(model)
         )
-    assert version("tallydiff") == "0.7.0"
+    assert version("tallydiff") == "0.8.0"
 
 
 @pytest.mark.parametrize("mode", list(ReconciliationMode))
@@ -868,6 +868,8 @@ def test_review_progress_filter_and_persistence_controls_precede_prepared_downlo
     app = _run_app()
     _assert_active(app)
     assert {widget.label for widget in app.button} == {
+        "Use selected key mapping",
+        "Use selected amount mapping",
         "Apply profile",
         "+ Add key field",
         "Remove last key field",

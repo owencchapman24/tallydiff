@@ -21,6 +21,7 @@ PACKAGE_MODULES = frozenset(
         "amounts",
         "app",
         "configuration",
+        "discovery",
         "engine",
         "export",
         "ingest",

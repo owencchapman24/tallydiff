@@ -42,13 +42,32 @@ from tallydiff import (
     export_reviewed_exceptions_csv,
     ingest_csv,
     ingest_xlsx,
-    inspect_csv_columns,
-    inspect_xlsx_columns,
     inspect_xlsx_sheets,
     load_mapping_profile,
     load_review_session,
     parse_amount,
     reconcile,
+)
+from tallydiff.discovery import (
+    MAX_KEY_DIFFERENCE_CANDIDATES,
+    MAX_KEY_DIFFERENCE_ROWS,
+    MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES,
+    AmountCompatibility,
+    AmountMappingSuggestion,
+    AmountSuggestionResult,
+    DiscoverySnapshot,
+    HeaderCompatibility,
+    KeyCompatibility,
+    KeyMappingSuggestion,
+    KeySuggestionResult,
+    PossibleKeyDifferenceResult,
+    compare_amount_columns,
+    compare_key_mapping,
+    discover_csv,
+    discover_xlsx,
+    find_possible_key_differences,
+    suggest_amount_mappings,
+    suggest_key_mappings,
 )
 from tallydiff.presentation import (
     CATEGORY_LABELS,
@@ -581,13 +600,30 @@ def _show_review_progress(session: ReviewSession) -> None:
     st.caption(f"Reviewed: {session.reviewed_count} · Open review items: {session.open_count}")
 
 
-def _reset_mapping() -> None:
+def _clear_discovery_ui() -> None:
+    for key in ("discovery_key_candidate", "discovery_amount_candidate"):
+        st.session_state[key] = None
+    st.session_state.pop("_discovery_notice", None)
+
+
+def _reset_mapping(*, reset_discovery: bool = True) -> None:
     _clear_result()
+    if reset_discovery:
+        _clear_discovery_ui()
+        st.session_state.pop("_configuration_evidence", None)
+        st.session_state.pop("_possible_key_differences", None)
     for key in list(st.session_state):
         if key.startswith(("map_", "norm_")):
             del st.session_state[key]
     st.session_state.key_count = 1
     st.session_state.comparison_count = 0
+    # Deletion alone does not send a reset to an existing keyed frontend widget.
+    # Explicit assignments synchronize surviving controls and prevent old browser
+    # values from becoming a partially restored configuration on the next rerun.
+    for key in ("map_key_a_0", "map_key_b_0", "map_amount_a", "map_amount_b"):
+        st.session_state[key] = None
+    for name in NORMALIZATION_LABELS:
+        st.session_state[f"norm_{name}_0"] = False
 
 
 def _change_key_count(change: int) -> None:
@@ -595,9 +631,15 @@ def _change_key_count(change: int) -> None:
     if change < 0:
         for side in ("a", "b"):
             st.session_state.pop(f"map_key_{side}_{st.session_state.key_count}", None)
+    else:
+        for side in ("a", "b"):
+            st.session_state[f"map_key_{side}_{st.session_state.key_count - 1}"] = None
     index = st.session_state.key_count if change < 0 else st.session_state.key_count - 1
     for name in NORMALIZATION_LABELS:
-        st.session_state.pop(f"norm_{name}_{index}", None)
+        if change < 0:
+            st.session_state.pop(f"norm_{name}_{index}", None)
+        else:
+            st.session_state[f"norm_{name}_{index}"] = False
     _clear_result()
 
 
@@ -608,7 +650,11 @@ def _change_comparison_count(change: int) -> None:
     # Clear both removed and newly added slots so selections cannot resurrect.
     for index in range(min(previous, count), max(previous, count)):
         for side in ("a", "b"):
-            st.session_state.pop(f"map_comparison_{side}_{index}", None)
+            key = f"map_comparison_{side}_{index}"
+            if change < 0:
+                st.session_state.pop(key, None)
+            else:
+                st.session_state[key] = None
     _clear_result()
 
 
@@ -618,6 +664,7 @@ class _Input:
     data: bytes
     columns: tuple[str, ...]
     input_format: Literal["csv", "xlsx"]
+    discovery: DiscoverySnapshot
     worksheet: str | None = None
     text: str | None = None
 
@@ -626,6 +673,69 @@ class _Input:
         return (
             self.name if self.worksheet is None else f"{self.name} — worksheet {self.worksheet!r}"
         )
+
+
+def _discovery_identity(
+    source: Source, data: bytes, input_format: Literal["csv", "xlsx"], worksheet: str | None
+) -> tuple[Source, bytes, str, str | None]:
+    # Built-in tuple equality survives app.py being executed again on each rerun.
+    return source, data, input_format, worksheet
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscoverySourceCache:
+    identity: tuple[Source, bytes, str, str | None]
+    snapshot: DiscoverySnapshot
+    text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscoveryPairCache:
+    identity: tuple[tuple[Source, bytes, str, str | None], ...]
+    keys: KeySuggestionResult
+    amounts: AmountSuggestionResult
+
+
+def _cached_discovery(
+    source: Source, data: bytes, input_format: Literal["csv", "xlsx"], worksheet: str | None
+) -> _DiscoverySourceCache:
+    identity = _discovery_identity(source, data, input_format, worksheet)
+    cache_key = f"_discovery_source_{source.value}"
+    cached = st.session_state.get(cache_key)
+    if cached is not None and cached.identity == identity:
+        return cached
+    # Drop the previous side even if the new input cannot be discovered.
+    st.session_state.pop(cache_key, None)
+    text = decode_upload(data, source=source) if input_format == "csv" else None
+    snapshot = (
+        discover_csv(text, source=source)
+        if input_format == "csv"
+        else discover_xlsx(data, source=source, worksheet=worksheet)
+    )
+    cached = _DiscoverySourceCache(identity, snapshot, text)
+    st.session_state[cache_key] = cached
+    return cached
+
+
+def _cached_suggestions(file_a: _Input, file_b: _Input) -> _DiscoveryPairCache:
+    identity = tuple(
+        _discovery_identity(
+            file.discovery.profile.source, file.data, file.input_format, file.worksheet
+        )
+        for file in (file_a, file_b)
+    )
+    cached = st.session_state.get("_discovery_pair")
+    if cached is not None and cached.identity == identity:
+        return cached
+    _clear_discovery_ui()
+    st.session_state.pop("_discovery_pair", None)
+    cached = _DiscoveryPairCache(
+        identity,
+        suggest_key_mappings(file_a.discovery, file_b.discovery, max_suggestions=8),
+        suggest_amount_mappings(file_a.discovery, file_b.discovery, max_suggestions=8),
+    )
+    st.session_state["_discovery_pair"] = cached
+    return cached
 
 
 def _choose_file(source: Source) -> _Input | None:
@@ -637,6 +747,9 @@ def _choose_file(source: Source) -> _Input | None:
         on_change=_reset_mapping,
     )
     if upload is None:
+        # Replacing a browser upload briefly removes its old file before the new
+        # bytes arrive. Keep the bounded memo inert while no input is available;
+        # its identity is checked again before any evidence can be displayed.
         return None
     st.text(upload.name)
     data = upload.getvalue()
@@ -647,18 +760,43 @@ def _choose_file(source: Source) -> _Input | None:
         if suffix == ".csv":
             input_format = "csv"
             st.caption("Detected file type: CSV")
-            text = decode_upload(data, source=source)
-            columns = inspect_csv_columns(text, source=source)
+            st.session_state.pop(f"_discovery_sheets_{source.value}", None)
         elif suffix == ".xlsx":
             input_format = "xlsx"
             st.caption("Detected file type: XLSX")
-            sheets = inspect_xlsx_sheets(data, source=source)
-            sheet_key = sha256(upload.name.encode("utf-8") + b"\0" + data).hexdigest()
+            sheets_key = f"_discovery_sheets_{source.value}"
+            sheet_cache = st.session_state.get(sheets_key)
+            workbook_changed = sheet_cache is None or sheet_cache[0] != data
+            if workbook_changed:
+                st.session_state.pop(sheets_key, None)
+                sheet_cache = (data, inspect_xlsx_sheets(data, source=source))
+                st.session_state[sheets_key] = sheet_cache
+            sheets = sheet_cache[1]
+            sheet_key = f"sheet_{source.value}_{sha256(data).hexdigest()}"
+            default_sheet = sheets[0] if len(sheets) == 1 else None
+            cached_source = st.session_state.get(f"_discovery_source_{source.value}")
+            if (
+                not workbook_changed
+                and cached_source is not None
+                and cached_source.identity[:3] == (source, data, "xlsx")
+            ):
+                # Widget cleanup during an absent-upload run may remove the key.
+                # Recover only the last explicitly selected, same-content sheet.
+                default_sheet = cached_source.identity[3]
+            selected_sheet = (
+                default_sheet
+                if workbook_changed
+                else st.session_state.get(sheet_key, default_sheet)
+            )
+            # Keep role/content identity across renames, but explicitly synchronize
+            # the retained selection even if the uploader remounts the frontend.
+            # New bytes must not resurrect a historical multi-sheet selection.
+            st.session_state[sheet_key] = selected_sheet if selected_sheet in sheets else None
             worksheet = st.selectbox(
                 f"File {source.value} worksheet",
                 sheets,
                 index=0 if len(sheets) == 1 else None,
-                key=f"sheet_{source.value}_{sheet_key}",
+                key=sheet_key,
                 placeholder="Choose a worksheet",
                 on_change=_reset_mapping,
                 help="A single worksheet is selected automatically. "
@@ -666,17 +804,248 @@ def _choose_file(source: Source) -> _Input | None:
                 "Hidden worksheets are included.",
             )
             if worksheet is None:
+                st.session_state.pop(f"_discovery_source_{source.value}", None)
                 st.info(f"Choose a worksheet for File {source.value} to detect its columns.")
                 return None
-            columns = inspect_xlsx_columns(data, source=source, worksheet=worksheet)
         else:
             raise IngestionError(source, "upload a .csv or .xlsx file")
+        cached = _cached_discovery(source, data, input_format, worksheet)
+        columns = tuple(column.name for column in cached.snapshot.profile.columns)
+        text = cached.text
     except IngestionError as exc:
+        st.session_state.pop(f"_discovery_source_{source.value}", None)
         st.error(str(exc))
         return None
     st.caption("Detected columns")
     st.text(" | ".join(columns))
-    return _Input(upload.name, data, columns, input_format, worksheet, text)
+    return _Input(upload.name, data, columns, input_format, cached.snapshot, worksheet, text)
+
+
+def _profile_rows(snapshot: DiscoverySnapshot) -> list[dict[str, str | int]]:
+    return [
+        {
+            "Column": column.name,
+            "Blank rows": column.blank_count,
+            "Distinct nonblank evidence": column.distinct_evidence_count,
+            "Key-eligible rows": column.key_eligible_count,
+            "Distinct baseline keys": column.distinct_key_count,
+            "Duplicate excess": column.duplicate_excess_count,
+            "Amount-parseable rows": column.amount_parseable_count,
+            "Candidate amount total": (
+                display_amount(column.amount_total) if column.amount_total is not None else "—"
+            ),
+        }
+        for column in snapshot.profile.columns
+    ]
+
+
+def _key_candidate_label(suggestion: KeyMappingSuggestion) -> str:
+    return " / ".join(f"{name_a} ↔ {name_b}" for name_a, name_b in suggestion.key_pairs)
+
+
+def _header_evidence(headers: tuple[HeaderCompatibility, ...]) -> str:
+    exact = sum(
+        bool(header.normalized_a) and bool(header.normalized_b) and header.exact_normalized_match
+        for header in headers
+    )
+    shared = " / ".join(
+        ", ".join(header.shared_tokens) if header.shared_tokens else "—" for header in headers
+    )
+    return f"Nonempty exact component matches: {exact}; shared tokens: {shared}"
+
+
+def _key_candidate_rows(result: KeySuggestionResult) -> list[dict[str, str | int]]:
+    rows = []
+    for number, suggestion in enumerate(result.suggestions, start=1):
+        facts = suggestion.compatibility
+        rows.append(
+            {
+                "Candidate": number,
+                "Key mapping": _key_candidate_label(suggestion),
+                "Cardinality": len(suggestion.key_pairs),
+                "Eligible A / total A": f"{facts.eligible_row_count_a} / {facts.row_count_a}",
+                "Eligible B / total B": f"{facts.eligible_row_count_b} / {facts.row_count_b}",
+                "Overlap rows A / eligible A": (
+                    f"{facts.overlap_row_count_a} / {facts.eligible_row_count_a}"
+                ),
+                "Overlap rows B / eligible B": (
+                    f"{facts.overlap_row_count_b} / {facts.eligible_row_count_b}"
+                ),
+                "Distinct overlapping keys": facts.overlap_distinct_count,
+                "Duplicate excess A": facts.duplicate_excess_count_a,
+                "Duplicate excess B": facts.duplicate_excess_count_b,
+                "Header evidence": _header_evidence(suggestion.headers),
+            }
+        )
+    return rows
+
+
+def _amount_candidate_rows(result: AmountSuggestionResult) -> list[dict[str, str | int]]:
+    rows = []
+    for number, suggestion in enumerate(result.suggestions, start=1):
+        facts = suggestion.compatibility
+        rows.append(
+            {
+                "Candidate": number,
+                "File A column": suggestion.column_a,
+                "File B column": suggestion.column_b,
+                "Parseable A / total A": f"{facts.parseable_count_a} / {facts.row_count_a}",
+                "Parseable B / total B": f"{facts.parseable_count_b} / {facts.row_count_b}",
+                "Candidate total A": display_amount(facts.total_a),
+                "Candidate total B": display_amount(facts.total_b),
+                "A - B control difference": display_amount(facts.control_difference, signed=True),
+                "Header evidence": _header_evidence((suggestion.header,)),
+            }
+        )
+    return rows
+
+
+def _apply_key_suggestion(suggestion: KeyMappingSuggestion) -> None:
+    count = st.session_state.get("key_count", 1)
+    current = tuple(
+        (st.session_state.get(f"map_key_a_{index}"), st.session_state.get(f"map_key_b_{index}"))
+        for index in range(count)
+    )
+    changed = current != suggestion.key_pairs or any(
+        st.session_state.get(f"norm_{name}_{index}", False)
+        for index in range(count)
+        for name in NORMALIZATION_LABELS
+    )
+    for key in list(st.session_state):
+        if key.startswith(("map_key_", "norm_")):
+            del st.session_state[key]
+    st.session_state.key_count = len(suggestion.key_pairs)
+    for index, (name_a, name_b) in enumerate(suggestion.key_pairs):
+        st.session_state[f"map_key_a_{index}"] = name_a
+        st.session_state[f"map_key_b_{index}"] = name_b
+        for name in NORMALIZATION_LABELS:
+            st.session_state[f"norm_{name}_{index}"] = False
+    if changed:
+        _clear_result()
+    st.session_state["_discovery_notice"] = (
+        "Key mapping candidate applied. Review or edit it before running reconciliation."
+    )
+
+
+def _apply_amount_suggestion(suggestion: AmountMappingSuggestion) -> None:
+    current = st.session_state.get("map_amount_a"), st.session_state.get("map_amount_b")
+    st.session_state.map_amount_a = suggestion.column_a
+    st.session_state.map_amount_b = suggestion.column_b
+    if current != (suggestion.column_a, suggestion.column_b):
+        _clear_result()
+    st.session_state["_discovery_notice"] = (
+        "Amount mapping candidate applied. Review or edit it before running reconciliation."
+    )
+
+
+def _show_discovery(file_a: _Input, file_b: _Input) -> None:
+    bundle = _cached_suggestions(file_a, file_b)
+    st.subheader("Discovery — advisory")
+    st.caption(
+        "TallyDiff profiles the uploaded data and ranks mapping candidates using deterministic "
+        "evidence. Suggestions are not accounting decisions and are never applied automatically."
+    )
+    st.caption(
+        "A candidate amount total is available only when every row parses under amount semantics. "
+        "This does not establish that the column is an amount field. — means unavailable."
+    )
+    for container, file in zip(st.columns(2), (file_a, file_b), strict=True):
+        with container:
+            profile = file.discovery.profile
+            st.caption(
+                f"File {profile.source.value}: {profile.row_count} rows · "
+                f"{len(profile.columns)} columns"
+            )
+            with st.expander(f"File {profile.source.value} column profile"):
+                st.table(_profile_rows(file.discovery))
+
+    keys = bundle.keys
+    st.subheader("Key mapping candidates")
+    if keys.leading_count == 1:
+        st.caption(
+            "One candidate leads under the deterministic discovery evidence. "
+            "This is not proof that it is the correct mapping."
+        )
+    elif keys.leading_count > 1:
+        st.caption(
+            f"{keys.leading_count} candidates are tied for the strongest discovery evidence. "
+            "Their displayed order within the tie is deterministic only."
+        )
+    st.caption(
+        f"{keys.evaluated_single_count} single-column candidates evaluated · "
+        f"{keys.evaluated_composite_count} two-column candidates evaluated. "
+        "Two-field discovery is intentionally bounded."
+    )
+    if keys.composite_search_truncated:
+        st.warning(
+            "The bounded two-field search was truncated by the discovery tie/evaluation policy."
+        )
+    with st.expander("Key candidate evidence"):
+        st.table(_key_candidate_rows(keys))
+    key_index = st.selectbox(
+        "Key mapping candidate",
+        range(len(keys.suggestions)),
+        index=None,
+        key="discovery_key_candidate",
+        placeholder="Choose a key mapping candidate",
+        format_func=lambda index: f"{index + 1}. {_key_candidate_label(keys.suggestions[index])}",
+    )
+    if (
+        st.button("Use selected key mapping", key="discovery_apply_key", disabled=key_index is None)
+        and key_index is not None
+        and 0 <= key_index < len(keys.suggestions)
+    ):
+        _apply_key_suggestion(keys.suggestions[key_index])
+
+    amounts = bundle.amounts
+    st.subheader("Amount mapping candidates")
+    st.caption(
+        "Candidate totals and control differences are factual diagnostics and do not "
+        "affect suggestion ordering."
+    )
+    st.caption(f"{amounts.evaluated_count} amount column pairs evaluated.")
+    if amounts.leading_count == 1:
+        st.caption(
+            "One candidate leads under the limited header evidence. "
+            "This is not proof of amount semantics."
+        )
+    elif amounts.leading_count > 1:
+        st.caption(
+            f"{amounts.leading_count} candidates are tied for the strongest amount header evidence."
+            " Their displayed order within the tie is deterministic only."
+        )
+    if amounts.suggestions:
+        with st.expander("Amount candidate evidence"):
+            st.table(_amount_candidate_rows(amounts))
+    else:
+        st.info(
+            "No fully runnable amount mapping candidates. You can still choose columns manually."
+        )
+    amount_index = st.selectbox(
+        "Amount mapping candidate",
+        range(len(amounts.suggestions)),
+        index=None,
+        key="discovery_amount_candidate",
+        placeholder="Choose an amount mapping candidate",
+        disabled=not amounts.suggestions,
+        format_func=lambda index: (
+            f"{index + 1}. {amounts.suggestions[index].column_a} ↔ "
+            f"{amounts.suggestions[index].column_b}"
+        ),
+    )
+    if (
+        st.button(
+            "Use selected amount mapping",
+            key="discovery_apply_amount",
+            disabled=amount_index is None,
+        )
+        and amount_index is not None
+        and 0 <= amount_index < len(amounts.suggestions)
+    ):
+        _apply_amount_suggestion(amounts.suggestions[amount_index])
+    notice = st.session_state.pop("_discovery_notice", None)
+    if notice is not None:
+        st.success(notice)
 
 
 def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) -> None:
@@ -697,7 +1066,7 @@ def _profile_controls(columns_a: tuple[str, ...], columns_b: tuple[str, ...]) ->
         else:
             # These widgets have not been instantiated on this run. Validate everything
             # before replacing any state, so failed application cannot partially apply.
-            _reset_mapping()
+            _reset_mapping(reset_discovery=False)
             st.session_state.key_count = len(profile.mapping.key_pairs)
             for index, (a, b) in enumerate(profile.mapping.key_pairs):
                 st.session_state[f"map_key_a_{index}"] = a
@@ -865,6 +1234,323 @@ def _normalization_config() -> KeyNormalizationConfig | None:
     if not any(getattr(rules, name) for rules in component_rules for name in NORMALIZATION_LABELS):
         return None
     return KeyNormalizationConfig(component_rules)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigurationEvidence:
+    identity: tuple[object, ...]
+    key: KeyCompatibility
+    amount: AmountCompatibility
+
+
+def _cached_configuration_evidence(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> _ConfigurationEvidence | None:
+    if mapping.problem(file_a.columns, file_b.columns) is not None:
+        st.session_state.pop("_configuration_evidence", None)
+        return None
+    identity = (
+        _discovery_identity(Source.A, file_a.data, file_a.input_format, file_a.worksheet),
+        _discovery_identity(Source.B, file_b.data, file_b.input_format, file_b.worksheet),
+        mapping.key_pairs,
+        mapping.amount_a,
+        mapping.amount_b,
+    )
+    cached = st.session_state.get("_configuration_evidence")
+    if cached is not None and cached.identity == identity:
+        return cached
+    st.session_state.pop("_configuration_evidence", None)
+    cached = _ConfigurationEvidence(
+        identity,
+        compare_key_mapping(file_a.discovery, file_b.discovery, key_pairs=mapping.key_pairs),
+        compare_amount_columns(
+            file_a.discovery, file_b.discovery, column_a=mapping.amount_a, column_b=mapping.amount_b
+        ),
+    )
+    st.session_state["_configuration_evidence"] = cached
+    return cached
+
+
+def _configuration_warnings(
+    key: KeyCompatibility, amount: AmountCompatibility, mode: ReconciliationMode
+) -> tuple[str, ...]:
+    """Apply advisory integer thresholds to existing baseline facts, without ingestion."""
+
+    warnings = []
+    sides = (
+        ("A", key.eligible_row_count_a, key.row_count_a),
+        ("B", key.eligible_row_count_b, key.row_count_b),
+    )
+    for side, eligible, total in sides:
+        if total > 0 and eligible == 0:
+            warnings.append(
+                f"File {side} has no eligible baseline key rows under the selected key "
+                f"({eligible} / {total} rows)."
+            )
+    if key.eligible_row_count_a > 0 and key.eligible_row_count_b > 0:
+        if key.overlap_distinct_count == 0:
+            warnings.append(
+                "The selected keys have no exact baseline overlap. This may indicate an "
+                "unsuitable mapping or genuinely nonoverlapping source populations; "
+                "it is not proof that the mapping is wrong."
+            )
+        elif (
+            key.overlap_row_count_a * 10 < key.eligible_row_count_a
+            and key.overlap_row_count_b * 10 < key.eligible_row_count_b
+        ):
+            warnings.append(
+                "The selected keys have very low baseline overlap: "
+                f"File A {key.overlap_row_count_a} / {key.eligible_row_count_a} eligible rows; "
+                f"File B {key.overlap_row_count_b} / {key.eligible_row_count_b} eligible rows. "
+                "Both are below 10%. Partial source overlap can be legitimate."
+            )
+    for side, eligible, total in sides:
+        if total > 0 and eligible * 10 < total * 9:
+            warnings.append(
+                f"File {side} has poor baseline key eligibility: {eligible} / {total} rows "
+                "are eligible under the selected key (below 90%)."
+            )
+    if mode is ReconciliationMode.UNIQUE and (
+        key.duplicate_excess_count_a > 0 or key.duplicate_excess_count_b > 0
+    ):
+        warnings.append(
+            "In Unique records mode, duplicate keys may produce ambiguous findings requiring "
+            f"review. Baseline duplicate excess: File A {key.duplicate_excess_count_a}; "
+            f"File B {key.duplicate_excess_count_b}. "
+            "This does not establish that a different reconciliation mode is appropriate."
+        )
+    for side, parseable, total in (
+        ("A", amount.parseable_count_a, amount.row_count_a),
+        ("B", amount.parseable_count_b, amount.row_count_b),
+    ):
+        if parseable < total:
+            warnings.append(
+                f"File {side}'s selected amount column contains values incompatible with amount "
+                f"parsing: {parseable} / {total} rows parse. "
+                "Existing ingestion validation may reject this configuration during Run."
+            )
+    return tuple(warnings)
+
+
+def _show_configuration_diagnostics(
+    file_a: _Input,
+    file_b: _Input,
+    mapping: ColumnMapping,
+    mode: ReconciliationMode,
+    key_normalization: KeyNormalizationConfig | None,
+) -> None:
+    evidence = _cached_configuration_evidence(file_a, file_b, mapping)
+    if evidence is None:
+        st.session_state.pop("_possible_key_differences", None)
+        return
+    key, amount = evidence.key, evidence.amount
+    st.subheader("Configuration diagnostics — advisory")
+    st.caption(
+        "These counts describe the selected mapping using baseline key values before optional "
+        "normalization. They are independent of reconciliation mode and amount tolerance."
+    )
+    if key_normalization is not None:
+        st.caption(
+            "Normalization is enabled. Overlap and duplication diagnostics reflect baseline "
+            "values and may differ from reconciliation outcomes. "
+            "Zero baseline overlap does not guarantee zero final matches."
+        )
+    st.markdown("**Selected key mapping**")
+    st.table(
+        [
+            {
+                "Key mapping": " / ".join(f"{a} ↔ {b}" for a, b in key.key_pairs),
+                "Eligible A / total A": f"{key.eligible_row_count_a} / {key.row_count_a}",
+                "Eligible B / total B": f"{key.eligible_row_count_b} / {key.row_count_b}",
+                "Overlap rows A / eligible A": (
+                    f"{key.overlap_row_count_a} / {key.eligible_row_count_a}"
+                ),
+                "Overlap rows B / eligible B": (
+                    f"{key.overlap_row_count_b} / {key.eligible_row_count_b}"
+                ),
+                "Distinct overlapping keys": key.overlap_distinct_count,
+                "Duplicate excess A": key.duplicate_excess_count_a,
+                "Duplicate excess B": key.duplicate_excess_count_b,
+            }
+        ]
+    )
+    st.caption(
+        "Duplicate excess counts eligible rows beyond one per distinct baseline key; "
+        "it is not the number of distinct duplicated keys."
+    )
+    st.markdown("**Selected amount mapping**")
+    st.table(
+        [
+            {
+                "File A column": amount.column_a,
+                "File B column": amount.column_b,
+                "Parseable A / total A": f"{amount.parseable_count_a} / {amount.row_count_a}",
+                "Parseable B / total B": f"{amount.parseable_count_b} / {amount.row_count_b}",
+            }
+        ]
+    )
+    warnings = _configuration_warnings(key, amount, mode)
+    for warning in warnings:
+        st.warning(warning)
+    if not warnings:
+        st.caption("No baseline warnings were detected. This does not verify the mapping.")
+    _show_possible_key_differences(file_a, file_b, mapping, key_normalization)
+
+
+@dataclass(frozen=True, slots=True)
+class _PossibleKeyDifferenceCache:
+    identity: tuple[object, ...]
+    result: PossibleKeyDifferenceResult
+
+
+def _possible_key_difference_identity(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> tuple[object, ...] | None:
+    if mapping.problem(file_a.columns, file_b.columns) is not None or len(mapping.key_pairs) < 2:
+        return None
+    return (
+        _discovery_identity(Source.A, file_a.data, file_a.input_format, file_a.worksheet),
+        _discovery_identity(Source.B, file_b.data, file_b.input_format, file_b.worksheet),
+        mapping.key_pairs,
+    )
+
+
+def _current_possible_key_differences(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> _PossibleKeyDifferenceCache | None:
+    """Read or evict the current request without ever starting a search."""
+
+    identity = _possible_key_difference_identity(file_a, file_b, mapping)
+    cached = st.session_state.get("_possible_key_differences")
+    if identity is None or (cached is not None and cached.identity != identity):
+        st.session_state.pop("_possible_key_differences", None)
+        return None
+    return cached
+
+
+def _inspect_possible_key_differences(
+    file_a: _Input, file_b: _Input, mapping: ColumnMapping
+) -> _PossibleKeyDifferenceCache | None:
+    cached = _current_possible_key_differences(file_a, file_b, mapping)
+    if cached is not None:
+        return cached
+    identity = _possible_key_difference_identity(file_a, file_b, mapping)
+    if identity is None:
+        return None
+    cached = _PossibleKeyDifferenceCache(
+        identity,
+        find_possible_key_differences(
+            file_a.discovery, file_b.discovery, key_pairs=mapping.key_pairs
+        ),
+    )
+    st.session_state["_possible_key_differences"] = cached
+    return cached
+
+
+def _possible_key_difference_rows(result: PossibleKeyDifferenceResult) -> list[dict[str, str]]:
+    return [
+        {
+            "File A baseline key": json.dumps(candidate.key_a, ensure_ascii=False),
+            "File B baseline key": json.dumps(candidate.key_b, ensure_ascii=False),
+            "Differing key component": (
+                f"{candidate.component_index + 1}: {candidate.column_a} ↔ {candidate.column_b}"
+            ),
+            "Exact shared-component evidence": json.dumps(
+                [
+                    {"component": index + 1, "column_a": a, "column_b": b, "value": value}
+                    for index, ((a, b), value) in enumerate(
+                        zip(result.key_pairs, candidate.key_a, strict=True)
+                    )
+                    if index != candidate.component_index
+                ],
+                ensure_ascii=False,
+            ),
+        }
+        for candidate in result.candidates
+    ]
+
+
+def _show_possible_key_differences(
+    file_a: _Input,
+    file_b: _Input,
+    mapping: ColumnMapping,
+    key_normalization: KeyNormalizationConfig | None,
+) -> None:
+    cached = _current_possible_key_differences(file_a, file_b, mapping)
+    if mapping.problem(file_a.columns, file_b.columns) is not None:
+        return
+    st.markdown("#### Possible key differences — advisory")
+    if len(mapping.key_pairs) < 2:
+        st.caption(
+            "This diagnostic requires a composite key with at least two selected components."
+        )
+        return
+    st.caption(
+        "These are possible key differences, not verified matches. Agreement on the other "
+        "selected components does not establish that the records represent the same transaction."
+    )
+    st.caption(
+        "Only complete unmatched baseline keys occurring exactly once in their source can be "
+        "displayed. Repeated baseline keys are excluded from display, remain in the original "
+        "source evidence, and can suppress ambiguous relationships."
+    )
+    st.caption(
+        f"Search limits: {MAX_KEY_DIFFERENCE_ROWS:,} rows per file, "
+        f"{MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES:,} combined signature entries, and "
+        f"{MAX_KEY_DIFFERENCE_CANDIDATES} displayed pairs."
+    )
+    if key_normalization is not None:
+        st.caption(
+            "These diagnostics use baseline values before normalization and may not reflect "
+            "final reconciliation behavior."
+        )
+    if st.button("Inspect possible key differences", key="inspect_possible_key_differences"):
+        cached = _inspect_possible_key_differences(file_a, file_b, mapping)
+    if cached is None:
+        return
+    result = cached.result
+    if not result.evaluated:
+        reasons = {
+            "requires_composite_key": "at least two key components are required",
+            "source_row_limit": f"a source exceeds {MAX_KEY_DIFFERENCE_ROWS:,} rows",
+            "signature_entry_limit": (
+                f"more than {MAX_KEY_DIFFERENCE_SIGNATURE_ENTRIES:,} combined signature entries "
+                "would be required"
+            ),
+        }
+        st.info(
+            "Possible-key-difference diagnostic was not evaluated: "
+            f"{reasons.get(result.skip_reason, result.skip_reason)}."
+        )
+        return
+    if result.ambiguity_suppressed:
+        st.caption("Cross-file signature ambiguity suppressed possible candidates.")
+    if not result.candidates:
+        st.info(
+            "No qualifying possible key differences were identified. "
+            "This does not verify the data or selected mapping."
+        )
+        return
+    if result.display_truncated:
+        st.caption(
+            f"Showing the first {len(result.candidates)} of {result.total_candidate_count} "
+            "qualifying possible key differences; the display is truncated."
+        )
+    else:
+        st.caption(
+            f"{result.total_candidate_count} qualifying possible key differences identified."
+        )
+    st.caption(
+        "Keys are shown as JSON arrays; quoting and escapes preserve their exact baseline strings."
+    )
+    rows = _possible_key_difference_rows(result)
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        column_config={column: st.column_config.TextColumn() for column in rows[0]},
+        key="possible_key_differences_table",
+    )
 
 
 def _show_evidence(rows: tuple[SourceRecord, ...], source: Source) -> None:
@@ -1392,6 +2078,15 @@ def main() -> None:
     )
     st.session_state.setdefault("key_count", 1)
     st.session_state.setdefault("comparison_count", 0)
+    # Retain and synchronize these controls even during an absent-upload rerun.
+    # None is an uninitialized widget value; an intentionally blank tolerance
+    # remains blank and is still rejected by the ordinary amount validation.
+    for key, default in (
+        ("reconciliation_mode", ReconciliationMode.UNIQUE),
+        ("amount_tolerance", "0"),
+    ):
+        current = st.session_state.get(key)
+        st.session_state[key] = default if current is None else current
     left, right = st.columns(2)
     with left:
         file_a = _choose_file(Source.A)
@@ -1399,15 +2094,23 @@ def main() -> None:
         file_b = _choose_file(Source.B)
     if file_a is None or file_b is None:
         _clear_result()
+        _clear_discovery_ui()
+        if any(
+            st.session_state.get(f"_discovery_source_{source.value}") is None
+            for source in (Source.A, Source.B)
+        ):
+            st.session_state.pop("_discovery_pair", None)
+        st.session_state.pop("_configuration_evidence", None)
+        st.session_state.pop("_possible_key_differences", None)
         st.info("Upload both files and select any required worksheets to map their columns.")
         return
     columns_a, columns_b = file_a.columns, file_b.columns
     st.header("2. Map columns")
+    _show_discovery(file_a, file_b)
     _profile_controls(columns_a, columns_b)
     mapping = _map_columns(columns_a, columns_b)
     key_normalization = _normalization_config()
     st.header("3. Run reconciliation")
-    st.session_state.setdefault("reconciliation_mode", ReconciliationMode.UNIQUE)
     mode = st.radio(
         "Reconciliation mode",
         (
@@ -1440,7 +2143,6 @@ def main() -> None:
             "as NOT_COMPARABLE. Secondary fields do not select, rank, or disambiguate "
             "financial subsets."
         )
-    st.session_state.setdefault("amount_tolerance", "0")
     tolerance_text = st.text_input(
         "Amount tolerance",
         value=None,
@@ -1499,6 +2201,7 @@ def main() -> None:
             key="download_profile",
             on_click="ignore",
         )
+    _show_configuration_diagnostics(file_a, file_b, mapping, mode, key_normalization)
     if st.button(
         "Run reconciliation",
         type="primary",

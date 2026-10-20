@@ -66,11 +66,14 @@ def _assert_blocked(app):
     assert not app.metric and not _exception_downloads(app)
     assert not any("override" in button.label.lower() for button in app.button)
     assert [button.label for button in app.button] == [
+        "Use selected key mapping",
+        "Use selected amount mapping",
         "Apply profile",
         "+ Add key field",
         "Remove last key field",
         "+ Add comparison field",
         "Remove last comparison field",
+        *(["Inspect possible key differences"] if app.session_state["key_count"] >= 2 else []),
         "Run reconciliation",
     ]
 

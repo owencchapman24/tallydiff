@@ -1,6 +1,6 @@
 # TallyDiff
 
-**TallyDiff v0.7.0** compares two structured financial exports locally
+**TallyDiff v0.8.0** compares two structured financial exports locally
 and explains which matching key groups account for their difference. Pair key columns, such as
 vendor and invoice number, then compare unique records or explicitly aggregate
 all rows sharing each key, or review bounded one-to-many correspondence.
@@ -8,8 +8,14 @@ Optional normalization handles known differences in
 key representation while preserving every original source row as evidence.
 Optional secondary fields compare additional evidence after keys are matched.
 
+TallyDiff **v0.8.0** includes **Reconciliation Discovery** for profiling source
+columns, reviewing mapping suggestions, and inspecting advisory diagnostics.
+
 - **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
   worksheet per workbook; multiple worksheets require an explicit choice.
+- **Reconciliation Discovery (v0.8.0)** profiles source columns, suggests
+  deterministic key/amount mappings for explicit adoption, and provides advisory
+  selected-configuration and possible-key-difference diagnostics.
 - **Three reconciliation modes**: **Unique records** keeps duplicate keys ambiguous;
   **Group by matching key** compares key totals without inferring individual
   row correspondence; **Bounded one-to-many** searches exact physical-row subsets
@@ -40,7 +46,7 @@ Equal totals alone never imply a reconciliation. TallyDiff reports differences;
 it does not decide which source is authoritative. See [known limitations](#known-limitations)
 and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
 
-TallyDiff v0.7.0 adds analyst review while retaining bounded correspondence and
+TallyDiff v0.7.0 introduced analyst review while retaining bounded correspondence and
 mapping-profile schema v5. Review-session JSON uses its independent schema v1.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
@@ -72,9 +78,18 @@ where you choose. Installing dependencies requires network access initially.
 The files in `sample_data/` contain only synthetic records.
 
 1. Upload `sample_data/file_a.csv` as **File A** and `sample_data/file_b.csv` as
-   **File B**. The app displays each filename and validated column names.
-2. Choose the mappings below. Use **+ Add key field** for the second key pair.
-   Every selector starts empty; the app does not infer mappings.
+   **File B** under **1. Choose files**. The app displays filenames and validated
+   column names. For XLSX inputs, select the worksheet first.
+2. Under **2. Map columns**, inspect **Discovery — advisory** and expand
+   **File A column profile** and **File B column profile**. Each sample has three
+   data rows and three columns. Profiling does not execute reconciliation.
+3. Review **Key candidate evidence** and **Amount candidate evidence**. Candidate
+   order is evidence ordering, not proof of the intended accounting mapping.
+4. Choose the exact key and amount pairs below in **Key mapping candidate** and
+   **Amount mapping candidate**, then click **Use selected key mapping** and
+   **Use selected amount mapping**. Alternatively, select them manually; use
+   **+ Add key field** for the second pair. Initial mapping selectors are empty;
+   merely selecting a discovery candidate does not apply it.
 
    | Selection | File A | File B |
    | --- | --- | --- |
@@ -82,7 +97,15 @@ The files in `sample_data/` contain only synthetic records.
    | Key field 2 | Invoice Number | Invoice Ref |
    | Amount | Invoice Amount | Gross Amount |
 
-3. Leave **Reconciliation mode** at **Unique records** and **Amount tolerance** at
+5. Under **3. Run reconciliation**, review **Configuration diagnostics — advisory**
+   for the selected mapping. The sample has three eligible key rows per side,
+   two distinct overlapping keys, and no duplicate excess. Candidate amount
+   totals are **2550** and **2305**; these are diagnostics, not mapping authority.
+6. Optionally click **Inspect possible key differences** under
+   **Possible key differences — advisory**. The sample's two unmatched keys differ
+   in both components, so no qualifying candidates are identified. That does not
+   verify the data or mapping.
+7. Leave **Reconciliation mode** at **Unique records** and **Amount tolerance** at
    its default `0`, leave secondary comparisons unconfigured, then click
    **Run reconciliation**.
    Expect File A total **2550**, File B total **2305**, and net difference **+245**. The four key groups are:
@@ -94,14 +117,15 @@ The files in `sample_data/` contain only synthetic records.
    | V003 / 1044 | File A only | +500 |
    | V004 / 1045 | File B only | -300 |
 
-4. Select **V001 / 1042** in the exception table. Both evidence panels show
+8. Select **V001 / 1042** in the exception table. Both evidence panels show
    source record **2**, including the original amounts **1250** and **1205**.
    Set **Analyst disposition** to **Needs follow-up** and optionally enter an
    **Analyst note**. Click **Save note** to commit it, or **Prepare review downloads**
    to commit the current valid note and prepare both review files in one action.
-5. Click **Download exception report**. The CSV contains exactly the three
+   Click **Download exception report**. The CSV contains exactly the three
    exception groups above, with blank amounts for the missing sides.
-6. Click **Prepare review downloads**, then **Download reviewed exception report**
+
+   Click **Prepare review downloads**, then **Download reviewed exception report**
    or **Download review session**. To resume later, rerun the equivalent
    reconciliation, upload the JSON under **Review session JSON**, and click
    **Apply review session**.
@@ -111,6 +135,175 @@ column selections disable reconciliation. A changed file or worksheet resets
 mappings, including secondary selections; any file, worksheet, mapping, mode,
 tolerance, or normalization change clears the result and download until you run
 again. Review controls and evidence selection preserve the current result.
+
+Discovery does not change these expected financial results. Only the analyst's
+selected configuration is passed to reconciliation.
+
+## Reconciliation Discovery — v0.8.0
+
+**Discovery advises; it never changes reconciliation truth.** The UI
+analyzes both valid uploads before mappings are selected. XLSX discovery uses the
+chosen worksheet; a multi-sheet workbook requires an explicit choice. Discovery
+never adopts a mapping, normalizes source values, runs reconciliation, or creates
+financial findings by itself.
+
+### Pre-configuration profiles
+
+**Discovery — advisory**, under **2. Map columns**, shows row/column counts and
+expandable per-column profiles: blank rows, distinct nonblank evidence,
+key-eligible rows, distinct baseline keys, duplicate excess, amount-parseable
+rows, and candidate amount totals. Whitespace-only evidence counts as blank;
+other evidence strings retain their original input representation. Baseline key
+candidates use existing ingestion conversions, including surrounding-whitespace
+trim and XLSX numeric/date conversion, before optional key normalization.
+
+A candidate total is an exact Decimal sum only for a nonempty column whose every
+row parses under the existing [amount semantics](#monetary-text-grammar).
+**—** means unavailable, including empty tables or any invalid/blank amount.
+Candidate-invalid values remain advisory during discovery; structurally malformed
+CSV/XLSX sources fail visibly. Selected fields still undergo normal validation
+when Run is clicked. Parseability and totals do not establish accounting meaning;
+numeric identifiers can also parse as amounts. No duplicate source rows are dropped.
+
+### Deterministic mapping suggestions and adoption
+
+Key suggestions evaluate **all single-column pairs**. Evidence order is positive
+baseline overlap, the smaller directional overlap/eligible-row ratio, the smaller
+eligible/total-row ratio, the smaller distinct-key/eligible-row ratio, distinct
+overlap count, nonempty exact-header matches, shared header tokens, then lower key
+cardinality. Ratios are exact; undefined ratios rank below defined ratios.
+Source-column order makes equal evidence deterministic without resolving its tie.
+Header comparisons casefold names and split on nonalphanumeric boundaries; they
+do not supply semantic aliases or change source values.
+
+The **top eight single pairs** seed bounded two-component exploration, with at
+most **64 composite candidates** evaluated. A tie cut at the seed boundary or an
+evaluation-cap cutoff is disclosed as truncation. The app ordinarily requests
+eight suggestions, but retains the full leading evidence tie even when it exceeds
+that display count. A nontruncated search is still not exhaustive enumeration of
+arbitrary composite mappings. Rankings are not confidence estimates. There is no
+fuzzy matching, probabilistic scoring, semantic matching, or AI/ML mapping.
+
+Amount suggestions require fully parseable columns on **both nonempty tables**.
+They rank only by nonempty exact normalized-header equality and shared header
+tokens. The evidence table shows exact candidate totals and signed **A - B control
+difference**, but total equality or proximity never influences ranking. Numeric
+identifier columns may therefore appear as plausible candidates. Leading ties
+remain explicit; their order does not establish amount semantics.
+
+Selecting **Key mapping candidate** or **Amount mapping candidate** only selects
+an advisory row. Apply it with **Use selected key mapping** or **Use selected amount
+mapping**. Key adoption replaces the selected key pairs and resets their
+normalization rules to default **OFF**. Amount adoption changes only the selected
+amount columns. Neither action runs reconciliation; existing configuration-change
+and result-invalidation rules still apply. Manual edits and explicitly applied
+mapping profiles remain authoritative until the analyst explicitly changes or
+adopts another mapping. Suggestions never overwrite them automatically.
+
+### Selected-configuration diagnostics
+
+With a complete valid column mapping, **Configuration diagnostics — advisory**
+appears under **3. Run reconciliation**, before **Run reconciliation**. It describes
+the currently selected mapping, even when it differs from the suggestion leader.
+
+An eligible key row has every selected component present under baseline semantics.
+Each side's overlap numerator counts its eligible physical rows whose complete
+key occurs in the opposite file; its denominator is that side's eligible rows.
+Eligibility uses eligible rows divided by all data rows on the affected side.
+**Duplicate excess** is `eligible rows - distinct complete baseline keys`: rows
+beyond the first occurrence of each key, not the number of distinct duplicated keys.
+
+Warnings identify:
+
+- No eligible baseline key rows on an affected nonempty side.
+- Zero distinct baseline overlap when both sides have eligible rows.
+- Nonzero but very low overlap, **strictly below 10% on both sides**.
+- Poor eligibility, **strictly below 90%** on an affected nonempty side.
+- Duplicate excess in **Unique records** mode, without choosing a different mode.
+- Incomplete selected-amount parseability, shown as parseable rows / total rows.
+
+Overlap and duplicate evidence precede optional normalization and are independent
+of amount tolerance. Zero baseline overlap does not prove that normalized keys
+cannot match. A warning does not prove the configuration is incorrect, and no
+warnings does not verify accounting correctness. These warnings add **no new
+Run-blocking conditions**; existing mapping, ingestion, and normalization checks
+still apply.
+
+### Possible key differences
+
+With a complete valid mapping and at least **two selected key components**, click
+**Inspect possible key differences** in the subordinate **Possible key differences
+— advisory** section under **3. Run reconciliation**. This search is explicitly
+requested, not rerun automatically for every widget change.
+
+It identifies unmatched baseline composite keys that agree exactly on every
+selected component except one. For example, File A `("Vendor-17", "INV-002")`
+and File B `("Vendor-17", "INV-003")` share a vendor string. This is factual
+evidence to investigate, not verified correspondence:
+
+> These are possible key differences, not verified matches. Agreement on the other selected components does not establish that the records represent the same transaction.
+
+Exact complete-key matches and incomplete keys are excluded. Only keys occurring
+exactly once within their source can be displayed. Repeated keys remain in source
+evidence and can suppress ambiguous relationships. Multi-key cross-file signature
+groups and keys with multiple possible partners are suppressed rather than paired
+arbitrarily. Results sort by differing component index and original complete keys,
+without similarity or confidence ranking.
+
+The read-only table preserves complete original baseline key strings as JSON
+arrays, with explicit quoting/escapes, and shows the differing component and exact
+shared-component evidence. Baseline strings already reflect normal input
+conversion; they are not reconstructed Excel display formatting. No fuzzy matching
+or automatic normalization occurs. When normalization is enabled, the UI explains
+that baseline diagnostics may differ from final reconciliation behavior. Viewing
+this evidence never creates or changes a reconciliation finding, financial total,
+mapping, or analyst annotation.
+
+| Possible-key-difference limit | Value |
+| --- | ---: |
+| Source rows per file | 25,000 |
+| Combined signature entries | 100,000 |
+| Displayed candidate pairs | 20 |
+
+One signature entry represents one unmatched eligible distinct key with one
+selected component omitted; the combined count includes both files and repeated
+distinct keys retained as ambiguity evidence. Row limits are checked before key
+counting, and the signature budget before signature-index construction. The search
+does not compare every File A key against every File B key.
+
+An **evaluated search with zero qualifying candidates** is different from a search
+**not evaluated because a resource limit was exceeded**. If an evaluated search
+has more than 20 qualifying candidates, only its first 20 are displayed and the
+**exact qualifying count** is retained with explicit truncation disclosure. Neither
+an empty result nor a skipped search validates the data. These bounds apply only
+to this diagnostic, not to the entire reconciliation engine.
+
+### Session caching and privacy
+
+Discovery caches are local to the current Streamlit session, not persistent
+databases or shared services. They retain current per-source snapshots, current
+source-pair suggestions, current selected-configuration evidence, and the current
+explicitly requested key-difference result, not a history of prior configurations.
+Relevant facts are reused across ordinary mapping reruns and unrelated controls.
+
+Source discovery identity includes **source role, exact input bytes, input format,
+and selected worksheet**, intentionally excluding filename. Uploading identical
+multi-sheet XLSX bytes under a different filename preserves worksheet selection
+and source/suggestion reuse. Different workbook bytes require a fresh explicit
+choice for multi-sheet workbooks; a single worksheet is selected automatically.
+Existing upload events still reset manual mappings and completed results.
+Dependent caches replace or clear stale evidence when sources, worksheets, or
+relevant selections change; invalid sources/mappings cannot present old facts as
+current. Requested key-difference output depends on the ordered selected key pairs,
+not amount mapping, tolerance, mode, or normalization, and requires a valid current
+configuration before display. A changed key mapping hides it until requested again.
+
+Filename is **not** excluded from every application identity: completed-result
+identity and review binding have their own rules described under
+[Architecture](#architecture). Mapping profiles save configuration, not discovery
+evidence or suggested candidates. Uploaded records stay in the local session;
+save downloads deliberately, and never commit real or confidential financial
+records to GitHub.
 
 ## Reconciliation modes
 
@@ -217,7 +410,7 @@ A component that becomes blank blocks the run with file, source row, component,
 and original-value context.
 
 **Distinct full original keys within the same file must never collapse to one
-matching key.** Such a normalization collision blocks **both** modes before
+matching key.** Such a normalization collision blocks **all three** modes before
 classification, even when the amounts agree. The collision diagnostic shows the
 normalized key, distinct full original keys, every affected source row, and its
 original evidence. There is no override. Repeated rows with the same full original
@@ -438,7 +631,7 @@ blank or repeated key selections, invalid amount names, incomplete/repeated
 secondary selections, same-side amount/secondary overlap, and invalid or negative
 tolerance are rejected with a concise message. Key/secondary overlap is allowed.
 
-Package version **0.6.0** and profile schema version **5** are separate versions.
+Package version **0.8.0** and profile schema version **5** are separate versions.
 
 ## Supported inputs
 
@@ -453,7 +646,10 @@ Package version **0.6.0** and profile schema version **5** are separate versions
   `(1,200.00)`. Quote CSV fields containing commas. All decimal places are retained.
 - Invalid encoding, malformed CSV, missing fields, blank keys, invalid headers,
   or invalid amounts block the run with file/record/column context where available.
-  Header discovery checks only the header; reconciliation validates every record.
+  The app's discovery pass profiles every data row and reports invalid candidate
+  values as advisory evidence. Structurally malformed sources fail before mapping;
+  reconciliation validates every selected field. The header-inspection Python
+  APIs remain header-only and do not replace either validation pass.
 
 See the [monetary grammar](#monetary-text-grammar) for the full accepted syntax.
 
@@ -739,14 +935,17 @@ spreadsheet. Numeric amount/delta cells are never prefixed or otherwise rewritte
 | `normalization.py` | Deterministic transformations and structured original-key collision evidence. |
 | `ingest.py` | Header discovery and atomic CSV validation with explicit mappings. |
 | `xlsx.py` | Worksheet/header discovery and atomic XLSX validation into the same source records. |
+| `discovery.py` | Immutable source profiles, deterministic mapping suggestions, selected baseline comparisons, and bounded possible-key-difference evidence. |
 | `configuration.py` | Shared ordered column mappings and manual mapping validation. |
 | `profiles.py` | Validated JSON profile import/export and directional column compatibility. |
 | `presentation.py` | UTF-8 decoding, configuration identity, review filtering/sorting and display strings. |
 | `review.py` | Immutable analyst annotations, deterministic result binding, and validated review-session JSON. |
 | `export.py` | Complete original/reviewed exception CSV and structured stored correspondence evidence. |
-| `app.py` | Streamlit controls, review lifecycle, error messages, results, downloads and source evidence. |
+| `app.py` | Streamlit controls, session-local discovery caches and explicit adoption, review lifecycle, errors, results, downloads and source evidence. |
 
-Public Python APIs are exposed through `tallydiff`. The engine and export layer
+Established public Python APIs are exposed through `tallydiff`; discovery interfaces
+are imported separately from `tallydiff.discovery`, with no new root exports.
+The engine remains unaware of discovery. The engine and export layer
 have no Streamlit dependency. The UI performs no financial calculations.
 Results carry a SHA-256 identity covering file contents, filenames, ordered key
 pairs, amount selections, selected worksheets, mode, effective Decimal tolerance,
@@ -835,9 +1034,52 @@ validity, configuration privacy, and stale-result clearing. XLSX tests cover
 worksheet selection, cell conversion, formula/error rejection, row references,
 corrupt inputs, resource closure, mixed-format results, and stale worksheet changes.
 
+### Discovery verification and benchmark
+
+Discovery tests cover immutable CSV/XLSX observations, exact comparison facts,
+deterministic suggestions and leading ties, strict warning thresholds, explicit
+adoption, signature-budget early exits, ambiguity suppression, display truncation,
+and session cache reuse/invalidation. AppTests also verify malformed replacement
+inputs, worksheet/filename changes, manual/profile precedence, and isolation of
+completed reconciliation, annotations, and prepared review downloads.
+
+Run the completed discovery benchmark from the repository root:
+
+```powershell
+uv run python -m scripts.discovery_benchmark --rows 1000 5000 20000
+```
+
+Sizes are data rows **per file**, with deterministic synthetic 12-column CSV
+workloads by default (`--columns` permits 10–12). Existing broad comparison phases
+remain in the JSON output. Its additional `v08_workflows` cases measure File A and
+File B discovery separately and together, key/amount suggestions, selected
+two-component `compare_key_mapping()` and `compare_amount_columns()` evidence,
+and `find_possible_key_differences()`. One scenario contains genuine one-component
+differences; another suppresses ambiguous signature groups.
+
+Input generation is outside measured operations. Wall-clock timings come from an
+untraced `time.perf_counter` pass; allocations come from a separate `tracemalloc`
+pass over the same inputs. Output records evaluation/candidate counts, evaluated
+versus skipped searches, display truncation, and deterministic content checksums;
+the timing and allocation passes must agree on result observations. Completed
+workflow checksums include exact Decimal text and returned candidate values.
+
+Memory observations cover **Python allocations, not process RSS or native
+allocations**. Absolute phase peaks include retained snapshots and small report
+allocations; incremental peaks subtract allocations present at phase start.
+Combined discovery time sums A/B timings; its peak is the maximum sequential
+tracked peak with A retained during B, not the sum of the two peaks. The JSON
+includes the full methodology. Results are observational, with no CI performance
+threshold or machine-independent capacity/speed guarantee. Keep optional captured
+JSON under ignored, unpackaged `benchmark_output/`; do not commit benchmark output
+or uploaded financial records.
+
 ### Manual browser release acceptance
 
-Both v0.7.0 checks below passed in a manual real-browser test. AppTest coverage
+#### Historical v0.7.0 browser evidence
+
+The two v0.7.0 checks below passed in a manual real-browser test. They are
+historical release evidence, not v0.8.0 browser acceptance. AppTest coverage
 does not substitute for these observations. To repeat the checks, run the app
 locally and use the CSV uploads and mappings in the
 [sample workflow](#sample-workflow).
@@ -891,6 +1133,102 @@ to another row.
    Confirm the row disappears and its selection/editor does not transfer to a
    different row. Correct alignment and isolation throughout are required to
    pass; any mismatch is a release blocker.
+
+#### v0.8.0 discovery browser acceptance
+
+Stage 10a remediation acceptance on **2026-10-19** passed **39/39 grouped
+assertions** using **Playwright 1.64.0** and **Chrome 155.0.8059.82**, running
+headless on Windows with isolated browser contexts and synthetic inputs.
+
+| Executed scenario | Result | Grouped assertions | Verified scope |
+| --- | --- | --- | --- |
+| A — Discovery and explicit adoption | PASS | 7 | Profiles, candidate evidence, empty initial mappings, explicit adoption, normalization OFF, no automatic Run |
+| B — XLSX worksheet state, both file roles | PASS following remediation | 14 | Explicit worksheet choice, cleared composite/amount/secondary mappings and results after switching, identical renamed bytes retaining the worksheet and discovery facts, changed bytes requiring a fresh choice without stale evidence |
+| C — Reconciliation and review isolation | PASS | 10 | Standard totals 2550/2305/+245, expected exceptions, key-bound notes, advisory/filter isolation, byte-identical prepared downloads, plus a separate exact-row visibility supplement |
+
+Six additional native-chooser assertions passed across both file roles, including
+retained tolerance/mode and deliberate reconfiguration. Two mapping-profile
+roundtrip assertions passed with schema v5 and identical exported profile bytes.
+These eight assertions bring the total above to **39**. Scenario C's exact-row
+supplement deliberately added a secondary comparison in a fresh context; its
+primary Exact match remained 800/800/0, separate from the main isolation run.
+
+The local report is
+`benchmark_output/stage10a-real-browser/acceptance-report.html`, with per-assertion
+screenshots, traces, and downloads in the same ignored directory. Original Stage
+10 failure evidence is preserved separately. These results establish the recorded
+Chrome observations, not cross-browser coverage or completion of every broader
+procedure below.
+
+The Stage 10 checklist below is retained for repeat testing. Checked items are
+supported by recorded browser observations; unchecked procedures were not
+independently executed in full as written. Recorded XLSX runs used **North** and
+**South** with different schemas in both file roles. Changed-byte replacements
+used different filenames, so the same-filename variant remains unchecked.
+Scenario C expanded candidate evidence; the full source-profile expansion
+sequence below was not separately executed after completing reconciliation.
+Use only local synthetic fixtures and fresh uploads where appropriate.
+
+For workbook checks, create a two-sheet XLSX with sheets **One** and **Two**, each
+containing the File A sample headers and rows. Make a byte-identical copy with a
+different filename **without resaving the workbook**, plus a separate copy whose
+cell value has changed. For warning/key-difference checks, use these tiny CSVs:
+
+File A:
+
+```csv
+vendor,invoice,amount
+Vendor-17,INV-002,10
+```
+
+File B:
+
+```csv
+supplier,ref,gross
+Vendor-17,INV-003,9
+```
+
+- [x] **CSV discovery and explicit adoption:** upload the standard sample pair;
+  verify three rows/columns per side under **Discovery — advisory**. Select the
+  vendor/invoice composite and amount candidates named in the sample walkthrough.
+  Selection alone must leave manual mappings empty. Click **Use selected key
+  mapping** and **Use selected amount mapping**: only their documented settings
+  may change, without running reconciliation.
+- [x] **Multi-sheet XLSX:** upload the two-sheet workbook. No sheet, source profile,
+  or mapping may be guessed before an explicit choice. Choose a worksheet and verify
+  that its columns/profile appear; changing worksheets must reset mappings/results.
+- [x] **Filename-only XLSX rename:** with a worksheet selected, upload the byte-identical
+  renamed copy in the same source role. That worksheet and its discovery facts must remain
+  selected/current. Existing upload-triggered mapping/result resets still apply.
+- [ ] **Changed workbook bytes:** upload the changed two-sheet copy, even under the
+  same filename. The previous worksheet choice and dependent diagnostics must be
+  hidden until a worksheet is explicitly selected again.
+- [ ] **Selected-configuration warnings:** upload the tiny CSVs and manually map
+  vendor ↔ supplier, invoice ↔ ref, amount ↔ gross. Verify zero baseline overlap
+  under **Configuration diagnostics — advisory**, regardless of the suggestion
+  leader, with Run still enabled. Enable a key normalization rule and verify the
+  baseline limitation is disclosed; turn it off before the next check.
+- [ ] **Explicit key-difference inspection:** with that valid composite mapping,
+  verify no candidate table appears until **Inspect possible key differences** is
+  clicked. Expect one candidate showing both full keys, the invoice difference,
+  shared vendor evidence, and the not-verified-matches disclaimer. Change the key
+  mapping: stale output must disappear without a fresh automatic search.
+- [ ] **Manual/profile precedence:** use **Apply profile** for a compatible saved
+  profile, then edit a mapping manually. Browsing or selecting discovery candidates
+  must not overwrite either configuration. Enable a normalization rule, then adopt
+  a key candidate explicitly: its rules must reset OFF. Re-enable a rule and adopt
+  an amount candidate: keys and normalization must remain unchanged.
+- [ ] **Reconciliation/review isolation:** run the standard sample, save a note and
+  disposition on V001 / 1042, and prepare review downloads. Expand profiles, select
+  advisory candidates without adoption, inspect possible differences, and change
+  review filters. Completed totals, selected mappings, committed annotations, and
+  prepared download contents must remain unchanged. If a filter hides the selected
+  key, its editor must disappear rather than transfer to another key.
+- [x] **Run the selected configuration:** restore the sample's exact mappings,
+  Unique records mode, tolerance `0`, normalization OFF, and zero secondary fields.
+  Click **Run reconciliation** and confirm **2550**, **2305**, **+245**, all four
+  documented categories, and the three-group exception export. Discovery must not
+  substitute the suggestion leader or alter calculations.
 
 ## Realistic-data validation (developer tooling)
 
@@ -1223,6 +1561,37 @@ artifacts.
 
 ## Python API contracts
 
+Existing root-level `tallydiff` reconciliation, ingestion, configuration/profile,
+normalization, export, and review interfaces retain their contracts below.
+Discovery adds **no root-level exports or compatibility aliases**.
+
+### Discovery module boundary (v0.8.0)
+
+Import discovery interfaces explicitly from `tallydiff.discovery`:
+
+| Operation | Functions | Result models |
+| --- | --- | --- |
+| Source observations/profiles | `discover_csv`, `discover_xlsx`; `profile_csv`, `profile_xlsx` | `DiscoverySnapshot`, `TableProfile`, `ColumnProfile` |
+| Baseline comparisons | `compare_key_mapping`, `compare_amount_columns`, `compare_headers` | `KeyCompatibility`, `AmountCompatibility`, `HeaderCompatibility` |
+| Mapping suggestions | `suggest_key_mappings`, `suggest_amount_mappings` | `KeyMappingSuggestion`, `KeySuggestionResult`, `AmountMappingSuggestion`, `AmountSuggestionResult` |
+| Possible key differences | `find_possible_key_differences` | `PossibleKeyDifference`, `PossibleKeyDifferenceResult` |
+
+`discover_csv`/`profile_csv` accept decoded CSV text or a text stream and an
+explicit `Source`; XLSX discovery/profile calls accept workbook bytes, `source`,
+and the exact `worksheet`. `compare_key_mapping()`, `compare_amount_columns()`,
+`suggest_key_mappings()`, and `suggest_amount_mappings()` take Source A's discovery
+snapshot first and Source B's second. `compare_headers()` accepts two column-name
+strings. Selected `key_pairs` preserve component order and exact column names.
+Discovery results are immutable advisory facts, not `ReconciliationFinding`
+objects or engine configuration changes.
+
+Use the module interfaces deliberately; this pre-1.0 release does not promise
+permanent stability for every discovery-layer detail. Leading-underscore helpers
+and snapshot `_key_rows` storage are implementation details, not compatibility
+contracts. The Streamlit cache holders are private UI implementation details.
+The engine receives only explicitly configured, normally ingested records;
+discovery does not change its existing API behavior.
+
 ### Analyst review
 
 The additive root exports are `ReviewDisposition`, `FindingReview`,
@@ -1453,11 +1822,23 @@ when ingesting CSV). No malformed amount is converted to zero.
   CSV must be comma-delimited UTF-8 (optional BOM); monetary text uses U.S.-style
   syntax. There is no locale inference, currency conversion, automatic sign
   correction, or Excel export.
-- Column mapping is explicit and never inferred. Normalization is opt-in per
+- Discovery suggests bounded, deterministic mappings but never adopts them
+  automatically or establishes accounting meaning. All single-column pairs are
+  evaluated; top-eight seeds and at most 64 composite evaluations do not exhaust
+  arbitrary key mappings. Evidence ranks and ties are not confidence estimates;
+  numeric identifiers can be amount candidates. Manual mapping/profile adoption
+  remains explicit. Normalization is opt-in per
   component, with only the four documented deterministic rules. There is no fuzzy
   matching, typo correction, accent stripping, transliteration, phonetic matching,
   arbitrary regex transformation, date-normalization system beyond existing input
   semantics, manual equivalence/alias table, or normalization-collision override.
+- Possible-key-difference inspection uses complete, unmatched, occurrence-one
+  baseline composite keys and suppresses ambiguity; it does not establish record
+  correspondence. Its 25,000 rows/file, 100,000 combined signatures, and 20 displayed
+  pairs are diagnostic-specific bounds, not engine capacity limits. Skipped,
+  truncated, or empty searches are disclosed; warnings and their absence do not
+  validate a mapping or accounting correctness. Baseline evidence is not aware of
+  optional key normalization.
 - Grouped mode totals rows under the explicitly configured matching key. It does
   not infer row pairs, subset-sum matches, allocations, or one-to-many relationships
   beyond those explicit grouped key totals. Tolerance is one global **absolute**

@@ -278,7 +278,7 @@ def main() -> None:
     parser.add_argument(
         "--checkout-root", type=Path, required=True, help="Excluded source checkout"
     )
-    parser.add_argument("--expected-version", default="0.7.0")
+    parser.add_argument("--expected-version", default="0.8.0")
     args = parser.parse_args()
     report = _provenance(args.wheel, args.checkout_root, args.expected_version)
     report.update(_unique_review())

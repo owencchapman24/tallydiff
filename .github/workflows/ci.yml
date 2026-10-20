@@ -74,7 +74,7 @@ jobs:
           uv venv --python "${{ matrix.python-version }}" "$smoke_dir/venv"
           smoke_python="$smoke_dir/venv/bin/python"
           uv pip sync --python "$smoke_python" --require-hashes "$smoke_dir/runtime-requirements.txt"
-          wheel="$GITHUB_WORKSPACE/dist/tallydiff-0.7.0-py3-none-any.whl"
+          wheel="$GITHUB_WORKSPACE/dist/tallydiff-0.8.0-py3-none-any.whl"
           "$smoke_python" -I - "$wheel" "$smoke_dir/wheel-requirements.txt" <<'PY'
           import hashlib
           import sys
