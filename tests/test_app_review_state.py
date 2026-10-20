@@ -343,7 +343,7 @@ def test_review_state_is_app_only_and_public_contracts_and_release_version_match
         assert not any(
             "review" in field.name or "annotation" in field.name for field in fields(model)
         )
-    assert version("tallydiff") == "0.7.0"
+    assert version("tallydiff") == "0.8.0"
 
 
 @pytest.mark.parametrize("mode", list(ReconciliationMode))

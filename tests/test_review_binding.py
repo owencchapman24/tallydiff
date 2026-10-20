@@ -1200,7 +1200,7 @@ def test_stage_two_public_api_is_additive_and_package_release_version_matches():
     ):
         assert name in tallydiff.__all__
         assert getattr(tallydiff, name) is getattr(domain, name)
-    assert version("tallydiff") == "0.7.0"
+    assert version("tallydiff") == "0.8.0"
     assert (
-        'version = "0.7.0"' in (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        'version = "0.8.0"' in (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     )

@@ -544,7 +544,7 @@ def test_new_developer_tools_preserve_existing_package_policies():
     assert "scripts/discovery_benchmark.py" not in wheel
     assert "/scripts/*.py" in source
     assert "/tests/*.py" in source
-    assert configuration["project"]["version"] == "0.7.0"
+    assert configuration["project"]["version"] == "0.8.0"
 
 
 def test_canonical_corpus_diagnostics_have_known_exact_counts_and_controls(calibration_report):

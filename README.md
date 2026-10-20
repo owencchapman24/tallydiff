@@ -1,6 +1,6 @@
 # TallyDiff
 
-**TallyDiff** compares two structured financial exports locally
+**TallyDiff v0.8.0** compares two structured financial exports locally
 and explains which matching key groups account for their difference. Pair key columns, such as
 vendor and invoice number, then compare unique records or explicitly aggregate
 all rows sharing each key, or review bounded one-to-many correspondence.
@@ -8,14 +8,12 @@ Optional normalization handles known differences in
 key representation while preserving every original source row as evidence.
 Optional secondary fields compare additional evidence after keys are matched.
 
-The latest released version is **v0.7.0**. The `v0.8-dev` branch contains
-**unreleased v0.8 Reconciliation Discovery**; package metadata remains `0.7.0`
-until final release preparation. The discovery workflow below describes this
-development checkout, not an already published v0.8.0 release.
+TallyDiff **v0.8.0** includes **Reconciliation Discovery** for profiling source
+columns, reviewing mapping suggestions, and inspecting advisory diagnostics.
 
 - **CSV and XLSX inputs**, including CSV ↔ XLSX in either direction. Select one
   worksheet per workbook; multiple worksheets require an explicit choice.
-- **Reconciliation Discovery (v0.8 development)** profiles source columns, suggests
+- **Reconciliation Discovery (v0.8.0)** profiles source columns, suggests
   deterministic key/amount mappings for explicit adoption, and provides advisory
   selected-configuration and possible-key-difference diagnostics.
 - **Three reconciliation modes**: **Unique records** keeps duplicate keys ambiguous;
@@ -48,7 +46,7 @@ Equal totals alone never imply a reconciliation. TallyDiff reports differences;
 it does not decide which source is authoritative. See [known limitations](#known-limitations)
 and [XLSX cell policies](#xlsx-worksheet-and-cell-policies) before preparing exports.
 
-TallyDiff v0.7.0 adds analyst review while retaining bounded correspondence and
+TallyDiff v0.7.0 introduced analyst review while retaining bounded correspondence and
 mapping-profile schema v5. Review-session JSON uses its independent schema v1.
 
 ![TallyDiff sample reconciliation](docs/tallydiff-demo.png)
@@ -141,9 +139,9 @@ again. Review controls and evidence selection preserve the current result.
 Discovery does not change these expected financial results. Only the analyst's
 selected configuration is passed to reconciliation.
 
-## Reconciliation Discovery — v0.8 development
+## Reconciliation Discovery — v0.8.0
 
-**Discovery advises; it never changes reconciliation truth.** The development UI
+**Discovery advises; it never changes reconciliation truth.** The UI
 analyzes both valid uploads before mappings are selected. XLSX discovery uses the
 chosen worksheet; a multi-sheet workbook requires an explicit choice. Discovery
 never adopts a mapping, normalizes source values, runs reconciliation, or creates
@@ -633,7 +631,7 @@ blank or repeated key selections, invalid amount names, incomplete/repeated
 secondary selections, same-side amount/secondary overlap, and invalid or negative
 tolerance are rejected with a concise message. Key/secondary overlap is allowed.
 
-Package version **0.7.0** and profile schema version **5** are separate versions.
+Package version **0.8.0** and profile schema version **5** are separate versions.
 
 ## Supported inputs
 
@@ -1081,7 +1079,7 @@ or uploaded financial records.
 #### Historical v0.7.0 browser evidence
 
 The two v0.7.0 checks below passed in a manual real-browser test. They are
-historical release evidence, not v0.8 browser acceptance. AppTest coverage
+historical release evidence, not v0.8.0 browser acceptance. AppTest coverage
 does not substitute for these observations. To repeat the checks, run the app
 locally and use the CSV uploads and mappings in the
 [sample workflow](#sample-workflow).
@@ -1136,11 +1134,40 @@ to another row.
    different row. Correct alignment and isolation throughout are required to
    pass; any mismatch is a release blocker.
 
-#### Pending v0.8 discovery browser acceptance
+#### v0.8.0 discovery browser acceptance
 
-These checks are **prepared, not executed or passed**. Real-browser execution and
-recording the outcome belong to **Stage 10**. Use only local synthetic fixtures;
-repeat individual checks from fresh uploads where appropriate.
+Stage 10a remediation acceptance on **2026-10-19** passed **39/39 grouped
+assertions** using **Playwright 1.64.0** and **Chrome 155.0.8059.82**, running
+headless on Windows with isolated browser contexts and synthetic inputs.
+
+| Executed scenario | Result | Grouped assertions | Verified scope |
+| --- | --- | --- | --- |
+| A — Discovery and explicit adoption | PASS | 7 | Profiles, candidate evidence, empty initial mappings, explicit adoption, normalization OFF, no automatic Run |
+| B — XLSX worksheet state, both file roles | PASS following remediation | 14 | Explicit worksheet choice, cleared composite/amount/secondary mappings and results after switching, identical renamed bytes retaining the worksheet and discovery facts, changed bytes requiring a fresh choice without stale evidence |
+| C — Reconciliation and review isolation | PASS | 10 | Standard totals 2550/2305/+245, expected exceptions, key-bound notes, advisory/filter isolation, byte-identical prepared downloads, plus a separate exact-row visibility supplement |
+
+Six additional native-chooser assertions passed across both file roles, including
+retained tolerance/mode and deliberate reconfiguration. Two mapping-profile
+roundtrip assertions passed with schema v5 and identical exported profile bytes.
+These eight assertions bring the total above to **39**. Scenario C's exact-row
+supplement deliberately added a secondary comparison in a fresh context; its
+primary Exact match remained 800/800/0, separate from the main isolation run.
+
+The local report is
+`benchmark_output/stage10a-real-browser/acceptance-report.html`, with per-assertion
+screenshots, traces, and downloads in the same ignored directory. Original Stage
+10 failure evidence is preserved separately. These results establish the recorded
+Chrome observations, not cross-browser coverage or completion of every broader
+procedure below.
+
+The Stage 10 checklist below is retained for repeat testing. Checked items are
+supported by recorded browser observations; unchecked procedures were not
+independently executed in full as written. Recorded XLSX runs used **North** and
+**South** with different schemas in both file roles. Changed-byte replacements
+used different filenames, so the same-filename variant remains unchecked.
+Scenario C expanded candidate evidence; the full source-profile expansion
+sequence below was not separately executed after completing reconciliation.
+Use only local synthetic fixtures and fresh uploads where appropriate.
 
 For workbook checks, create a two-sheet XLSX with sheets **One** and **Two**, each
 containing the File A sample headers and rows. Make a byte-identical copy with a
@@ -1161,17 +1188,17 @@ supplier,ref,gross
 Vendor-17,INV-003,9
 ```
 
-- [ ] **CSV discovery and explicit adoption:** upload the standard sample pair;
+- [x] **CSV discovery and explicit adoption:** upload the standard sample pair;
   verify three rows/columns per side under **Discovery — advisory**. Select the
   vendor/invoice composite and amount candidates named in the sample walkthrough.
   Selection alone must leave manual mappings empty. Click **Use selected key
   mapping** and **Use selected amount mapping**: only their documented settings
   may change, without running reconciliation.
-- [ ] **Multi-sheet XLSX:** upload the two-sheet workbook. No sheet, source profile,
-  or mapping may be guessed before an explicit choice. Choose **One** and verify
-  that its columns/profile appear; changing to **Two** must reset mappings/results.
-- [ ] **Filename-only XLSX rename:** with **One** selected, upload the byte-identical
-  renamed copy in the same source role. **One** and its discovery facts must remain
+- [x] **Multi-sheet XLSX:** upload the two-sheet workbook. No sheet, source profile,
+  or mapping may be guessed before an explicit choice. Choose a worksheet and verify
+  that its columns/profile appear; changing worksheets must reset mappings/results.
+- [x] **Filename-only XLSX rename:** with a worksheet selected, upload the byte-identical
+  renamed copy in the same source role. That worksheet and its discovery facts must remain
   selected/current. Existing upload-triggered mapping/result resets still apply.
 - [ ] **Changed workbook bytes:** upload the changed two-sheet copy, even under the
   same filename. The previous worksheet choice and dependent diagnostics must be
@@ -1197,7 +1224,7 @@ Vendor-17,INV-003,9
   review filters. Completed totals, selected mappings, committed annotations, and
   prepared download contents must remain unchanged. If a filter hides the selected
   key, its editor must disappear rather than transfer to another key.
-- [ ] **Run the selected configuration:** restore the sample's exact mappings,
+- [x] **Run the selected configuration:** restore the sample's exact mappings,
   Unique records mode, tolerance `0`, normalization OFF, and zero secondary fields.
   Click **Run reconciliation** and confirm **2550**, **2305**, **+245**, all four
   documented categories, and the three-group exception export. Discovery must not
@@ -1538,7 +1565,7 @@ Existing root-level `tallydiff` reconciliation, ingestion, configuration/profile
 normalization, export, and review interfaces retain their contracts below.
 Discovery adds **no root-level exports or compatibility aliases**.
 
-### Discovery module boundary (v0.8 development)
+### Discovery module boundary (v0.8.0)
 
 Import discovery interfaces explicitly from `tallydiff.discovery`:
 
@@ -1551,12 +1578,14 @@ Import discovery interfaces explicitly from `tallydiff.discovery`:
 
 `discover_csv`/`profile_csv` accept decoded CSV text or a text stream and an
 explicit `Source`; XLSX discovery/profile calls accept workbook bytes, `source`,
-and the exact `worksheet`. Cross-file comparisons/suggestions require Source A's
-snapshot first and Source B's second. Selected `key_pairs` preserve component
-order and exact column names. Discovery results are immutable advisory facts,
-not `ReconciliationFinding` objects or engine configuration changes.
+and the exact `worksheet`. `compare_key_mapping()`, `compare_amount_columns()`,
+`suggest_key_mappings()`, and `suggest_amount_mappings()` take Source A's discovery
+snapshot first and Source B's second. `compare_headers()` accepts two column-name
+strings. Selected `key_pairs` preserve component order and exact column names.
+Discovery results are immutable advisory facts, not `ReconciliationFinding`
+objects or engine configuration changes.
 
-Use the module interfaces deliberately; this development release does not promise
+Use the module interfaces deliberately; this pre-1.0 release does not promise
 permanent stability for every discovery-layer detail. Leading-underscore helpers
 and snapshot `_key_rows` storage are implementation details, not compatibility
 contracts. The Streamlit cache holders are private UI implementation details.
