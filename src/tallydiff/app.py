@@ -601,8 +601,9 @@ def _show_review_progress(session: ReviewSession) -> None:
 
 
 def _clear_discovery_ui() -> None:
-    for key in ("discovery_key_candidate", "discovery_amount_candidate", "_discovery_notice"):
-        st.session_state.pop(key, None)
+    for key in ("discovery_key_candidate", "discovery_amount_candidate"):
+        st.session_state[key] = None
+    st.session_state.pop("_discovery_notice", None)
 
 
 def _reset_mapping(*, reset_discovery: bool = True) -> None:
@@ -616,6 +617,13 @@ def _reset_mapping(*, reset_discovery: bool = True) -> None:
             del st.session_state[key]
     st.session_state.key_count = 1
     st.session_state.comparison_count = 0
+    # Deletion alone does not send a reset to an existing keyed frontend widget.
+    # Explicit assignments synchronize surviving controls and prevent old browser
+    # values from becoming a partially restored configuration on the next rerun.
+    for key in ("map_key_a_0", "map_key_b_0", "map_amount_a", "map_amount_b"):
+        st.session_state[key] = None
+    for name in NORMALIZATION_LABELS:
+        st.session_state[f"norm_{name}_0"] = False
 
 
 def _change_key_count(change: int) -> None:
@@ -623,9 +631,15 @@ def _change_key_count(change: int) -> None:
     if change < 0:
         for side in ("a", "b"):
             st.session_state.pop(f"map_key_{side}_{st.session_state.key_count}", None)
+    else:
+        for side in ("a", "b"):
+            st.session_state[f"map_key_{side}_{st.session_state.key_count - 1}"] = None
     index = st.session_state.key_count if change < 0 else st.session_state.key_count - 1
     for name in NORMALIZATION_LABELS:
-        st.session_state.pop(f"norm_{name}_{index}", None)
+        if change < 0:
+            st.session_state.pop(f"norm_{name}_{index}", None)
+        else:
+            st.session_state[f"norm_{name}_{index}"] = False
     _clear_result()
 
 
@@ -636,7 +650,11 @@ def _change_comparison_count(change: int) -> None:
     # Clear both removed and newly added slots so selections cannot resurrect.
     for index in range(min(previous, count), max(previous, count)):
         for side in ("a", "b"):
-            st.session_state.pop(f"map_comparison_{side}_{index}", None)
+            key = f"map_comparison_{side}_{index}"
+            if change < 0:
+                st.session_state.pop(key, None)
+            else:
+                st.session_state[key] = None
     _clear_result()
 
 
@@ -729,8 +747,9 @@ def _choose_file(source: Source) -> _Input | None:
         on_change=_reset_mapping,
     )
     if upload is None:
-        st.session_state.pop(f"_discovery_source_{source.value}", None)
-        st.session_state.pop(f"_discovery_sheets_{source.value}", None)
+        # Replacing a browser upload briefly removes its old file before the new
+        # bytes arrive. Keep the bounded memo inert while no input is available;
+        # its identity is checked again before any evidence can be displayed.
         return None
     st.text(upload.name)
     data = upload.getvalue()
@@ -747,17 +766,37 @@ def _choose_file(source: Source) -> _Input | None:
             st.caption("Detected file type: XLSX")
             sheets_key = f"_discovery_sheets_{source.value}"
             sheet_cache = st.session_state.get(sheets_key)
-            if sheet_cache is None or sheet_cache[0] != data:
+            workbook_changed = sheet_cache is None or sheet_cache[0] != data
+            if workbook_changed:
                 st.session_state.pop(sheets_key, None)
                 sheet_cache = (data, inspect_xlsx_sheets(data, source=source))
                 st.session_state[sheets_key] = sheet_cache
             sheets = sheet_cache[1]
-            sheet_key = sha256(data).hexdigest()
+            sheet_key = f"sheet_{source.value}_{sha256(data).hexdigest()}"
+            default_sheet = sheets[0] if len(sheets) == 1 else None
+            cached_source = st.session_state.get(f"_discovery_source_{source.value}")
+            if (
+                not workbook_changed
+                and cached_source is not None
+                and cached_source.identity[:3] == (source, data, "xlsx")
+            ):
+                # Widget cleanup during an absent-upload run may remove the key.
+                # Recover only the last explicitly selected, same-content sheet.
+                default_sheet = cached_source.identity[3]
+            selected_sheet = (
+                default_sheet
+                if workbook_changed
+                else st.session_state.get(sheet_key, default_sheet)
+            )
+            # Keep role/content identity across renames, but explicitly synchronize
+            # the retained selection even if the uploader remounts the frontend.
+            # New bytes must not resurrect a historical multi-sheet selection.
+            st.session_state[sheet_key] = selected_sheet if selected_sheet in sheets else None
             worksheet = st.selectbox(
                 f"File {source.value} worksheet",
                 sheets,
                 index=0 if len(sheets) == 1 else None,
-                key=f"sheet_{source.value}_{sheet_key}",
+                key=sheet_key,
                 placeholder="Choose a worksheet",
                 on_change=_reset_mapping,
                 help="A single worksheet is selected automatically. "
@@ -2039,6 +2078,15 @@ def main() -> None:
     )
     st.session_state.setdefault("key_count", 1)
     st.session_state.setdefault("comparison_count", 0)
+    # Retain and synchronize these controls even during an absent-upload rerun.
+    # None is an uninitialized widget value; an intentionally blank tolerance
+    # remains blank and is still rejected by the ordinary amount validation.
+    for key, default in (
+        ("reconciliation_mode", ReconciliationMode.UNIQUE),
+        ("amount_tolerance", "0"),
+    ):
+        current = st.session_state.get(key)
+        st.session_state[key] = default if current is None else current
     left, right = st.columns(2)
     with left:
         file_a = _choose_file(Source.A)
@@ -2047,7 +2095,11 @@ def main() -> None:
     if file_a is None or file_b is None:
         _clear_result()
         _clear_discovery_ui()
-        st.session_state.pop("_discovery_pair", None)
+        if any(
+            st.session_state.get(f"_discovery_source_{source.value}") is None
+            for source in (Source.A, Source.B)
+        ):
+            st.session_state.pop("_discovery_pair", None)
         st.session_state.pop("_configuration_evidence", None)
         st.session_state.pop("_possible_key_differences", None)
         st.info("Upload both files and select any required worksheets to map their columns.")
@@ -2059,7 +2111,6 @@ def main() -> None:
     mapping = _map_columns(columns_a, columns_b)
     key_normalization = _normalization_config()
     st.header("3. Run reconciliation")
-    st.session_state.setdefault("reconciliation_mode", ReconciliationMode.UNIQUE)
     mode = st.radio(
         "Reconciliation mode",
         (
@@ -2092,7 +2143,6 @@ def main() -> None:
             "as NOT_COMPARABLE. Secondary fields do not select, rank, or disambiguate "
             "financial subsets."
         )
-    st.session_state.setdefault("amount_tolerance", "0")
     tolerance_text = st.text_input(
         "Amount tolerance",
         value=None,

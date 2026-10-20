@@ -249,11 +249,9 @@ def test_pair_cache_replacement_clears_stale_candidate_selection_and_notice(stat
     assert second is not first
     assert state["_discovery_pair"] is second
     assert second.identity[1] == (Source.B, changed_b.data, "csv", None)
-    assert not {
-        "discovery_key_candidate",
-        "discovery_amount_candidate",
-        "_discovery_notice",
-    }.intersection(state)
+    assert state["discovery_key_candidate"] is None
+    assert state["discovery_amount_candidate"] is None
+    assert "_discovery_notice" not in state
 
 
 def test_key_adoption_cleans_all_old_slots_and_normalization_only(state, snapshots):
@@ -366,17 +364,60 @@ def test_mapping_reset_clears_discovery_selection_only_when_requested(state, res
         "_discovery_notice": "applied",
     }
     state.update(caches | selections)
-    state.update(key_count=2, comparison_count=1, map_key_a_0="old", norm_casefold_0=True)
-    _completed_state(state)
+    state.update(key_count=2, comparison_count=1)
+    for index in range(2):
+        for side in ("a", "b"):
+            state[f"map_key_{side}_{index}"] = f"old key {index}"
+        for rule in ui.NORMALIZATION_LABELS:
+            state[f"norm_{rule}_{index}"] = True
+    state.update(
+        map_amount_a="old amount",
+        map_amount_b="old gross",
+        map_comparison_a_0="old comparison",
+        map_comparison_b_0="other comparison",
+    )
+    ownership = _completed_state(state)
     ui._reset_mapping(reset_discovery=reset_discovery)
     assert state["key_count"] == 1 and state["comparison_count"] == 0
-    assert not any(key.startswith(("map_", "norm_")) for key in state)
-    assert "completed" not in state
+    assert {key: value for key, value in state.items() if key.startswith("map_")} == {
+        "map_key_a_0": None,
+        "map_key_b_0": None,
+        "map_amount_a": None,
+        "map_amount_b": None,
+    }
+    assert {key: value for key, value in state.items() if key.startswith("norm_")} == {
+        f"norm_{rule}_0": False for rule in ui.NORMALIZATION_LABELS
+    }
+    assert not ownership.keys() & state.keys()
     assert all(state[key] is value for key, value in caches.items())
     if reset_discovery:
-        assert not selections.keys() & state.keys()
+        assert state["discovery_key_candidate"] is None
+        assert state["discovery_amount_candidate"] is None
+        assert "_discovery_notice" not in state
     else:
         assert all(state[key] is value for key, value in selections.items())
+
+
+def test_readding_key_component_starts_empty_without_clearing_retained_configuration(state):
+    state.update(key_count=2, comparison_count=1)
+    preserved = _retained_mapping_state(state)
+    state.update(map_key_a_0="vendor", map_key_b_0="supplier", norm_casefold_0=True)
+    state.update(map_key_a_1="invoice", map_key_b_1="reference", norm_casefold_1=True)
+    _completed_state(state)
+    ui._change_key_count(-1)
+    assert state["key_count"] == 1
+    assert "map_key_a_1" not in state and "map_key_b_1" not in state
+    assert all(f"norm_{rule}_1" not in state for rule in ui.NORMALIZATION_LABELS)
+    # A stale frontend value may still exist after the old slot is removed.
+    state.update(map_key_a_1="invoice", map_key_b_1="reference", norm_casefold_1=True)
+    ui._change_key_count(1)
+    assert state["key_count"] == 2
+    assert state["map_key_a_1"] is None and state["map_key_b_1"] is None
+    assert all(state[f"norm_{rule}_1"] is False for rule in ui.NORMALIZATION_LABELS)
+    assert state["map_key_a_0"] == "vendor" and state["map_key_b_0"] == "supplier"
+    assert state["norm_casefold_0"] is True
+    assert all(state[key] is value for key, value in preserved.items())
+    assert "completed" not in state and "_review_state" not in state
 
 
 def test_key_candidate_labels_keep_exact_names_and_component_order(snapshots):

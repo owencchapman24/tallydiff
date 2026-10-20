@@ -1381,8 +1381,9 @@ def test_possible_difference_dataframe_preserves_markdown_like_keys_as_read_only
 
 
 @pytest.mark.parametrize("side", ["A", "B"])
+@pytest.mark.parametrize("upload_gap", [False, True])
 def test_renaming_same_multisheet_workbook_retains_sheet_and_reuses_current_discovery(
-    xlsx_bytes, discovery_calls, side
+    xlsx_bytes, discovery_calls, side, upload_gap
 ):
     header = ["vendor", "invoice", "amount"] if side == "A" else ["supplier", "ref", "gross"]
     data = xlsx_bytes(
@@ -1391,13 +1392,22 @@ def test_renaming_same_multisheet_workbook_retains_sheet_and_reuses_current_disc
     data_a, data_b = _possible_data()
     inputs = (data, data_b) if side == "A" else (data_a, data)
     app = _uploaded_app(*inputs, **{f"name_{side.lower()}": "original.xlsx"})
-    _worksheet(app, side).set_value("One").run()
-    _set_pairs(
-        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
-    )
+    selected_sheet = "Two" if upload_gap else "One"
+    _worksheet(app, side).set_value(selected_sheet).run()
+    _complete_transition_configuration(app)
     source = app.session_state[f"_discovery_source_{side}"]
+    sheets = app.session_state[f"_discovery_sheets_{side}"]
     suggestions = _bundle(app)
     calls = dict(discovery_calls)
+    if upload_gap:
+        # A native replacement upload emits a complete no-file rerun before
+        # delivering the renamed file. Hidden widget state may be cleaned up.
+        app.file_uploader(key=f"upload_{side}").set_value(None).run()
+        _assert_no_visible_mapping_evidence(app)
+        assert app.session_state[f"_discovery_source_{side}"] is source
+        assert app.session_state[f"_discovery_sheets_{side}"] is sheets
+        assert _bundle(app) is suggestions
+        assert discovery_calls == calls
     app.file_uploader(key=f"upload_{side}").set_value(
         (
             "renamed.xlsx",
@@ -1406,11 +1416,18 @@ def test_renaming_same_multisheet_workbook_retains_sheet_and_reuses_current_disc
         )
     ).run()
     assert not app.exception
-    assert _worksheet(app, side).value == "One"
+    assert _worksheet(app, side).value == selected_sheet
     assert app.session_state[f"_discovery_source_{side}"] is source
     assert _bundle(app) is suggestions
     assert discovery_calls == calls
+    _assert_reset_transition_configuration(app)
+    assert _worksheet(app, side).proto.set_value
+    assert _worksheet(app, side).proto.raw_value == selected_sheet
+    _select_key(app, _bundle(app).keys.suggestions[0].key_pairs)
     assert all(value is None for value in _map_values(app).values())
+    assert app.button(key="run").disabled
+    assert discovery_calls == calls
+    _complete_transition_configuration(app)
     changed = xlsx_bytes(
         {"One": [header, ["Vendor-17", "INV-006", 9]], "Two": [header, ["Vendor-17", "INV-007", 9]]}
     )
@@ -1422,8 +1439,300 @@ def test_renaming_same_multisheet_workbook_retains_sheet_and_reuses_current_disc
         )
     ).run()
     assert _worksheet(app, side).value is None
+    assert _worksheet(app, side).proto.set_value
+    assert not _worksheet(app, side).proto.HasField("raw_value")
     assert f"_discovery_source_{side}" not in app.session_state
     assert "_discovery_pair" not in app.session_state
+    _assert_no_worksheet_evidence(app)
+    assert discovery_calls == calls
+    _worksheet(app, side).set_value("Two").run()
+    _assert_reset_transition_configuration(app)
+    assert app.session_state[f"_discovery_source_{side}"].identity == (
+        Source(side),
+        changed,
+        "xlsx",
+        "Two",
+    )
+    assert discovery_calls[("discover_xlsx", Source(side))] == 2
+    assert discovery_calls[("suggest_key_mappings", None)] == 2
+    assert discovery_calls[("suggest_amount_mappings", None)] == 2
+
+
+def _complete_transition_configuration(app):
+    _set_pairs(
+        app, (("vendor", "supplier"), ("invoice", "ref")), amount_a="amount", amount_b="gross"
+    )
+    for index in range(2):
+        for rule in RULES:
+            app.checkbox(key=f"norm_{rule}_{index}").set_value(True)
+    _comparison(app, "vendor", "supplier")
+    _inspect_possible(app)
+    app.button(key="run").click().run()
+    assert not app.exception
+    assert "completed" in app.session_state
+    assert ui._REVIEW_STATE_KEY in app.session_state
+    app.button(key=ui._REVIEW_PREPARE_KEY).click().run()
+    assert ui._REVIEW_PREPARED_KEY in app.session_state
+
+
+def _assert_reset_transition_configuration(app):
+    _assert_no_result(app)
+    assert app.session_state["key_count"] == 1
+    assert app.session_state["comparison_count"] == 0
+    assert _map_values(app) == {
+        "map_key_a_0": None,
+        "map_key_b_0": None,
+        "map_amount_a": None,
+        "map_amount_b": None,
+    }
+    for key in _map_values(app):
+        assert app.session_state[key] is None
+        # The frontend must receive an explicit empty value, even when an old
+        # selectbox with this identity retains a browser-side selection.
+        assert app.selectbox(key=key).proto.set_value
+        assert not app.selectbox(key=key).proto.HasField("raw_value")
+    for rule in RULES:
+        assert not app.checkbox(key=f"norm_{rule}_0").value
+        assert app.checkbox(key=f"norm_{rule}_0").proto.set_value
+        assert not app.checkbox(key=f"norm_{rule}_0").proto.value
+        assert f"norm_{rule}_1" not in app.session_state
+    for side in ("a", "b"):
+        assert f"map_key_{side}_1" not in app.session_state
+        assert f"map_comparison_{side}_0" not in app.session_state
+    for key in (
+        ui._REVIEW_STATE_KEY,
+        ui._REVIEW_BINDING_KEY,
+        ui._REVIEW_PREPARED_KEY,
+        "_configuration_evidence",
+        "_possible_key_differences",
+    ):
+        assert key not in app.session_state
+    assert app.button(key="run").disabled
+    assert _key_selector(app).value is None and _amount_selector(app).value is None
+
+
+def _assert_no_worksheet_evidence(app):
+    _assert_no_visible_mapping_evidence(app)
+    assert "_discovery_pair" not in app.session_state
+    assert "_configuration_evidence" not in app.session_state
+    assert "_possible_key_differences" not in app.session_state
+
+
+def _assert_no_visible_mapping_evidence(app):
+    _assert_no_result(app)
+    assert ui._REVIEW_STATE_KEY not in app.session_state
+    assert ui._REVIEW_PREPARED_KEY not in app.session_state
+    assert not app.table
+    assert not any(widget.key.startswith("map_") for widget in app.selectbox)
+    assert not any(button.key == "run" for button in app.button)
+    assert not any(header.value == "Key mapping candidates" for header in app.subheader)
+    assert "select any required worksheets" in _messages(app)
+
+
+@pytest.mark.parametrize("side", ["A", "B"])
+def test_explicit_worksheet_clear_does_not_restore_prior_choice_or_show_stale_evidence(
+    xlsx_bytes, discovery_calls, side
+):
+    header = ["vendor", "invoice", "amount"] if side == "A" else ["supplier", "ref", "gross"]
+    data = xlsx_bytes(
+        {"One": [header, ["Vendor-17", "INV-003", 9]], "Two": [header, ["Other", "INV-004", 7]]}
+    )
+    data_a, data_b = _possible_data()
+    inputs = (data, data_b) if side == "A" else (data_a, data)
+    app = _uploaded_app(*inputs, **{f"name_{side.lower()}": "original.xlsx"})
+    _worksheet(app, side).set_value("Two").run()
+    _complete_transition_configuration(app)
+    calls = dict(discovery_calls)
+    _worksheet(app, side).set_value(None).run()
+    assert _worksheet(app, side).value is None
+    assert _worksheet(app, side).proto.set_value
+    assert not _worksheet(app, side).proto.HasField("raw_value")
+    assert f"_discovery_source_{side}" not in app.session_state
+    _assert_no_worksheet_evidence(app)
+    app.file_uploader(key=f"upload_{side}").set_value(
+        (
+            "renamed.xlsx",
+            data,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    ).run()
+    assert _worksheet(app, side).value is None
+    _assert_no_worksheet_evidence(app)
+    assert discovery_calls == calls
+
+
+@pytest.mark.parametrize("side", ["A", "B"])
+@pytest.mark.parametrize("tolerance", ["0.25", ""])
+def test_upload_gap_and_advisory_reruns_preserve_mode_and_exact_tolerance(
+    xlsx_bytes, discovery_calls, side, tolerance
+):
+    header = ["vendor", "invoice", "amount"] if side == "A" else ["supplier", "ref", "gross"]
+    data = xlsx_bytes(
+        {"One": [header, ["Vendor-17", "INV-003", 9]], "Two": [header, ["Other", "INV-004", 7]]}
+    )
+    data_a, data_b = _possible_data()
+    inputs = (data, data_b) if side == "A" else (data_a, data)
+    app = _uploaded_app(*inputs, **{f"name_{side.lower()}": "original.xlsx"})
+    _worksheet(app, side).set_value("Two").run()
+    _complete_transition_configuration(app)
+    app.radio(key="reconciliation_mode").set_value(ReconciliationMode.GROUPED_BY_KEY)
+    app.text_input(key="amount_tolerance").set_value(tolerance).run()
+    assert app.button(key="run").disabled is (tolerance == "")
+    calls = dict(discovery_calls)
+    app.file_uploader(key=f"upload_{side}").set_value(None).run()
+    _assert_no_visible_mapping_evidence(app)
+    assert app.session_state["amount_tolerance"] == tolerance
+    assert app.session_state["reconciliation_mode"] is ReconciliationMode.GROUPED_BY_KEY
+    app.file_uploader(key=f"upload_{side}").set_value(
+        (
+            "renamed.xlsx",
+            data,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    ).run()
+    _assert_reset_transition_configuration(app)
+
+    def assert_preferences():
+        assert not app.exception
+        widget = app.text_input(key="amount_tolerance")
+        assert widget.value == tolerance
+        assert app.session_state["amount_tolerance"] == tolerance
+        assert widget.proto.set_value and widget.proto.HasField("value")
+        assert widget.proto.value == tolerance
+        mode = app.radio(key="reconciliation_mode")
+        assert mode.value is ReconciliationMode.GROUPED_BY_KEY
+        assert mode.proto.set_value
+        assert app.button(key="run").disabled
+        assert all(value is None for value in _map_values(app).values())
+        if tolerance == "":
+            assert any("Amount tolerance:" in error.value for error in app.error)
+        assert discovery_calls == calls
+
+    assert_preferences()
+    _select_key(app, _bundle(app).keys.suggestions[0].key_pairs)
+    assert_preferences()
+    candidate = _bundle(app).amounts.suggestions[0]
+    _select_amount(app, candidate.column_a, candidate.column_b)
+    assert_preferences()
+    app.run()
+    assert_preferences()
+
+
+@pytest.mark.parametrize("side", ["A", "B"])
+def test_same_schema_worksheet_switch_clears_composite_configuration_and_review(
+    xlsx_bytes, discovery_calls, side
+):
+    header = ["vendor", "invoice", "amount"] if side == "A" else ["supplier", "ref", "gross"]
+    data = xlsx_bytes(
+        {
+            "One": [header, ["Vendor-17", "INV-003", 11]],
+            "Two": [header, ["Vendor-17", "INV-005", 12], ["New", "INV-006", 3]],
+        }
+    )
+    data_a, data_b = _possible_data()
+    inputs = (data, data_b) if side == "A" else (data_a, data)
+    app = _uploaded_app(*inputs, **{f"name_{side.lower()}": "multi.xlsx"})
+    _worksheet(app, side).set_value("One").run()
+    _complete_transition_configuration(app)
+    previous_source = app.session_state[f"_discovery_source_{side}"]
+    other_side = "B" if side == "A" else "A"
+    other_source = app.session_state[f"_discovery_source_{other_side}"]
+    previous_pair = _bundle(app)
+    calls = dict(discovery_calls)
+    _worksheet(app, side).set_value("Two").run()
+    _assert_reset_transition_configuration(app)
+    selected_source = app.session_state[f"_discovery_source_{side}"]
+    assert selected_source is not previous_source
+    assert selected_source.snapshot.profile.worksheet == "Two"
+    assert selected_source.snapshot.profile.row_count == 2
+    assert app.session_state[f"_discovery_source_{other_side}"] is other_source
+    assert _bundle(app).identity != previous_pair.identity
+    expected_calls = Counter(calls)
+    expected_calls[("discover_xlsx", Source(side))] += 1
+    expected_calls[("suggest_key_mappings", None)] += 1
+    expected_calls[("suggest_amount_mappings", None)] += 1
+    assert discovery_calls == expected_calls
+    app.button(key="add_key").click().run()
+    assert app.selectbox(key="map_key_a_1").value is None
+    assert app.selectbox(key="map_key_b_1").value is None
+    assert all(not app.checkbox(key=f"norm_{rule}_1").value for rule in RULES)
+    assert app.button(key="run").disabled
+    assert discovery_calls == expected_calls
+
+
+@pytest.mark.parametrize("side", ["A", "B"])
+def test_restoring_prior_workbook_bytes_requires_explicit_worksheet_without_stale_evidence(
+    xlsx_bytes, discovery_calls, side
+):
+    header = ["vendor", "invoice", "amount"] if side == "A" else ["supplier", "ref", "gross"]
+    original = xlsx_bytes(
+        {"One": [header, ["Vendor-17", "INV-003", 9]], "Two": [header, ["Other", "INV-004", 7]]}
+    )
+    changed = xlsx_bytes(
+        {"One": [header, ["Vendor-17", "INV-003", 19]], "Two": [header, ["Other", "INV-004", 17]]}
+    )
+    data_a, data_b = _possible_data()
+    inputs = (original, data_b) if side == "A" else (data_a, original)
+    app = _uploaded_app(*inputs, **{f"name_{side.lower()}": "multi.xlsx"})
+    _worksheet(app, side).set_value("Two").run()
+    for data in (changed, original):
+        calls = dict(discovery_calls)
+        app.file_uploader(key=f"upload_{side}").set_value(None).run()
+        _assert_no_visible_mapping_evidence(app)
+        app.file_uploader(key=f"upload_{side}").set_value(
+            (
+                "multi.xlsx",
+                data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        ).run()
+        assert _worksheet(app, side).value is None
+        assert _worksheet(app, side).proto.set_value
+        assert not _worksheet(app, side).proto.HasField("raw_value")
+        assert f"_discovery_source_{side}" not in app.session_state
+        _assert_no_worksheet_evidence(app)
+        assert discovery_calls == calls
+        _worksheet(app, side).set_value("One").run()
+        _assert_reset_transition_configuration(app)
+        assert app.session_state[f"_discovery_source_{side}"].identity == (
+            Source(side),
+            data,
+            "xlsx",
+            "One",
+        )
+
+
+def test_removed_key_and_secondary_components_cannot_reappear_when_readded():
+    app = _possible_app()
+    for rule in RULES:
+        app.checkbox(key=f"norm_{rule}_1").set_value(True)
+    app.button(key="remove_key").click().run()
+    assert app.session_state["key_count"] == 1
+    assert "map_key_a_1" not in app.session_state and "map_key_b_1" not in app.session_state
+    app.button(key="add_key").click().run()
+    assert app.selectbox(key="map_key_a_0").value == "vendor"
+    assert app.selectbox(key="map_key_b_0").value == "supplier"
+    for side in ("a", "b"):
+        widget = app.selectbox(key=f"map_key_{side}_1")
+        assert widget.value is None
+        assert widget.proto.set_value
+        assert not widget.proto.HasField("raw_value")
+    assert all(not app.checkbox(key=f"norm_{rule}_1").value for rule in RULES)
+    assert app.button(key="run").disabled
+    _comparison(app, "vendor", "supplier")
+    app.button(key="remove_comparison").click().run()
+    assert app.session_state["comparison_count"] == 0
+    assert "map_comparison_a_0" not in app.session_state
+    assert "map_comparison_b_0" not in app.session_state
+    app.button(key="add_comparison").click().run()
+    for side in ("a", "b"):
+        widget = app.selectbox(key=f"map_comparison_{side}_0")
+        assert widget.value is None
+        assert widget.proto.set_value
+        assert not widget.proto.HasField("raw_value")
+    assert app.selectbox(key="map_amount_a").value == "amount"
+    assert app.selectbox(key="map_amount_b").value == "gross"
+    assert app.button(key="run").disabled
 
 
 @pytest.fixture
